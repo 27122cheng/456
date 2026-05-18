@@ -1,8 +1,8 @@
 {
   "version": 2,
   "functions": {
-    "api/stocks.js": { "maxDuration": 30 },
-    "api/ticker.js": { "maxDuration": 15 },
-    "api/search.js": { "maxDuration": 10 }
+    "api/market.js":   { "maxDuration": 15 },
+    "api/ai.js":       { "maxDuration": 30 },
+    "api/telegram.js": { "maxDuration": 10 }
   }
 }
