@@ -1,9 +1,5 @@
 {
   "name": "stock-trend-detector",
   "version": "1.0.0",
-  "description": "100-stock real-time trend detector using Finnhub API",
-  "type": "module",
-  "engines": {
-    "node": ">=18"
-  }
+  "engines": { "node": ">=18" }
 }

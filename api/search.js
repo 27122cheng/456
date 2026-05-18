@@ -1,18 +1,22 @@
-// Stock autocomplete search via Finnhub symbol search
-import { finnhubKey, finnhubGet } from "./_indicators.js";
+// CommonJS — no external dependencies
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Cache-Control", "s-maxage=60");
 
   const q = (req.query.q || "").trim();
   if (!q) return res.status(400).json({ error: "缺少搜尋關鍵字" });
 
-  const apiKey = finnhubKey(req);
-  if (!apiKey) return res.status(500).json({ error: "未設定 FINNHUB_API_KEY 環境變數" });
+  const apiKey = process.env.FINNHUB_API_KEY || "";
+  if (!apiKey) return res.status(500).json({ error: "未設定 FINNHUB_API_KEY" });
 
   try {
-    const data = await finnhubGet("/search", { q }, apiKey);
+    const res2 = await fetch(
+      `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q)}&token=${apiKey}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!res2.ok) throw new Error(`Finnhub search ${res2.status}`);
+    const data = await res2.json();
 
     const results = (data.result || [])
       .filter(item => item.type === "Common Stock" || item.type === "ETP")
@@ -29,4 +33,4 @@ export default async function handler(req, res) {
     console.error(err);
     res.status(500).json({ error: err.message });
   }
-}
+};
