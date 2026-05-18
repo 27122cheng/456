@@ -1,4 +1,4 @@
-import { analyze, FETCH_OPTS } from "./_indicators.js";
+import { analyze, finnhubKey, finnhubGet, batchProcess } from "./_indicators.js";
 
 const TICKERS = [
   "AAPL","MSFT","GOOGL","META","NVDA","AMD","INTC","TSLA","AMZN","CRM",
@@ -15,57 +15,45 @@ const TICKERS = [
   "LIN","APD","NEM","FCX","NEE","DUK","SO","AMT","PLD","SPG",
 ];
 
-async function fetchSpark(symbols) {
-  const r = await fetch(
-    `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${symbols.join(",")}&range=3mo&interval=1d`,
-    FETCH_OPTS
-  );
-  if (!r.ok) throw new Error(`Spark HTTP ${r.status}`);
-  return r.json();
-}
+async function fetchTicker(ticker, apiKey) {
+  const to   = Math.floor(Date.now() / 1000);
+  const from = to - 100 * 24 * 60 * 60; // 100 days back for indicator warmup
 
-async function fetchQuotes(symbols) {
-  const r = await fetch(
-    `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols.join(",")}&fields=regularMarketPrice,regularMarketChangePercent`,
-    FETCH_OPTS
-  );
-  if (!r.ok) throw new Error(`Quote HTTP ${r.status}`);
-  return r.json();
+  try {
+    const [candle, quote] = await Promise.all([
+      finnhubGet("/stock/candle", { symbol: ticker, resolution: "D", from, to }, apiKey),
+      finnhubGet("/quote",        { symbol: ticker }, apiKey),
+    ]);
+
+    if (candle.s !== "ok" || !candle.c?.length) {
+      return { ticker, trend: "unknown", error: "無歷史資料" };
+    }
+
+    const result = analyze(ticker, candle.c, quote.c, quote.dp);
+    result.name = ticker;
+    return result;
+  } catch (e) {
+    return { ticker, trend: "unknown", error: e.message };
+  }
 }
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Cache-Control", "s-maxage=120, stale-while-revalidate=60");
+  res.setHeader("Cache-Control", "s-maxage=180, stale-while-revalidate=60");
 
-  const BATCH = 50;
-  const batches = [];
-  for (let i = 0; i < TICKERS.length; i += BATCH) batches.push(TICKERS.slice(i, i + BATCH));
+  const apiKey = finnhubKey(req);
+  if (!apiKey) {
+    return res.status(500).json({ error: "未設定 FINNHUB_API_KEY 環境變數" });
+  }
 
   try {
-    const [sparkAll, quoteAll] = await Promise.all([
-      Promise.all(batches.map(fetchSpark)),
-      Promise.all(batches.map(fetchQuotes)),
-    ]);
-
-    const closeMap = {}, quoteMap = {};
-
-    for (const d of sparkAll)
-      for (const item of (d?.spark?.result ?? []))
-        if (item) {
-          const closes = item.response?.[0]?.indicators?.quote?.[0]?.close ?? [];
-          if (closes.length) closeMap[item.symbol] = closes;
-        }
-
-    for (const d of quoteAll)
-      for (const q of (d?.quoteResponse?.result ?? []))
-        quoteMap[q.symbol] = { price: q.regularMarketPrice, changePct: q.regularMarketChangePercent };
-
-    const stocks = TICKERS.map(t => {
-      const closes = closeMap[t];
-      if (!closes || closes.length < 20) return { ticker: t, trend: "unknown", error: "資料不足" };
-      const q = quoteMap[t];
-      return analyze(t, closes, q?.price, q?.changePct);
-    });
+    // Batch 8 tickers at a time with 150ms gap → ~20 batches × 150ms ≈ 3s
+    const stocks = await batchProcess(
+      TICKERS,
+      t => fetchTicker(t, apiKey),
+      8,
+      150
+    );
 
     stocks.sort((a, b) => {
       const r = { bullish: 0, neutral: 1, bearish: 2, unknown: 3 };

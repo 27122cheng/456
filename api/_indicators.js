@@ -1,4 +1,35 @@
-// Shared technical indicator functions (prefixed _ so Vercel ignores as route)
+// Shared technical indicator functions + Finnhub helpers (prefixed _ so Vercel ignores as route)
+
+const FINNHUB_BASE = "https://finnhub.io/api/v1";
+
+export function finnhubKey(req) {
+  // env var set in Vercel project settings
+  return process.env.FINNHUB_API_KEY || "";
+}
+
+export async function finnhubGet(path, params, apiKey) {
+  const qs = new URLSearchParams({ ...params, token: apiKey }).toString();
+  const res = await fetch(`${FINNHUB_BASE}${path}?${qs}`, {
+    signal: AbortSignal.timeout(9000),
+  });
+  if (!res.ok) throw new Error(`Finnhub ${path} HTTP ${res.status}`);
+  return res.json();
+}
+
+// Rate-limit-safe batch processor (Finnhub free: 60 req/min)
+// batchSize tickers × 2 calls each = stay under limit with delay
+export async function batchProcess(items, asyncFn, batchSize = 8, delayMs = 150) {
+  const results = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(asyncFn));
+    results.push(...batchResults);
+    if (i + batchSize < items.length) {
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  return results;
+}
 
 export function sma(arr, n) {
   return arr.map((_, i) =>
@@ -107,12 +138,3 @@ export function analyze(ticker, closePrices, currentPrice, changePct) {
   };
 }
 
-export const FETCH_OPTS = {
-  headers: {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    "Accept": "application/json, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://finance.yahoo.com/",
-  },
-  signal: AbortSignal.timeout(9000),
-};

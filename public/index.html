@@ -322,7 +322,7 @@ async function loadStocks() {
     const res=await fetch('/api/stocks');
     if(!res.ok) throw new Error(`伺服器錯誤 ${res.status}`);
     const data=await res.json();
-    if(data.error) throw new Error(data.error);
+    if(data.error) throw new Error(data.error.includes('FINNHUB_API_KEY') ? '請在 Vercel 專案設定中加入 FINNHUB_API_KEY 環境變數（finnhub.io 免費申請）' : data.error);
     allData=data.stocks;
     updateSummary(allData, data.summary);
     renderCards();

@@ -6,9 +6,9 @@
     "api/search.js": { "maxDuration": 10 }
   },
   "rewrites": [
-    { "source": "/api/stocks",              "destination": "/api/stocks" },
-    { "source": "/api/search",              "destination": "/api/search" },
-    { "source": "/api/ticker",              "destination": "/api/ticker" },
-    { "source": "/((?!api/).*)",            "destination": "/public/index.html" }
+    { "source": "/api/stocks",   "destination": "/api/stocks" },
+    { "source": "/api/search",   "destination": "/api/search" },
+    { "source": "/api/ticker",   "destination": "/api/ticker" },
+    { "source": "/((?!api/).*)", "destination": "/public/index.html" }
   ]
 }

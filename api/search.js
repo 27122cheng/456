@@ -1,5 +1,5 @@
-// Stock autocomplete search via Yahoo Finance
-import { FETCH_OPTS } from "./_indicators.js";
+// Stock autocomplete search via Finnhub symbol search
+import { finnhubKey, finnhubGet } from "./_indicators.js";
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -8,20 +8,20 @@ export default async function handler(req, res) {
   const q = (req.query.q || "").trim();
   if (!q) return res.status(400).json({ error: "缺少搜尋關鍵字" });
 
-  try {
-    const url = `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&lang=en-US&region=US&quotesCount=10&newsCount=0&listsCount=0`;
-    const r = await fetch(url, FETCH_OPTS);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
+  const apiKey = finnhubKey(req);
+  if (!apiKey) return res.status(500).json({ error: "未設定 FINNHUB_API_KEY 環境變數" });
 
-    const results = (data.quotes || [])
-      .filter(item => ["EQUITY", "ETF", "MUTUALFUND"].includes(item.quoteType))
+  try {
+    const data = await finnhubGet("/search", { q }, apiKey);
+
+    const results = (data.result || [])
+      .filter(item => item.type === "Common Stock" || item.type === "ETP")
       .slice(0, 8)
       .map(item => ({
         ticker:   item.symbol,
-        name:     item.longname || item.shortname || item.symbol,
-        exchange: item.exchDisp || item.exchange || "",
-        type:     item.quoteType,
+        name:     item.description || item.symbol,
+        exchange: item.displaySymbol || "",
+        type:     item.type,
       }));
 
     res.status(200).json({ results });
