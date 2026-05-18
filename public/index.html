@@ -980,9 +980,32 @@ async function loadPicks(market) {
     }
 
     grid.innerHTML = picks.map(p => renderPickCard(p)).join('');
+
+    // Auto-send Telegram if enabled
+    autoSendPicksTelegram(picks);
   } catch(e) {
-    grid.innerHTML = '<div class="text-muted text-sm" style="grid-column:1/-1;padding:20px">AI 選股暫時無法使用</div>';
+    grid.innerHTML = '<div class="text-muted text-sm" style="grid-column:1/-1;padding:20px">AI 選股暫時無法使用，請稍後再試</div>';
   }
+}
+
+function autoSendPicksTelegram(picks) {
+  const tgPicks = document.getElementById('tg-picks');
+  if (!tgPicks || !tgPicks.checked) return;
+  const {token, chatId} = getTgCreds();
+  if (!token || !chatId) return;
+
+  const top3 = picks.slice(0, 3);
+  const dateStr = new Date().toLocaleDateString('zh-TW');
+  const lines = top3.map((p, i) =>
+    `${i+1}. ${p.name}(${p.code}) 評分${p.score}分\n   買入區間：${p.buyRange} 元｜目標：${p.target} 元 (+${p.upsidePct}%)`
+  ).join('\n\n');
+  const msg = `📊 AI 選股推薦 — ${dateStr}\n\n${lines}\n\n⚠️ 本訊息由系統自動發送，僅供參考，投資有風險`;
+
+  fetch('/api/telegram', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({message: msg, token, chatId}),
+  }).catch(() => {});
 }
 
 function renderPickCard(p) {
