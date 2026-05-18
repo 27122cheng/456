@@ -1,12 +1,14 @@
 {
   "version": 2,
   "functions": {
-    "api/stocks.js": {
-      "maxDuration": 30
-    }
+    "api/stocks.js": { "maxDuration": 30 },
+    "api/ticker.js": { "maxDuration": 15 },
+    "api/search.js": { "maxDuration": 10 }
   },
   "rewrites": [
-    { "source": "/api/stocks", "destination": "/api/stocks" },
-    { "source": "/(.*)",       "destination": "/public/index.html" }
+    { "source": "/api/stocks",              "destination": "/api/stocks" },
+    { "source": "/api/search",              "destination": "/api/search" },
+    { "source": "/api/ticker",              "destination": "/api/ticker" },
+    { "source": "/((?!api/).*)",            "destination": "/public/index.html" }
   ]
 }
