@@ -592,8 +592,6 @@ tr:hover td{background:var(--surface2)}
 <!-- ── Toast container ── -->
 <div id="toast-container"></div>
 
-<!-- ── TradingView library ── -->
-<script src="https://s3.tradingview.com/tv.js"></script>
 <script>
 'use strict';
 // ═══════════════════════════════════════════════════════════
@@ -640,53 +638,32 @@ function toast(msg, type='info', dur=4000) {
 // ═══════════════════════════════════════════════════════════
 // MINI SYMBOL WIDGETS (TradingView)
 // ═══════════════════════════════════════════════════════════
-function makeMiniWidget(containerId, symbol, locale='zh_TW') {
-  const el = document.getElementById(containerId);
-  if (!el) return;
-  const w = document.createElement('div');
-  el.appendChild(w);
-  if (typeof TradingView !== 'undefined' && TradingView.MiniWidget) {
-    new TradingView.MiniWidget({
-      container: w,
-      symbol,
-      width: '100%',
-      height: 130,
-      locale,
-      colorTheme: 'dark',
-      autosize: false,
-      dateRange: '1D',
-      isTransparent: true,
-      largeChartUrl: '',
-    });
-  } else {
-    // Fallback iframe approach
-    const src = `https://s.tradingview.com/embed-widget/mini-symbol-overview/?locale=zh_TW#${encodeURIComponent(JSON.stringify({symbol,width:'100%',height:130,locale:'zh_TW',colorTheme:'dark',autosize:false,dateRange:'1D',isTransparent:true}))}`;
-    const iframe = document.createElement('iframe');
-    iframe.src = src;
-    iframe.style.cssText = 'width:100%;height:130px;border:none';
-    el.appendChild(iframe);
-  }
-}
-
 function initIndexWidgets() {
-  // Use iframe-based mini widgets (most reliable)
   const widgets = [
-    {id:'tv-twse',  symbol:'TWSE:TAIEX',    badge:'badge-twse'},
-    {id:'tv-tpex',  symbol:'TPEX:GTSM',     badge:'badge-tpex'},
-    {id:'tv-dji',   symbol:'DJ:DJI',         badge:'badge-dji'},
-    {id:'tv-nasdaq',symbol:'NASDAQ:COMP',    badge:'badge-nasdaq'},
+    {id:'tv-twse',   symbol:'TWSE:TAIEX',  badge:'badge-twse'},
+    {id:'tv-tpex',   symbol:'TPEX:GTSM',   badge:'badge-tpex'},
+    {id:'tv-dji',    symbol:'DJ:DJI',       badge:'badge-dji'},
+    {id:'tv-nasdaq', symbol:'NASDAQ:COMP',  badge:'badge-nasdaq'},
   ];
-  widgets.forEach(({id,symbol,badge}) => {
+  widgets.forEach(({id, symbol, badge}) => {
     const el = document.getElementById(id);
     if (!el) return;
-    const iframeUrl = `https://s.tradingview.com/embed-widget/mini-symbol-overview/?locale=zh_TW#${encodeURIComponent(JSON.stringify({
-      symbol, width:'100%', height:130, locale:'zh_TW', colorTheme:'dark',
-      autosize:false, dateRange:'1D', isTransparent:true, trendLineColor:'rgba(88,166,255,0.5)'
-    }))}`;
-    el.innerHTML = `<iframe src="${iframeUrl}" style="width:100%;height:130px;border:none" allowtransparency="true" frameborder="0"></iframe>`;
-    // Badge will be updated by API data
+    // Official TradingView embed-script method (most reliable cross-origin approach)
+    const cfg = JSON.stringify({
+      symbol, width: '100%', height: 130,
+      locale: 'zh_TW', dateRange: '1D',
+      colorTheme: 'dark', isTransparent: true, autosize: true,
+      trendLineColor: 'rgba(88,166,255,0.5)', underLineColor: 'rgba(88,166,255,0.1)',
+    });
+    el.innerHTML = `
+      <div class="tradingview-widget-container" style="height:130px">
+        <div class="tradingview-widget-container__widget"></div>
+        <script type="text/javascript"
+          src="https://s3.tradingview.com/external-embedding/embed-widget-mini-symbol-overview.js"
+          async>${cfg}<\/script>
+      </div>`;
     const b = document.getElementById(badge);
-    if (b) { b.textContent = '載入中…'; b.className='index-badge'; }
+    if (b) { b.textContent = '—'; b.className = 'index-badge'; }
   });
 }
 
@@ -1197,13 +1174,36 @@ function openDetail(code, name) {
   const tvSymbol = isOtc ? `TPEX:${code}` : `TWSE:${code}`;
   document.getElementById('detail-subtitle').textContent = tvSymbol;
 
-  // TradingView Advanced Chart
+  // TradingView Advanced Chart — official script embed
   const chartEl = document.getElementById('detail-chart');
-  chartEl.innerHTML = `<iframe src="https://s.tradingview.com/widgetsnippet/symbol-overview/?symbol=${tvSymbol}&interval=D&theme=dark&style=1&locale=zh_TW&toolbar_bg=%23161b22&enable_publishing=false&hide_top_toolbar=false&hide_legend=false&save_image=false&calendar=false&hide_volume=false" style="width:100%;height:300px;border:none" allowtransparency="true" frameborder="0"></iframe>`;
+  const chartCfg = JSON.stringify({
+    autosize: true, symbol: tvSymbol, interval: 'D', timezone: 'Asia/Taipei',
+    theme: 'dark', style: '1', locale: 'zh_TW', toolbar_bg: '#161b22',
+    enable_publishing: false, hide_top_toolbar: false, hide_legend: false,
+    save_image: false, calendar: false,
+  });
+  chartEl.innerHTML = `
+    <div class="tradingview-widget-container" style="height:300px">
+      <div class="tradingview-widget-container__widget"></div>
+      <script type="text/javascript"
+        src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"
+        async>${chartCfg}<\/script>
+    </div>`;
 
-  // TradingView Technical Analysis
+  // TradingView Technical Analysis — official script embed
   const taEl = document.getElementById('detail-ta');
-  taEl.innerHTML = `<iframe src="https://s.tradingview.com/embed-widget/technical-analysis/?locale=zh_TW#${encodeURIComponent(JSON.stringify({symbol:tvSymbol,width:'100%',height:220,interval:'1D',isTransparent:true,colorTheme:'dark',locale:'zh_TW'})}" style="width:100%;height:220px;border:none" allowtransparency="true" frameborder="0"></iframe>`;
+  const taCfg = JSON.stringify({
+    interval: '1D', width: '100%', isTransparent: true,
+    height: 220, symbol: tvSymbol, showIntervalTabs: true,
+    displayMode: 'single', locale: 'zh_TW', colorTheme: 'dark',
+  });
+  taEl.innerHTML = `
+    <div class="tradingview-widget-container" style="height:220px">
+      <div class="tradingview-widget-container__widget"></div>
+      <script type="text/javascript"
+        src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js"
+        async>${taCfg}<\/script>
+    </div>`;
 
   renderWatchlist(); // update selection highlight
   loadDetailTabs(code, name);
