@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "functions": {
+    "api/stocks.js": {
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/api/stocks", "destination": "/api/stocks" },
+    { "source": "/(.*)",       "destination": "/public/index.html" }
+  ]
+}

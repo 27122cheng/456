@@ -1,0 +1,8 @@
+{
+  "name": "stock-trend-detector",
+  "version": "1.0.0",
+  "description": "100-stock real-time trend detector using Yahoo Finance",
+  "engines": {
+    "node": ">=18"
+  }
+}
