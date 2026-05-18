@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>股票趨勢偵測器</title>
+  <style>
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --surface2: #21262d;
+      --border:   #30363d;
+      --text:     #c9d1d9;
+      --muted:    #8b949e;
+      --bullish:  #3fb950;
+      --bearish:  #f85149;
+      --neutral:  #d29922;
+      --accent:   #58a6ff;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text); min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 700; color: var(--accent); }
+    header .sub { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+    .demo-badge {
+      background: rgba(210,153,34,0.15); color: var(--neutral);
+      border: 1px solid rgba(210,153,34,0.3);
+      padding: 3px 10px; border-radius: 12px; font-size: 0.72rem; font-weight: 600;
+    }
+    #refresh-btn {
+      background: var(--accent); color: #0d1117; border: none;
+      padding: 8px 18px; border-radius: 6px; font-weight: 700; font-size: 0.85rem;
+      cursor: pointer; transition: opacity .2s;
+    }
+    #refresh-btn:hover { opacity: .85; }
+    #refresh-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* ── Summary ── */
+    .summary-row {
+      display: flex; gap: 12px; padding: 14px 24px; flex-wrap: wrap; align-items: stretch;
+    }
+    .sum-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 12px 18px;
+      display: flex; flex-direction: column; align-items: center; min-width: 100px;
+    }
+    .sum-card .count { font-size: 2rem; font-weight: 800; line-height: 1; }
+    .sum-card .lbl   { font-size: 0.72rem; color: var(--muted); margin-top: 3px; }
+    .sum-card.bull .count { color: var(--bullish); }
+    .sum-card.bear .count { color: var(--bearish); }
+    .sum-card.neu  .count { color: var(--neutral);  }
+
+    .market-meter {
+      flex: 1; min-width: 200px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px;
+      display: flex; flex-direction: column; justify-content: center; gap: 8px;
+    }
+    .meter-lbl { font-size: 0.72rem; color: var(--muted); }
+    .meter-track {
+      height: 10px; border-radius: 5px; background: var(--border);
+      overflow: hidden; display: flex;
+    }
+    .seg { height: 100%; transition: width .6s ease; }
+    .seg.bull { background: var(--bullish); }
+    .seg.neu  { background: var(--neutral);  }
+    .seg.bear { background: var(--bearish);  }
+
+    /* ── Controls ── */
+    .controls {
+      padding: 4px 24px 10px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    }
+    .f-btn {
+      padding: 5px 14px; border-radius: 20px;
+      border: 1px solid var(--border); background: transparent;
+      color: var(--text); font-size: 0.8rem; cursor: pointer; transition: all .15s;
+    }
+    .f-btn:hover { border-color: var(--accent); }
+    .f-btn.active.all  { background: var(--accent);   border-color: var(--accent);   color: #000; font-weight: 700; }
+    .f-btn.active.bull { background: var(--bullish);   border-color: var(--bullish);   color: #000; font-weight: 700; }
+    .f-btn.active.neu  { background: var(--neutral);   border-color: var(--neutral);   color: #000; font-weight: 700; }
+    .f-btn.active.bear { background: var(--bearish);   border-color: var(--bearish);   color: #fff; font-weight: 700; }
+
+    .sort-sel {
+      margin-left: auto;
+      background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); padding: 5px 10px; border-radius: 6px; font-size: 0.8rem; outline: none;
+    }
+    #search {
+      background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); padding: 5px 12px; border-radius: 6px; font-size: 0.85rem;
+      outline: none; width: 160px;
+    }
+    #search:focus { border-color: var(--accent); }
+
+    #ts { font-size: 0.72rem; color: var(--muted); padding: 0 24px 8px; }
+
+    /* ── Grid & Cards ── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+      gap: 10px; padding: 0 24px 24px;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px; position: relative; overflow: hidden;
+      transition: transform .15s, border-color .15s;
+    }
+    .card:hover { transform: translateY(-2px); border-color: var(--accent); }
+    .card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; }
+    .card.bullish::before { background: var(--bullish); }
+    .card.bearish::before { background: var(--bearish); }
+    .card.neutral::before { background: var(--neutral); }
+
+    .card-top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+    .ticker-name .ticker { font-size: 1.05rem; font-weight: 700; }
+    .ticker-name .name   { font-size: 0.68rem; color: var(--muted); margin-top: 1px; }
+
+    .badge {
+      padding: 3px 9px; border-radius: 12px; font-size: 0.7rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .4px; white-space: nowrap;
+    }
+    .badge.bullish { background: rgba(63,185,80,.14);  color: var(--bullish); }
+    .badge.bearish { background: rgba(248,81,73,.14);  color: var(--bearish); }
+    .badge.neutral { background: rgba(210,153,34,.14); color: var(--neutral); }
+
+    .score-bar { height: 3px; border-radius: 2px; background: var(--border); margin-bottom: 10px; overflow: hidden; }
+    .score-fill { height: 100%; border-radius: 2px; transition: width .5s; }
+
+    .price-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+    .price { font-size: 1.35rem; font-weight: 800; }
+    .chg   { font-size: 0.82rem; font-weight: 600; }
+    .pos   { color: var(--bullish); }
+    .neg   { color: var(--bearish); }
+
+    .metrics {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-bottom: 10px;
+    }
+    .metric { background: var(--surface2); border-radius: 6px; padding: 6px 8px; }
+    .m-lbl  { font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: .4px; }
+    .m-val  { font-size: 0.88rem; font-weight: 700; margin-top: 1px; }
+    .overbought { color: var(--bearish); }
+    .oversold   { color: var(--bullish); }
+
+    .sigs { display: flex; flex-wrap: wrap; gap: 3px; }
+    .sig {
+      font-size: 0.62rem; padding: 2px 6px; border-radius: 4px; font-weight: 600;
+    }
+    .sig.bullish { background: rgba(63,185,80,.12);  color: var(--bullish); }
+    .sig.bearish { background: rgba(248,81,73,.12);  color: var(--bearish); }
+    .sig.neutral { background: rgba(210,153,34,.12); color: var(--neutral); }
+
+    /* ── Loading ── */
+    #loading {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 80px 24px; gap: 14px;
+    }
+    .spinner {
+      width: 38px; height: 38px;
+      border: 3px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin .75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .load-txt { color: var(--muted); font-size: 0.88rem; }
+    .progress-wrap {
+      width: 260px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden;
+    }
+    #progress-fill { height: 100%; background: var(--accent); border-radius: 2px; width: 0; transition: width .3s; }
+
+    @media (max-width: 600px) {
+      .grid { grid-template-columns: 1fr; padding: 0 12px 20px; }
+      header, .summary-row, .controls, #ts { padding-left: 12px; padding-right: 12px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <h1>股票趨勢偵測器</h1>
+      <span class="demo-badge">DEMO 模擬資料</span>
+    </div>
+    <div class="sub">100 支股票 · RSI · MACD · 雙均線 · 動能 · 布林帶 — 五指標綜合判斷</div>
+  </div>
+  <button id="refresh-btn" onclick="run()">重新分析</button>
+</header>
+
+<div class="summary-row">
+  <div class="sum-card bull"><span class="count" id="c-bull">—</span><span class="lbl">▲ 看漲</span></div>
+  <div class="sum-card neu" ><span class="count" id="c-neu" >—</span><span class="lbl">— 中立</span></div>
+  <div class="sum-card bear"><span class="count" id="c-bear">—</span><span class="lbl">▼ 看跌</span></div>
+  <div class="market-meter">
+    <span class="meter-lbl">市場情緒分佈</span>
+    <div class="meter-track">
+      <div class="seg bull" id="mb"></div>
+      <div class="seg neu"  id="mn"></div>
+      <div class="seg bear" id="mk"></div>
+    </div>
+    <span class="meter-lbl" id="meter-txt">—</span>
+  </div>
+</div>
+
+<div class="controls">
+  <button class="f-btn active all"  onclick="setFilter('all',this)">全部 <span id="cnt-all"></span></button>
+  <button class="f-btn bull"        onclick="setFilter('bullish',this)">看漲 <span id="cnt-bull"></span></button>
+  <button class="f-btn neu"         onclick="setFilter('neutral',this)">中立 <span id="cnt-neu"></span></button>
+  <button class="f-btn bear"        onclick="setFilter('bearish',this)">看跌 <span id="cnt-bear"></span></button>
+  <select class="sort-sel" id="sort-sel" onchange="renderCards()">
+    <option value="trend">依趨勢排序</option>
+    <option value="score-desc">分數高→低</option>
+    <option value="score-asc">分數低→高</option>
+    <option value="chg-desc">漲幅高→低</option>
+    <option value="chg-asc">跌幅大→小</option>
+    <option value="rsi-desc">RSI 高→低</option>
+    <option value="alpha">代碼 A→Z</option>
+  </select>
+  <input id="search" type="text" placeholder="搜尋代碼/名稱…" oninput="renderCards()" />
+</div>
+<div id="ts"></div>
+<div id="loading">
+  <div class="spinner"></div>
+  <div class="load-txt" id="load-txt">正在計算技術指標…</div>
+  <div class="progress-wrap"><div id="progress-fill"></div></div>
+</div>
+<div class="grid" id="grid"></div>
+
+<script>
+// ── Stock universe (100 stocks) ──────────────────────────────────────────────
+const STOCKS = [
+  // Tech (25)
+  {t:"AAPL",  n:"Apple"},          {t:"MSFT",  n:"Microsoft"},
+  {t:"GOOGL", n:"Alphabet"},       {t:"META",  n:"Meta"},
+  {t:"NVDA",  n:"NVIDIA"},         {t:"AMD",   n:"AMD"},
+  {t:"INTC",  n:"Intel"},          {t:"TSLA",  n:"Tesla"},
+  {t:"AMZN",  n:"Amazon"},         {t:"CRM",   n:"Salesforce"},
+  {t:"ORCL",  n:"Oracle"},         {t:"ADBE",  n:"Adobe"},
+  {t:"QCOM",  n:"Qualcomm"},       {t:"TXN",   n:"Texas Instruments"},
+  {t:"MU",    n:"Micron"},         {t:"AMAT",  n:"Applied Materials"},
+  {t:"LRCX",  n:"Lam Research"},   {t:"KLAC",  n:"KLA Corp"},
+  {t:"MRVL",  n:"Marvell Tech"},   {t:"AVGO",  n:"Broadcom"},
+  {t:"NFLX",  n:"Netflix"},        {t:"SNOW",  n:"Snowflake"},
+  {t:"PLTR",  n:"Palantir"},       {t:"UBER",  n:"Uber"},
+  {t:"LYFT",  n:"Lyft"},
+  // Finance (15)
+  {t:"JPM",   n:"JPMorgan"},       {t:"BAC",   n:"Bank of America"},
+  {t:"GS",    n:"Goldman Sachs"},  {t:"WFC",   n:"Wells Fargo"},
+  {t:"MS",    n:"Morgan Stanley"}, {t:"C",     n:"Citigroup"},
+  {t:"BLK",   n:"BlackRock"},      {t:"AXP",   n:"Amex"},
+  {t:"V",     n:"Visa"},           {t:"MA",    n:"Mastercard"},
+  {t:"PYPL",  n:"PayPal"},         {t:"SQ",    n:"Block"},
+  {t:"SCHW",  n:"Charles Schwab"}, {t:"USB",   n:"US Bancorp"},
+  {t:"TFC",   n:"Truist"},
+  // Healthcare (10)
+  {t:"JNJ",   n:"J&J"},            {t:"PFE",   n:"Pfizer"},
+  {t:"UNH",   n:"UnitedHealth"},   {t:"ABBV",  n:"AbbVie"},
+  {t:"MRK",   n:"Merck"},          {t:"LLY",   n:"Eli Lilly"},
+  {t:"TMO",   n:"Thermo Fisher"},  {t:"ABT",   n:"Abbott"},
+  {t:"DHR",   n:"Danaher"},        {t:"BMY",   n:"Bristol-Myers"},
+  // Consumer Disc. (10)
+  {t:"MCD",   n:"McDonald's"},     {t:"NKE",   n:"Nike"},
+  {t:"SBUX",  n:"Starbucks"},      {t:"TGT",   n:"Target"},
+  {t:"HD",    n:"Home Depot"},     {t:"LOW",   n:"Lowe's"},
+  {t:"BKNG",  n:"Booking"},        {t:"CMG",   n:"Chipotle"},
+  {t:"F",     n:"Ford"},           {t:"GM",    n:"General Motors"},
+  // Consumer Staples (8)
+  {t:"KO",    n:"Coca-Cola"},      {t:"PEP",   n:"PepsiCo"},
+  {t:"PG",    n:"P&G"},            {t:"WMT",   n:"Walmart"},
+  {t:"COST",  n:"Costco"},         {t:"PM",    n:"Philip Morris"},
+  {t:"CL",    n:"Colgate"},        {t:"KHC",   n:"Kraft Heinz"},
+  // Energy (8)
+  {t:"XOM",   n:"ExxonMobil"},     {t:"CVX",   n:"Chevron"},
+  {t:"COP",   n:"ConocoPhillips"}, {t:"SLB",   n:"SLB"},
+  {t:"EOG",   n:"EOG Resources"},  {t:"MPC",   n:"Marathon Pete."},
+  {t:"VLO",   n:"Valero"},         {t:"HAL",   n:"Halliburton"},
+  // Communication (6)
+  {t:"DIS",   n:"Disney"},         {t:"CMCSA", n:"Comcast"},
+  {t:"T",     n:"AT&T"},           {t:"VZ",    n:"Verizon"},
+  {t:"TMUS",  n:"T-Mobile"},       {t:"SNAP",  n:"Snap"},
+  // Industrials (8)
+  {t:"BA",    n:"Boeing"},         {t:"CAT",   n:"Caterpillar"},
+  {t:"GE",    n:"GE Aerospace"},   {t:"HON",   n:"Honeywell"},
+  {t:"UPS",   n:"UPS"},            {t:"FDX",   n:"FedEx"},
+  {t:"DE",    n:"Deere"},          {t:"LMT",   n:"Lockheed Martin"},
+  // Materials & Utilities & REIT (10)
+  {t:"LIN",   n:"Linde"},          {t:"APD",   n:"Air Products"},
+  {t:"NEM",   n:"Newmont"},        {t:"FCX",   n:"Freeport-McMoRan"},
+  {t:"NEE",   n:"NextEra Energy"}, {t:"DUK",   n:"Duke Energy"},
+  {t:"SO",    n:"Southern Co."},   {t:"AMT",   n:"American Tower"},
+  {t:"PLD",   n:"Prologis"},       {t:"SPG",   n:"Simon Property"},
+];
+
+// ── PRNG for reproducible-per-run randomness ─────────────────────────────────
+function mulberry32(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = t + Math.imul(t ^ (t >>> 7), 61 | t) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ── Generate simulated OHLCV price series ────────────────────────────────────
+function genPriceSeries(ticker, seed, days = 60) {
+  const rand = mulberry32(seed);
+  // Base price from ticker hash
+  const base = 20 + (seed % 500);
+  // Drift: slight random bias so stocks naturally land in different zones
+  const drift = (rand() - 0.48) * 0.0008;
+  const vol   = 0.012 + rand() * 0.015;
+
+  const prices = [base];
+  const volumes = [];
+  for (let i = 1; i < days; i++) {
+    const r = rand();
+    const dailyReturn = drift + vol * (r * 2 - 1) * Math.sqrt(1);
+    prices.push(Math.max(1, prices[i-1] * (1 + dailyReturn)));
+    volumes.push(500000 + rand() * 5000000);
+  }
+  volumes.push(500000 + rand() * 5000000);
+  return { prices, volumes };
+}
+
+// ── Technical indicators ─────────────────────────────────────────────────────
+function sma(arr, n) {
+  return arr.map((_, i) => i < n - 1 ? NaN : arr.slice(i - n + 1, i + 1).reduce((a,b) => a+b) / n);
+}
+
+function ema(arr, n) {
+  const k = 2 / (n + 1);
+  const out = [arr[0]];
+  for (let i = 1; i < arr.length; i++) out.push(arr[i] * k + out[i-1] * (1 - k));
+  return out;
+}
+
+function rsi(prices, n = 14) {
+  const gains = [], losses = [];
+  for (let i = 1; i < prices.length; i++) {
+    const d = prices[i] - prices[i-1];
+    gains.push(Math.max(0, d));
+    losses.push(Math.max(0, -d));
+  }
+  // Wilder smoothing
+  let ag = gains.slice(0, n).reduce((a,b)=>a+b)/n;
+  let al = losses.slice(0, n).reduce((a,b)=>a+b)/n;
+  const out = new Array(n).fill(NaN);
+  out.push(100 - 100/(1 + ag/al));
+  for (let i = n; i < gains.length; i++) {
+    ag = (ag * (n-1) + gains[i]) / n;
+    al = (al * (n-1) + losses[i]) / n;
+    out.push(100 - 100/(1 + (al===0 ? Infinity : ag/al)));
+  }
+  return out;
+}
+
+function bollingerBands(prices, n = 20, k = 2) {
+  const mid = sma(prices, n);
+  const upper = [], lower = [];
+  for (let i = 0; i < prices.length; i++) {
+    if (i < n-1) { upper.push(NaN); lower.push(NaN); continue; }
+    const slice = prices.slice(i-n+1, i+1);
+    const mean = mid[i];
+    const std  = Math.sqrt(slice.reduce((s, x) => s + (x-mean)**2, 0) / n);
+    upper.push(mean + k*std); lower.push(mean - k*std);
+  }
+  return { mid, upper, lower };
+}
+
+function analyzeStock(info, seed) {
+  const { prices, volumes } = genPriceSeries(info.t, seed);
+  const n = prices.length;
+
+  const ma20arr = sma(prices, 20);
+  const ma50arr = sma(prices, Math.min(50, n));
+  const rsiArr  = rsi(prices, 14);
+  const ema12   = ema(prices, 12);
+  const ema26   = ema(prices, 26);
+  const macdLine = ema12.map((v,i) => v - ema26[i]);
+  const sigLine  = ema(macdLine, 9);
+  const macdHist = macdLine.map((v,i) => v - sigLine[i]);
+  const bb       = bollingerBands(prices, 20);
+
+  const last   = prices[n-1];
+  const prev   = prices[n-2];
+  const ma20   = ma20arr[n-1];
+  const ma50   = ma50arr[n-1];
+  const rsiVal = rsiArr[n-1];
+  const hist   = macdHist[n-1];
+  const bbUpper= bb.upper[n-1];
+  const bbLower= bb.lower[n-1];
+  const bbMid  = bb.mid[n-1];
+
+  const chgPct    = ((last - prev) / prev) * 100;
+  const mom5d     = ((last - prices[Math.max(0,n-6)]) / prices[Math.max(0,n-6)]) * 100;
+  const mom20d    = ((last - prices[Math.max(0,n-21)]) / prices[Math.max(0,n-21)]) * 100;
+
+  // Vol ratio vs 20-day avg
+  const avgVol = volumes.slice(-20).reduce((a,b)=>a+b)/20;
+  const volRatio = volumes[n-1] / avgVol;
+
+  // ── Scoring (5 signals) ──
+  let score = 0;
+  const signals = {};
+
+  // 1. Price vs MA20
+  if (!isNaN(ma20)) {
+    if (last > ma20) { score += 1; signals["價格>MA20"] = "bullish"; }
+    else             { score -= 1; signals["價格>MA20"] = "bearish"; }
+  }
+
+  // 2. MA20 vs MA50 (golden/death cross)
+  if (!isNaN(ma50) && !isNaN(ma20)) {
+    if (ma20 > ma50) { score += 1; signals["MA20>MA50"] = "bullish"; }
+    else             { score -= 1; signals["MA20>MA50"] = "bearish"; }
+  }
+
+  // 3. RSI
+  if (!isNaN(rsiVal)) {
+    if      (rsiVal > 55) { score += 1; signals[`RSI(${rsiVal.toFixed(0)})`] = "bullish"; }
+    else if (rsiVal < 45) { score -= 1; signals[`RSI(${rsiVal.toFixed(0)})`] = "bearish"; }
+    else                  {             signals[`RSI(${rsiVal.toFixed(0)})`] = "neutral";  }
+  }
+
+  // 4. MACD histogram
+  if (!isNaN(hist)) {
+    if (hist > 0) { score += 1; signals["MACD柱狀"] = "bullish"; }
+    else          { score -= 1; signals["MACD柱狀"] = "bearish"; }
+  }
+
+  // 5. Bollinger Band position
+  if (!isNaN(bbUpper) && !isNaN(bbLower)) {
+    const bbPct = (last - bbLower) / (bbUpper - bbLower);
+    if      (bbPct > 0.6)  { score += 1; signals["布林帶位置"] = "bullish"; }
+    else if (bbPct < 0.4)  { score -= 1; signals["布林帶位置"] = "bearish"; }
+    else                   {             signals["布林帶位置"] = "neutral";  }
+  }
+
+  const trend = score >= 3 ? "bullish" : score <= -3 ? "bearish" : "neutral";
+
+  return {
+    ticker: info.t, name: info.n, price: last, changePct: chgPct,
+    mom5d, mom20d, rsi: rsiVal, ma20, ma50,
+    macdHist: hist, volRatio, score, trend, signals,
+    bbUpper, bbLower, bbMid
+  };
+}
+
+// ── State ────────────────────────────────────────────────────────────────────
+let allData = [];
+let currentFilter = 'all';
+
+function setFilter(f, el) {
+  currentFilter = f;
+  document.querySelectorAll('.f-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  renderCards();
+}
+
+function renderCards() {
+  const q   = (document.getElementById('search').value || '').toUpperCase().trim();
+  const srt = document.getElementById('sort-sel').value;
+
+  let data = allData.filter(s => {
+    if (q && !s.ticker.includes(q) && !s.name.toUpperCase().includes(q)) return false;
+    if (currentFilter !== 'all' && s.trend !== currentFilter) return false;
+    return true;
+  });
+
+  data = [...data].sort((a, b) => {
+    if (srt === 'trend') {
+      const rank = {bullish: 0, neutral: 1, bearish: 2};
+      return (rank[a.trend] - rank[b.trend]) || (b.score - a.score);
+    }
+    if (srt === 'score-desc') return b.score - a.score;
+    if (srt === 'score-asc')  return a.score - b.score;
+    if (srt === 'chg-desc')   return b.changePct - a.changePct;
+    if (srt === 'chg-asc')    return a.changePct - b.changePct;
+    if (srt === 'rsi-desc')   return b.rsi - a.rsi;
+    if (srt === 'alpha')      return a.ticker.localeCompare(b.ticker);
+    return 0;
+  });
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  data.forEach(s => grid.appendChild(buildCard(s)));
+}
+
+function buildCard(s) {
+  const div  = document.createElement('div');
+  div.className = `card ${s.trend}`;
+
+  const chgCls  = s.changePct >= 0 ? 'pos' : 'neg';
+  const chgSign = s.changePct >= 0 ? '+' : '';
+  const mom5Cls = s.mom5d >= 0 ? 'pos' : 'neg';
+  const mom5Sign= s.mom5d >= 0 ? '+' : '';
+
+  const scoreW = ((s.score + 5) / 10 * 100).toFixed(0);
+  const scoreFill = s.trend === 'bullish' ? 'var(--bullish)' : s.trend === 'bearish' ? 'var(--bearish)' : 'var(--neutral)';
+
+  const rsiCls = s.rsi >= 70 ? 'overbought' : s.rsi <= 30 ? 'oversold' : '';
+  const rsiLabel = s.rsi >= 70 ? '超買' : s.rsi <= 30 ? '超賣' : '';
+
+  const trendLabel = {bullish:'▲ 看漲', bearish:'▼ 看跌', neutral:'— 中立'};
+
+  const sigsHtml = Object.entries(s.signals).map(([k,v]) =>
+    `<span class="sig ${v}">${k}</span>`
+  ).join('');
+
+  // Mini sparkline using inline SVG
+  div.innerHTML = `
+    <div class="card-top">
+      <div class="ticker-name">
+        <div class="ticker">${s.ticker}</div>
+        <div class="name">${s.name}</div>
+      </div>
+      <span class="badge ${s.trend}">${trendLabel[s.trend]}</span>
+    </div>
+    <div class="score-bar">
+      <div class="score-fill" style="width:${scoreW}%;background:${scoreFill}"></div>
+    </div>
+    <div class="price-row">
+      <span class="price">$${s.price.toFixed(2)}</span>
+      <span class="chg ${chgCls}">${chgSign}${s.changePct.toFixed(2)}%</span>
+    </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="m-lbl">RSI(14) ${rsiLabel}</div>
+        <div class="m-val ${rsiCls}">${s.rsi.toFixed(1)}</div>
+      </div>
+      <div class="metric">
+        <div class="m-lbl">5日動能</div>
+        <div class="m-val ${mom5Cls}">${mom5Sign}${s.mom5d.toFixed(2)}%</div>
+      </div>
+      <div class="metric">
+        <div class="m-lbl">MA20</div>
+        <div class="m-val">$${s.ma20.toFixed(2)}</div>
+      </div>
+      <div class="metric">
+        <div class="m-lbl">MA50</div>
+        <div class="m-val">$${s.ma50.toFixed(2)}</div>
+      </div>
+    </div>
+    <div class="sigs">${sigsHtml}</div>
+  `;
+  return div;
+}
+
+function updateSummary(data) {
+  const bull = data.filter(d => d.trend === 'bullish').length;
+  const neu  = data.filter(d => d.trend === 'neutral').length;
+  const bear = data.filter(d => d.trend === 'bearish').length;
+  const tot  = data.length;
+
+  document.getElementById('c-bull').textContent = bull;
+  document.getElementById('c-neu').textContent  = neu;
+  document.getElementById('c-bear').textContent = bear;
+
+  const pb = (bull/tot*100).toFixed(1);
+  const pn = (neu/tot*100).toFixed(1);
+  const pk = (bear/tot*100).toFixed(1);
+
+  document.getElementById('mb').style.width = pb + '%';
+  document.getElementById('mn').style.width = pn + '%';
+  document.getElementById('mk').style.width = pk + '%';
+  document.getElementById('meter-txt').textContent = `看漲 ${pb}%  ·  中立 ${pn}%  ·  看跌 ${pk}%`;
+
+  document.getElementById('cnt-all').textContent  = `(${tot})`;
+  document.getElementById('cnt-bull').textContent = `(${bull})`;
+  document.getElementById('cnt-neu').textContent  = `(${neu})`;
+  document.getElementById('cnt-bear').textContent = `(${bear})`;
+}
+
+async function run() {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true; btn.textContent = '計算中…';
+  document.getElementById('loading').style.display  = 'flex';
+  document.getElementById('grid').innerHTML = '';
+  allData = [];
+
+  // Unique seed per run (changes with each click)
+  const baseSeed = Date.now() & 0xFFFFFF;
+
+  const total = STOCKS.length;
+  for (let i = 0; i < total; i++) {
+    const seed = (baseSeed + i * 1337) >>> 0;
+    allData.push(analyzeStock(STOCKS[i], seed));
+    const pct = ((i+1)/total*100).toFixed(0);
+    document.getElementById('progress-fill').style.width = pct + '%';
+    document.getElementById('load-txt').textContent = `正在分析 ${STOCKS[i].t} (${i+1}/${total})…`;
+    if (i % 5 === 0) await new Promise(r => setTimeout(r, 0)); // yield to UI
+  }
+
+  updateSummary(allData);
+  renderCards();
+
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('ts').textContent = `最後分析時間：${new Date().toLocaleString('zh-TW')}`;
+
+  btn.disabled = false; btn.textContent = '重新分析';
+}
+
+run();
+</script>
+</body>
+</html>
