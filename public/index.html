@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>股票趨勢偵測器 · 即時資料</title>
+  <title>股票趨勢分析 · TradingView</title>
   <style>
     :root {
       --bg:#0d1117; --surface:#161b22; --surface2:#21262d; --border:#30363d;
@@ -11,134 +11,135 @@
       --bullish:#3fb950; --bearish:#f85149; --neutral:#d29922; --accent:#58a6ff;
     }
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+      background:var(--bg);color:var(--text);min-height:100vh}
 
     /* ── Header ── */
-    header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-    header h1{font-size:1.3rem;font-weight:700;color:var(--accent)}
-    .sub{font-size:.73rem;color:var(--muted);margin-top:3px}
-    .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bullish);margin-right:6px;animation:pulse 1.8s ease-in-out infinite}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-    #refresh-btn{background:var(--accent);color:#0d1117;border:none;padding:8px 18px;border-radius:6px;font-weight:700;font-size:.85rem;cursor:pointer;transition:opacity .2s}
-    #refresh-btn:hover{opacity:.85}
-    #refresh-btn:disabled{opacity:.45;cursor:not-allowed}
+    header{background:var(--surface);border-bottom:1px solid var(--border);
+      padding:14px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+    header h1{font-size:1.25rem;font-weight:700;color:var(--accent)}
+    .sub{font-size:.72rem;color:var(--muted);margin-top:2px}
+    .tv-badge{
+      background:rgba(41,98,255,.15);color:#2962ff;
+      border:1px solid rgba(41,98,255,.3);
+      padding:3px 10px;border-radius:12px;font-size:.72rem;font-weight:700}
 
-    /* ── Search Hero ── */
-    .search-hero{padding:20px 24px 8px;max-width:720px}
-    .search-hero h2{font-size:1rem;font-weight:600;color:var(--text);margin-bottom:10px}
+    /* ── Search ── */
+    .search-section{padding:18px 24px 10px;max-width:700px}
+    .search-section h2{font-size:.95rem;font-weight:600;margin-bottom:10px}
     .search-wrap{position:relative;display:flex;gap:0}
     #hero-input{
       flex:1;background:var(--surface);border:1px solid var(--border);border-right:none;
       color:var(--text);padding:10px 16px;border-radius:8px 0 0 8px;
-      font-size:1rem;outline:none;transition:border-color .2s
-    }
+      font-size:1rem;outline:none;transition:border-color .2s}
     #hero-input:focus{border-color:var(--accent)}
     #hero-input::placeholder{color:var(--muted)}
-    #search-go-btn{
+    #go-btn{
       background:var(--accent);color:#0d1117;border:none;
-      padding:10px 20px;border-radius:0 8px 8px 0;font-weight:700;font-size:.9rem;
-      cursor:pointer;white-space:nowrap;transition:opacity .2s
-    }
-    #search-go-btn:hover{opacity:.85}
-    #search-go-btn:disabled{opacity:.5;cursor:not-allowed}
-
-    /* Dropdown */
+      padding:10px 22px;border-radius:0 8px 8px 0;font-weight:700;font-size:.9rem;
+      cursor:pointer;transition:opacity .2s;white-space:nowrap}
+    #go-btn:hover{opacity:.85}
     #autocomplete{
-      position:absolute;top:100%;left:0;right:0;z-index:100;
+      position:absolute;top:100%;left:0;right:0;z-index:200;
       background:var(--surface);border:1px solid var(--border);border-top:none;
-      border-radius:0 0 8px 8px;overflow:hidden;display:none;
-    }
+      border-radius:0 0 8px 8px;overflow:hidden;display:none}
     .ac-item{
-      padding:10px 16px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;
-      transition:background .1s;border-bottom:1px solid var(--border);
-    }
+      padding:9px 16px;cursor:pointer;display:flex;justify-content:space-between;
+      align-items:center;gap:8px;border-bottom:1px solid var(--border);transition:background .1s}
     .ac-item:last-child{border-bottom:none}
     .ac-item:hover,.ac-item.focused{background:var(--surface2)}
-    .ac-ticker{font-weight:700;font-size:.9rem;color:var(--accent);min-width:70px}
-    .ac-name{font-size:.8rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .ac-exch{font-size:.7rem;color:var(--muted);white-space:nowrap}
+    .ac-sym{font-weight:700;font-size:.88rem;color:var(--accent);min-width:70px}
+    .ac-name{font-size:.78rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .ac-exch{font-size:.68rem;color:var(--muted);white-space:nowrap}
 
-    /* Search result card */
-    #search-result{padding:0 24px 16px;max-width:420px;display:none}
-    .result-label{font-size:.72rem;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:6px}
-    .result-label button{background:none;border:none;color:var(--muted);cursor:pointer;font-size:.72rem;padding:1px 6px;border-radius:4px}
-    .result-label button:hover{color:var(--bearish)}
+    /* ── Analysis Panel ── */
+    #analysis-panel{
+      display:none;padding:0 24px 20px;
+      animation:fadeIn .3s ease}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+    .panel-header{
+      display:flex;align-items:center;justify-content:space-between;
+      margin-bottom:12px;flex-wrap:wrap;gap:8px}
+    .panel-title{font-size:1.1rem;font-weight:700}
+    .panel-symbol{font-size:.8rem;color:var(--muted)}
+    .close-btn{
+      background:none;border:1px solid var(--border);color:var(--muted);
+      padding:5px 12px;border-radius:6px;cursor:pointer;font-size:.8rem;transition:all .15s}
+    .close-btn:hover{border-color:var(--bearish);color:var(--bearish)}
+    .interval-btns{display:flex;gap:4px}
+    .ivl-btn{
+      background:var(--surface2);border:1px solid var(--border);color:var(--muted);
+      padding:4px 10px;border-radius:5px;cursor:pointer;font-size:.75rem;transition:all .15s}
+    .ivl-btn:hover,.ivl-btn.active{background:var(--accent);border-color:var(--accent);color:#000;font-weight:700}
 
-    /* ── Summary ── */
-    .summary-row{display:flex;gap:12px;padding:14px 24px;flex-wrap:wrap;align-items:stretch}
-    .sum-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 18px;display:flex;flex-direction:column;align-items:center;min-width:100px}
-    .sum-card .count{font-size:2rem;font-weight:800;line-height:1}
-    .sum-card .lbl{font-size:.72rem;color:var(--muted);margin-top:3px}
-    .sum-card.bull .count{color:var(--bullish)}
-    .sum-card.bear .count{color:var(--bearish)}
-    .sum-card.neu  .count{color:var(--neutral)}
-    .market-meter{flex:1;min-width:200px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:12px 18px;display:flex;flex-direction:column;justify-content:center;gap:8px}
-    .meter-lbl{font-size:.72rem;color:var(--muted)}
-    .meter-track{height:10px;border-radius:5px;background:var(--border);overflow:hidden;display:flex}
-    .seg{height:100%;transition:width .6s ease}
-    .seg.bull{background:var(--bullish)} .seg.neu{background:var(--neutral)} .seg.bear{background:var(--bearish)}
-
-    /* ── Controls ── */
-    .controls{padding:4px 24px 10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-    .f-btn{padding:5px 14px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--text);font-size:.8rem;cursor:pointer;transition:all .15s}
-    .f-btn:hover{border-color:var(--accent)}
-    .f-btn.active.all {background:var(--accent);  border-color:var(--accent);  color:#000;font-weight:700}
-    .f-btn.active.bull{background:var(--bullish); border-color:var(--bullish); color:#000;font-weight:700}
-    .f-btn.active.neu {background:var(--neutral); border-color:var(--neutral); color:#000;font-weight:700}
-    .f-btn.active.bear{background:var(--bearish); border-color:var(--bearish); color:#fff;font-weight:700}
-    .sort-sel{margin-left:auto;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:6px;font-size:.8rem;outline:none}
-    #grid-search{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 12px;border-radius:6px;font-size:.85rem;outline:none;width:150px}
-    #grid-search:focus{border-color:var(--accent)}
-    #ts{font-size:.72rem;color:var(--muted);padding:0 24px 8px}
-
-    /* ── Cards ── */
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:10px;padding:0 24px 24px}
-    .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;position:relative;overflow:hidden;transition:transform .15s,border-color .15s}
-    .card:hover{transform:translateY(-2px);border-color:var(--accent)}
-    .card::before{content:"";position:absolute;top:0;left:0;right:0;height:3px}
-    .card.bullish::before{background:var(--bullish)}
-    .card.bearish::before{background:var(--bearish)}
-    .card.neutral::before{background:var(--neutral)}
-    .card.unknown::before{background:var(--muted)}
-    .card-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
-    .ticker{font-size:1.05rem;font-weight:700}
-    .badge{padding:3px 9px;border-radius:12px;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.4px;white-space:nowrap}
-    .badge.bullish{background:rgba(63,185,80,.14); color:var(--bullish)}
-    .badge.bearish{background:rgba(248,81,73,.14); color:var(--bearish)}
-    .badge.neutral{background:rgba(210,153,34,.14);color:var(--neutral)}
-    .badge.unknown{background:rgba(139,148,158,.14);color:var(--muted)}
-    .score-bar{height:3px;border-radius:2px;background:var(--border);margin-bottom:10px;overflow:hidden}
-    .score-fill{height:100%;border-radius:2px;transition:width .5s}
-    .price-row{display:flex;align-items:baseline;gap:8px;margin-bottom:10px}
-    .price{font-size:1.35rem;font-weight:800}
-    .chg{font-size:.82rem;font-weight:600}
-    .pos{color:var(--bullish)} .neg{color:var(--bearish)}
-    .metrics{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:10px}
-    .metric{background:var(--surface2);border-radius:6px;padding:6px 8px}
-    .m-lbl{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
-    .m-val{font-size:.88rem;font-weight:700;margin-top:1px}
-    .overbought{color:var(--bearish)} .oversold{color:var(--bullish)}
-    .sigs{display:flex;flex-wrap:wrap;gap:3px}
-    .sig{font-size:.62rem;padding:2px 6px;border-radius:4px;font-weight:600}
-    .sig.bullish{background:rgba(63,185,80,.12); color:var(--bullish)}
-    .sig.bearish{background:rgba(248,81,73,.12); color:var(--bearish)}
-    .sig.neutral{background:rgba(210,153,34,.12);color:var(--neutral)}
-
-    /* ── Loading / Error ── */
-    #loading{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 24px;gap:14px}
-    .spinner{width:38px;height:38px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .75s linear infinite}
+    .tv-grid{
+      display:grid;grid-template-columns:1fr 380px;gap:12px;
+      height:500px}
+    @media(max-width:900px){
+      .tv-grid{grid-template-columns:1fr;height:auto}
+      .tv-grid>div{height:420px}}
+    .tv-box{
+      background:var(--surface);border:1px solid var(--border);
+      border-radius:10px;overflow:hidden;position:relative}
+    .tv-loading{
+      position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+      flex-direction:column;gap:10px;z-index:1;pointer-events:none}
+    .tv-loading.hidden{display:none}
+    .spinner{width:32px;height:32px;border:3px solid var(--border);
+      border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .load-txt{color:var(--muted);font-size:.88rem}
-    .err-box{background:rgba(248,81,73,.08);border:1px solid rgba(248,81,73,.3);border-radius:10px;padding:16px 20px;margin:12px 24px;color:var(--bearish);font-size:.85rem;display:none}
+    .tv-loading p{font-size:.78rem;color:var(--muted)}
 
-    /* search result loading */
-    .mini-spinner{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle}
+    /* ── Sector tabs ── */
+    .sector-row{
+      display:flex;gap:6px;padding:12px 24px 0;overflow-x:auto;
+      scrollbar-width:none;flex-wrap:nowrap}
+    .sector-row::-webkit-scrollbar{display:none}
+    .sec-btn{
+      padding:5px 14px;border-radius:20px;border:1px solid var(--border);
+      background:transparent;color:var(--muted);font-size:.78rem;white-space:nowrap;
+      cursor:pointer;transition:all .15s;flex-shrink:0}
+    .sec-btn:hover{border-color:var(--accent);color:var(--text)}
+    .sec-btn.active{background:var(--accent);border-color:var(--accent);color:#000;font-weight:700}
 
-    .divider{border:none;border-top:1px solid var(--border);margin:4px 24px 12px}
+    /* ── Stock Grid ── */
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));
+      gap:8px;padding:12px 24px 32px}
+    .stock-card{
+      background:var(--surface);border:1px solid var(--border);border-radius:8px;
+      padding:12px 10px;cursor:pointer;transition:all .15s;text-align:center;
+      display:flex;flex-direction:column;align-items:center;gap:4px;
+      position:relative;overflow:hidden}
+    .stock-card::before{content:"";position:absolute;top:0;left:0;right:0;height:2px}
+    .stock-card:hover{border-color:var(--accent);transform:translateY(-2px);background:var(--surface2)}
+    .stock-card.active{border-color:var(--accent);background:rgba(88,166,255,.08)}
+    .card-ticker{font-size:1rem;font-weight:800;color:var(--text)}
+    .card-name{font-size:.65rem;color:var(--muted);line-height:1.3;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:100%}
+    .card-sector-dot{
+      width:6px;height:6px;border-radius:50%;margin-top:2px;flex-shrink:0}
+
+    /* sector colors */
+    .dot-tech   {background:#58a6ff}
+    .dot-finance{background:#3fb950}
+    .dot-health {background:#79c0ff}
+    .dot-cons-d {background:#ffa657}
+    .dot-cons-s {background:#d2a8ff}
+    .dot-energy {background:#f85149}
+    .dot-comm   {background:#d29922}
+    .dot-indust {background:#7ee787}
+    .dot-other  {background:#8b949e}
+
+    /* legend */
+    .legend{display:flex;gap:12px;flex-wrap:wrap;padding:4px 24px 8px;font-size:.68rem;color:var(--muted)}
+    .legend span{display:flex;align-items:center;gap:4px}
+    .legend-dot{width:7px;height:7px;border-radius:50%}
+
+    hr.divider{border:none;border-top:1px solid var(--border);margin:8px 0}
 
     @media(max-width:600px){
-      .grid{grid-template-columns:1fr;padding:0 12px 20px}
-      header,.search-hero,.summary-row,.controls,#ts,#search-result,.err-box,.divider{padding-left:12px;padding-right:12px}
+      .grid{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));padding:10px 12px 24px}
+      header,.search-section,#analysis-panel,.sector-row,.legend{padding-left:12px;padding-right:12px}
     }
   </style>
 </head>
@@ -146,219 +147,403 @@
 
 <header>
   <div>
-    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <h1>股票趨勢偵測器</h1>
-      <span style="font-size:.72rem;color:var(--muted)"><span class="live-dot"></span>即時資料</span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <h1>股票趨勢分析</h1>
+      <span class="tv-badge">TradingView 數據</span>
     </div>
-    <div class="sub">100 支股票 · RSI · MACD · 雙均線 · 動能 · 布林帶</div>
+    <div class="sub">技術分析 · 振盪指標 · 均線系統 · 即時買賣訊號</div>
   </div>
-  <button id="refresh-btn" onclick="loadStocks()">重新整理</button>
 </header>
 
-<!-- ── Search Hero ── -->
-<div class="search-hero">
-  <h2>搜尋任意股票 / ETF</h2>
+<!-- ── Search ── -->
+<div class="search-section">
+  <h2>搜尋任意股票 / ETF / 指數</h2>
   <div class="search-wrap">
-    <input id="hero-input" type="text" placeholder="輸入股票代碼或公司名稱，例如：AAPL、2330.TW、台積電…" autocomplete="off" />
+    <input id="hero-input" type="text"
+      placeholder="輸入代碼或名稱，例：AAPL、2330、台積電、SPY…"
+      autocomplete="off" />
     <div id="autocomplete"></div>
-    <button id="search-go-btn" onclick="searchGo()">分析</button>
+    <button id="go-btn" onclick="analyzeSymbol(document.getElementById('hero-input').value.trim())">分析</button>
   </div>
 </div>
 
-<!-- Search result -->
-<div id="search-result">
-  <div class="result-label">
-    <span id="result-label-txt">搜尋結果</span>
-    <button onclick="clearSearchResult()">✕ 清除</button>
-  </div>
-  <div id="result-card"></div>
-</div>
-
-<hr class="divider" />
-
-<!-- ── Summary ── -->
-<div class="summary-row">
-  <div class="sum-card bull"><span class="count" id="c-bull">—</span><span class="lbl">▲ 看漲</span></div>
-  <div class="sum-card neu" ><span class="count" id="c-neu" >—</span><span class="lbl">— 中立</span></div>
-  <div class="sum-card bear"><span class="count" id="c-bear">—</span><span class="lbl">▼ 看跌</span></div>
-  <div class="market-meter">
-    <span class="meter-lbl">市場情緒分佈（100 支預設股票）</span>
-    <div class="meter-track">
-      <div class="seg bull" id="mb" style="width:0%"></div>
-      <div class="seg neu"  id="mn" style="width:0%"></div>
-      <div class="seg bear" id="mk" style="width:0%"></div>
+<!-- ── Analysis Panel ── -->
+<div id="analysis-panel">
+  <hr class="divider" />
+  <div class="panel-header">
+    <div>
+      <div class="panel-title" id="panel-title">—</div>
+      <div class="panel-symbol" id="panel-symbol"></div>
     </div>
-    <span class="meter-lbl" id="meter-txt">載入中…</span>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="interval-btns" id="interval-btns">
+        <button class="ivl-btn" data-iv="1">1分</button>
+        <button class="ivl-btn" data-iv="5">5分</button>
+        <button class="ivl-btn" data-iv="15">15分</button>
+        <button class="ivl-btn" data-iv="60">1時</button>
+        <button class="ivl-btn active" data-iv="D">日</button>
+        <button class="ivl-btn" data-iv="W">週</button>
+      </div>
+      <button class="close-btn" onclick="closePanel()">✕ 關閉</button>
+    </div>
+  </div>
+  <div class="tv-grid">
+    <!-- Chart -->
+    <div class="tv-box" id="chart-box">
+      <div class="tv-loading" id="chart-loading">
+        <div class="spinner"></div><p>載入圖表中…</p>
+      </div>
+      <div id="chart-widget" style="height:100%"></div>
+    </div>
+    <!-- Technical Analysis -->
+    <div class="tv-box" id="ta-box">
+      <div class="tv-loading" id="ta-loading">
+        <div class="spinner"></div><p>載入技術分析…</p>
+      </div>
+      <div id="ta-widget" style="height:100%"></div>
+    </div>
   </div>
 </div>
 
-<div class="controls">
-  <button class="f-btn active all"  onclick="setFilter('all',this)">全部 <span id="cnt-all"></span></button>
-  <button class="f-btn bull"        onclick="setFilter('bullish',this)">看漲 <span id="cnt-bull-f"></span></button>
-  <button class="f-btn neu"         onclick="setFilter('neutral',this)">中立 <span id="cnt-neu-f"></span></button>
-  <button class="f-btn bear"        onclick="setFilter('bearish',this)">看跌 <span id="cnt-bear-f"></span></button>
-  <select class="sort-sel" id="sort-sel" onchange="renderCards()">
-    <option value="trend">依趨勢排序</option>
-    <option value="score-desc">分數 高→低</option>
-    <option value="score-asc">分數 低→高</option>
-    <option value="chg-desc">漲幅 高→低</option>
-    <option value="chg-asc">跌幅 大→小</option>
-    <option value="rsi-desc">RSI 高→低</option>
-    <option value="alpha">代碼 A→Z</option>
-  </select>
-  <input id="grid-search" type="text" placeholder="篩選代碼…" oninput="renderCards()" />
+<hr class="divider" style="margin:4px 24px" />
+
+<!-- ── Sector tabs ── -->
+<div class="sector-row" id="sector-row">
+  <button class="sec-btn active" onclick="filterSector('all',this)">全部 (100)</button>
+  <button class="sec-btn" onclick="filterSector('tech',this)">科技 (25)</button>
+  <button class="sec-btn" onclick="filterSector('finance',this)">金融 (15)</button>
+  <button class="sec-btn" onclick="filterSector('health',this)">醫療 (10)</button>
+  <button class="sec-btn" onclick="filterSector('cons-d',this)">非必需消費 (10)</button>
+  <button class="sec-btn" onclick="filterSector('cons-s',this)">必需消費 (8)</button>
+  <button class="sec-btn" onclick="filterSector('energy',this)">能源 (8)</button>
+  <button class="sec-btn" onclick="filterSector('comm',this)">通訊 (6)</button>
+  <button class="sec-btn" onclick="filterSector('indust',this)">工業 (8)</button>
+  <button class="sec-btn" onclick="filterSector('other',this)">材料/公用/REITs (10)</button>
 </div>
-<div id="ts"></div>
-<div class="err-box" id="err-box"></div>
-<div id="loading">
-  <div class="spinner"></div>
-  <div class="load-txt">正在從 Yahoo Finance 取得即時資料，請稍候…</div>
+
+<!-- Legend -->
+<div class="legend">
+  <span><span class="legend-dot" style="background:#58a6ff"></span>科技</span>
+  <span><span class="legend-dot" style="background:#3fb950"></span>金融</span>
+  <span><span class="legend-dot" style="background:#79c0ff"></span>醫療</span>
+  <span><span class="legend-dot" style="background:#ffa657"></span>非必需消費</span>
+  <span><span class="legend-dot" style="background:#d2a8ff"></span>必需消費</span>
+  <span><span class="legend-dot" style="background:#f85149"></span>能源</span>
+  <span><span class="legend-dot" style="background:#d29922"></span>通訊</span>
+  <span><span class="legend-dot" style="background:#7ee787"></span>工業</span>
+  <span><span class="legend-dot" style="background:#8b949e"></span>材料/公用/REITs</span>
 </div>
-<div class="grid" id="grid"></div>
+
+<!-- ── Stock Grid ── -->
+<div class="grid" id="stock-grid"></div>
 
 <script>
-// ── State ────────────────────────────────────────────────────────────────────
-let allData = [], currentFilter = 'all';
-const TREND_LABEL = { bullish:'▲ 看漲', bearish:'▼ 看跌', neutral:'— 中立', unknown:'? 未知' };
+// ── Stock universe ────────────────────────────────────────────────────────────
+const STOCKS = [
+  // tech
+  {t:"AAPL",  n:"Apple",             s:"tech"},
+  {t:"MSFT",  n:"Microsoft",         s:"tech"},
+  {t:"GOOGL", n:"Alphabet",          s:"tech"},
+  {t:"META",  n:"Meta",              s:"tech"},
+  {t:"NVDA",  n:"NVIDIA",            s:"tech"},
+  {t:"AMD",   n:"AMD",               s:"tech"},
+  {t:"INTC",  n:"Intel",             s:"tech"},
+  {t:"TSLA",  n:"Tesla",             s:"tech"},
+  {t:"AMZN",  n:"Amazon",            s:"tech"},
+  {t:"CRM",   n:"Salesforce",        s:"tech"},
+  {t:"ORCL",  n:"Oracle",            s:"tech"},
+  {t:"ADBE",  n:"Adobe",             s:"tech"},
+  {t:"QCOM",  n:"Qualcomm",          s:"tech"},
+  {t:"TXN",   n:"Texas Instruments", s:"tech"},
+  {t:"MU",    n:"Micron",            s:"tech"},
+  {t:"AMAT",  n:"Applied Materials", s:"tech"},
+  {t:"LRCX",  n:"Lam Research",      s:"tech"},
+  {t:"KLAC",  n:"KLA Corp",          s:"tech"},
+  {t:"MRVL",  n:"Marvell",           s:"tech"},
+  {t:"AVGO",  n:"Broadcom",          s:"tech"},
+  {t:"NFLX",  n:"Netflix",           s:"tech"},
+  {t:"SNOW",  n:"Snowflake",         s:"tech"},
+  {t:"PLTR",  n:"Palantir",          s:"tech"},
+  {t:"UBER",  n:"Uber",              s:"tech"},
+  {t:"LYFT",  n:"Lyft",              s:"tech"},
+  // finance
+  {t:"JPM",   n:"JPMorgan",          s:"finance"},
+  {t:"BAC",   n:"Bank of America",   s:"finance"},
+  {t:"GS",    n:"Goldman Sachs",     s:"finance"},
+  {t:"WFC",   n:"Wells Fargo",       s:"finance"},
+  {t:"MS",    n:"Morgan Stanley",    s:"finance"},
+  {t:"C",     n:"Citigroup",         s:"finance"},
+  {t:"BLK",   n:"BlackRock",         s:"finance"},
+  {t:"AXP",   n:"Amex",             s:"finance"},
+  {t:"V",     n:"Visa",              s:"finance"},
+  {t:"MA",    n:"Mastercard",        s:"finance"},
+  {t:"PYPL",  n:"PayPal",            s:"finance"},
+  {t:"SQ",    n:"Block",             s:"finance"},
+  {t:"SCHW",  n:"Schwab",            s:"finance"},
+  {t:"USB",   n:"US Bancorp",        s:"finance"},
+  {t:"TFC",   n:"Truist",            s:"finance"},
+  // health
+  {t:"JNJ",   n:"J&J",               s:"health"},
+  {t:"PFE",   n:"Pfizer",            s:"health"},
+  {t:"UNH",   n:"UnitedHealth",      s:"health"},
+  {t:"ABBV",  n:"AbbVie",            s:"health"},
+  {t:"MRK",   n:"Merck",             s:"health"},
+  {t:"LLY",   n:"Eli Lilly",         s:"health"},
+  {t:"TMO",   n:"Thermo Fisher",     s:"health"},
+  {t:"ABT",   n:"Abbott",            s:"health"},
+  {t:"DHR",   n:"Danaher",           s:"health"},
+  {t:"BMY",   n:"Bristol-Myers",     s:"health"},
+  // cons-d
+  {t:"MCD",   n:"McDonald's",        s:"cons-d"},
+  {t:"NKE",   n:"Nike",              s:"cons-d"},
+  {t:"SBUX",  n:"Starbucks",         s:"cons-d"},
+  {t:"TGT",   n:"Target",            s:"cons-d"},
+  {t:"HD",    n:"Home Depot",        s:"cons-d"},
+  {t:"LOW",   n:"Lowe's",            s:"cons-d"},
+  {t:"BKNG",  n:"Booking",           s:"cons-d"},
+  {t:"CMG",   n:"Chipotle",          s:"cons-d"},
+  {t:"F",     n:"Ford",              s:"cons-d"},
+  {t:"GM",    n:"General Motors",    s:"cons-d"},
+  // cons-s
+  {t:"KO",    n:"Coca-Cola",         s:"cons-s"},
+  {t:"PEP",   n:"PepsiCo",           s:"cons-s"},
+  {t:"PG",    n:"P&G",               s:"cons-s"},
+  {t:"WMT",   n:"Walmart",           s:"cons-s"},
+  {t:"COST",  n:"Costco",            s:"cons-s"},
+  {t:"PM",    n:"Philip Morris",     s:"cons-s"},
+  {t:"CL",    n:"Colgate",           s:"cons-s"},
+  {t:"KHC",   n:"Kraft Heinz",       s:"cons-s"},
+  // energy
+  {t:"XOM",   n:"ExxonMobil",        s:"energy"},
+  {t:"CVX",   n:"Chevron",           s:"energy"},
+  {t:"COP",   n:"ConocoPhillips",    s:"energy"},
+  {t:"SLB",   n:"SLB",               s:"energy"},
+  {t:"EOG",   n:"EOG Resources",     s:"energy"},
+  {t:"MPC",   n:"Marathon Pete.",    s:"energy"},
+  {t:"VLO",   n:"Valero",            s:"energy"},
+  {t:"HAL",   n:"Halliburton",       s:"energy"},
+  // comm
+  {t:"DIS",   n:"Disney",            s:"comm"},
+  {t:"CMCSA", n:"Comcast",           s:"comm"},
+  {t:"T",     n:"AT&T",              s:"comm"},
+  {t:"VZ",    n:"Verizon",           s:"comm"},
+  {t:"TMUS",  n:"T-Mobile",          s:"comm"},
+  {t:"SNAP",  n:"Snap",              s:"comm"},
+  // indust
+  {t:"BA",    n:"Boeing",            s:"indust"},
+  {t:"CAT",   n:"Caterpillar",       s:"indust"},
+  {t:"GE",    n:"GE Aerospace",      s:"indust"},
+  {t:"HON",   n:"Honeywell",         s:"indust"},
+  {t:"UPS",   n:"UPS",               s:"indust"},
+  {t:"FDX",   n:"FedEx",             s:"indust"},
+  {t:"DE",    n:"Deere",             s:"indust"},
+  {t:"LMT",   n:"Lockheed Martin",   s:"indust"},
+  // other
+  {t:"LIN",   n:"Linde",             s:"other"},
+  {t:"APD",   n:"Air Products",      s:"other"},
+  {t:"NEM",   n:"Newmont",           s:"other"},
+  {t:"FCX",   n:"Freeport-McMoRan",  s:"other"},
+  {t:"NEE",   n:"NextEra Energy",    s:"other"},
+  {t:"DUK",   n:"Duke Energy",       s:"other"},
+  {t:"SO",    n:"Southern Co.",      s:"other"},
+  {t:"AMT",   n:"American Tower",    s:"other"},
+  {t:"PLD",   n:"Prologis",          s:"other"},
+  {t:"SPG",   n:"Simon Property",    s:"other"},
+];
 
-// ── Card builder ─────────────────────────────────────────────────────────────
-function buildCard(s) {
+// ── State ─────────────────────────────────────────────────────────────────────
+let currentSymbol = null, currentInterval = "D", currentFilter = "all";
+let acTimer = null, acFocused = -1;
+
+// ── Grid ──────────────────────────────────────────────────────────────────────
+function filterSector(sector, btn) {
+  currentFilter = sector;
+  document.querySelectorAll('.sec-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderGrid();
+}
+
+function renderGrid() {
+  const grid = document.getElementById('stock-grid');
+  grid.innerHTML = '';
+  const list = currentFilter === 'all' ? STOCKS : STOCKS.filter(s => s.s === currentFilter);
+  list.forEach(stock => {
+    const card = document.createElement('div');
+    card.className = 'stock-card' + (currentSymbol === stock.t ? ' active' : '');
+    card.id = 'card-' + stock.t;
+    card.onclick = () => analyzeSymbol(stock.t, stock.n);
+    card.innerHTML = `
+      <div class="card-ticker">${stock.t}</div>
+      <div class="card-name">${stock.n}</div>
+      <div class="card-sector-dot dot-${stock.s}"></div>`;
+    grid.appendChild(card);
+  });
+}
+
+// ── TradingView Widgets ───────────────────────────────────────────────────────
+function createChartWidget(symbol, interval) {
+  const container = document.getElementById('chart-widget');
+  container.innerHTML = '';
+  document.getElementById('chart-loading').classList.remove('hidden');
+
   const div = document.createElement('div');
-  div.className = `card ${s.trend}`;
+  div.className = 'tradingview-widget-container';
+  div.style.height = '100%';
 
-  if (s.trend === 'unknown') {
-    div.innerHTML = `<div class="card-top"><div><span class="ticker">${s.ticker}</span>${s.name?`<div style="font-size:.7rem;color:var(--muted);margin-top:2px">${s.name}</div>`:''}</div><span class="badge unknown">未知</span></div><div style="font-size:.75rem;color:var(--muted);margin-top:4px">${s.error||'資料不足'}</div>`;
-    return div;
-  }
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+  inner.style.height = 'calc(100% - 32px)';
 
-  const chgCls  = (s.changePct??0)>=0?'pos':'neg', chgSign=(s.changePct??0)>=0?'+':'';
-  const m5Cls   = (s.mom5d??0)>=0?'pos':'neg',     m5Sign=(s.mom5d??0)>=0?'+':'';
-  const scoreW  = (((s.score??0)+5)/10*100).toFixed(0);
-  const sfill   = s.trend==='bullish'?'var(--bullish)':s.trend==='bearish'?'var(--bearish)':'var(--neutral)';
-  const rsiCls  = (s.rsi??50)>=70?'overbought':(s.rsi??50)<=30?'oversold':'';
-  const rsiNote = (s.rsi??50)>=70?'超買':(s.rsi??50)<=30?'超賣':'';
-  const cur     = s.currency && s.currency!=='USD' ? s.currency+' ' : '$';
-  const sigsHtml= Object.entries(s.signals||{}).map(([k,v])=>`<span class="sig ${v}">${k}</span>`).join('');
+  const cr = document.createElement('div');
+  cr.className = 'tradingview-widget-copyright';
+  cr.style.cssText = 'text-align:center;font-size:11px;padding:4px;';
+  cr.innerHTML = '<a href="https://www.tradingview.com/" target="_blank" style="color:var(--muted)">Powered by TradingView</a>';
 
-  div.innerHTML = `
-    <div class="card-top">
-      <div>
-        <span class="ticker">${s.ticker}</span>
-        ${s.name?`<div style="font-size:.7rem;color:var(--muted);margin-top:2px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.name}</div>`:''}
-      </div>
-      <span class="badge ${s.trend}">${TREND_LABEL[s.trend]}</span>
-    </div>
-    <div class="score-bar"><div class="score-fill" style="width:${scoreW}%;background:${sfill}"></div></div>
-    <div class="price-row">
-      <span class="price">${cur}${(s.price??0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</span>
-      <span class="chg ${chgCls}">${chgSign}${(s.changePct??0).toFixed(2)}%</span>
-    </div>
-    <div class="metrics">
-      <div class="metric"><div class="m-lbl">RSI(14) ${rsiNote}</div><div class="m-val ${rsiCls}">${(s.rsi??0).toFixed(1)}</div></div>
-      <div class="metric"><div class="m-lbl">5日動能</div><div class="m-val ${m5Cls}">${m5Sign}${(s.mom5d??0).toFixed(2)}%</div></div>
-      <div class="metric"><div class="m-lbl">MA20</div><div class="m-val">${cur}${(s.ma20??0).toFixed(2)}</div></div>
-      <div class="metric"><div class="m-lbl">MA50</div><div class="m-val">${cur}${(s.ma50??0).toFixed(2)}</div></div>
-    </div>
-    <div class="sigs">${sigsHtml}</div>`;
-  return div;
-}
-
-// ── Grid ─────────────────────────────────────────────────────────────────────
-function setFilter(f, el) {
-  currentFilter = f;
-  document.querySelectorAll('.f-btn').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active');
-  renderCards();
-}
-
-function renderCards() {
-  const q   = (document.getElementById('grid-search').value||'').toUpperCase().trim();
-  const srt = document.getElementById('sort-sel').value;
-  let data  = allData.filter(s=>{
-    if (q && !s.ticker.includes(q) && !(s.name||'').toUpperCase().includes(q)) return false;
-    if (currentFilter!=='all' && s.trend!==currentFilter) return false;
-    return true;
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.onload = () => document.getElementById('chart-loading').classList.add('hidden');
+  script.text = JSON.stringify({
+    autosize: true,
+    symbol: symbol,
+    interval: interval,
+    timezone: "Asia/Taipei",
+    theme: "dark",
+    style: "1",
+    locale: "zh_TW",
+    toolbar_bg: "#161b22",
+    enable_publishing: false,
+    allow_symbol_change: true,
+    save_image: false,
+    hide_side_toolbar: false,
+    studies: ["MACD@tv-basicstudies", "RSI@tv-basicstudies"],
+    withdateranges: true,
+    support_host: "https://www.tradingview.com"
   });
-  data = [...data].sort((a,b)=>{
-    if (srt==='trend'){const r={bullish:0,neutral:1,bearish:2,unknown:3};return(r[a.trend]-r[b.trend])||((b.score??0)-(a.score??0))}
-    if (srt==='score-desc') return(b.score??0)-(a.score??0);
-    if (srt==='score-asc')  return(a.score??0)-(b.score??0);
-    if (srt==='chg-desc')   return(b.changePct??0)-(a.changePct??0);
-    if (srt==='chg-asc')    return(a.changePct??0)-(b.changePct??0);
-    if (srt==='rsi-desc')   return(b.rsi??0)-(a.rsi??0);
-    if (srt==='alpha')      return a.ticker.localeCompare(b.ticker);
-    return 0;
+
+  div.appendChild(inner);
+  div.appendChild(cr);
+  div.appendChild(script);
+  container.appendChild(div);
+}
+
+function createTAWidget(symbol, interval) {
+  const container = document.getElementById('ta-widget');
+  container.innerHTML = '';
+  document.getElementById('ta-loading').classList.remove('hidden');
+
+  const div = document.createElement('div');
+  div.className = 'tradingview-widget-container';
+  div.style.height = '100%';
+
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js';
+  script.async = true;
+  script.onload = () => document.getElementById('ta-loading').classList.add('hidden');
+  script.text = JSON.stringify({
+    interval: interval,
+    width: "100%",
+    isTransparent: true,
+    height: "100%",
+    symbol: symbol,
+    showIntervalTabs: true,
+    displayMode: "multiple",
+    locale: "zh_TW",
+    colorTheme: "dark"
   });
-  const grid=document.getElementById('grid');
-  grid.innerHTML='';
-  data.forEach(s=>grid.appendChild(buildCard(s)));
+
+  div.appendChild(inner);
+  div.appendChild(script);
+  container.appendChild(div);
 }
 
-function updateSummary(stocks, summary) {
-  const tot=stocks.length;
-  document.getElementById('c-bull').textContent=summary.bullish;
-  document.getElementById('c-neu').textContent=summary.neutral;
-  document.getElementById('c-bear').textContent=summary.bearish;
-  const pb=(summary.bullish/tot*100).toFixed(1),pn=(summary.neutral/tot*100).toFixed(1),pk=(summary.bearish/tot*100).toFixed(1);
-  document.getElementById('mb').style.width=pb+'%';
-  document.getElementById('mn').style.width=pn+'%';
-  document.getElementById('mk').style.width=pk+'%';
-  document.getElementById('meter-txt').textContent=`看漲 ${pb}%  ·  中立 ${pn}%  ·  看跌 ${pk}%`;
-  document.getElementById('cnt-all').textContent=`(${tot})`;
-  document.getElementById('cnt-bull-f').textContent=`(${summary.bullish})`;
-  document.getElementById('cnt-neu-f').textContent=`(${summary.neutral})`;
-  document.getElementById('cnt-bear-f').textContent=`(${summary.bearish})`;
+// ── Analyze symbol ────────────────────────────────────────────────────────────
+function analyzeSymbol(raw, nameHint) {
+  const symbol = raw.trim().toUpperCase();
+  if (!symbol) return;
+  closeAC();
+
+  currentSymbol = symbol;
+  document.getElementById('hero-input').value = symbol;
+
+  // Update panel header
+  const meta = STOCKS.find(s => s.t === symbol);
+  const name = nameHint || meta?.n || '';
+  document.getElementById('panel-title').textContent = name ? `${symbol}  ${name}` : symbol;
+  document.getElementById('panel-symbol').textContent = `TradingView 技術分析 · ${intervalLabel(currentInterval)}`;
+
+  // Show panel
+  document.getElementById('analysis-panel').style.display = 'block';
+  document.getElementById('analysis-panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Highlight card
+  document.querySelectorAll('.stock-card').forEach(c => c.classList.remove('active'));
+  document.getElementById('card-' + symbol)?.classList.add('active');
+
+  // Load widgets
+  createChartWidget(symbol, currentInterval);
+  createTAWidget(symbol, currentInterval);
 }
 
-async function loadStocks() {
-  const btn=document.getElementById('refresh-btn');
-  const errBox=document.getElementById('err-box');
-  btn.disabled=true; btn.textContent='載入中…';
-  document.getElementById('loading').style.display='flex';
-  document.getElementById('grid').innerHTML='';
-  errBox.style.display='none';
-  document.getElementById('ts').textContent='';
-  try {
-    const res=await fetch('/api/stocks');
-    if(!res.ok) throw new Error(`伺服器錯誤 ${res.status}`);
-    const data=await res.json();
-    if(data.error) throw new Error(data.error.includes('FINNHUB_API_KEY') ? '請在 Vercel 專案設定中加入 FINNHUB_API_KEY 環境變數（finnhub.io 免費申請）' : data.error);
-    allData=data.stocks;
-    updateSummary(allData, data.summary);
-    renderCards();
-    document.getElementById('ts').textContent=`即時資料更新時間：${new Date(data.updatedAt).toLocaleString('zh-TW')}`;
-  } catch(e) {
-    errBox.style.display='block';
-    errBox.textContent=`資料載入失敗：${e.message}`;
-  } finally {
-    btn.disabled=false; btn.textContent='重新整理';
-    document.getElementById('loading').style.display='none';
+function closePanel() {
+  document.getElementById('analysis-panel').style.display = 'none';
+  document.getElementById('chart-widget').innerHTML = '';
+  document.getElementById('ta-widget').innerHTML = '';
+  document.querySelectorAll('.stock-card').forEach(c => c.classList.remove('active'));
+  currentSymbol = null;
+  document.getElementById('hero-input').value = '';
+}
+
+function intervalLabel(iv) {
+  const map = {'1':'1分鐘','5':'5分鐘','15':'15分鐘','60':'1小時','D':'日線','W':'週線'};
+  return map[iv] || iv;
+}
+
+// Interval buttons
+document.getElementById('interval-btns').addEventListener('click', e => {
+  const btn = e.target.closest('.ivl-btn');
+  if (!btn) return;
+  document.querySelectorAll('.ivl-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  currentInterval = btn.dataset.iv;
+  if (currentSymbol) {
+    document.getElementById('panel-symbol').textContent = `TradingView 技術分析 · ${intervalLabel(currentInterval)}`;
+    createChartWidget(currentSymbol, currentInterval);
+    createTAWidget(currentSymbol, currentInterval);
   }
-}
+});
 
-// ── Search / Autocomplete ─────────────────────────────────────────────────────
-let acTimer=null, acFocused=-1;
-
-const heroInput    = document.getElementById('hero-input');
-const acBox        = document.getElementById('autocomplete');
-const searchGoBtn  = document.getElementById('search-go-btn');
+// ── Autocomplete ──────────────────────────────────────────────────────────────
+const heroInput   = document.getElementById('hero-input');
+const acBox       = document.getElementById('autocomplete');
 
 heroInput.addEventListener('input', () => {
   clearTimeout(acTimer);
   const q = heroInput.value.trim();
   if (!q) { closeAC(); return; }
-  acTimer = setTimeout(() => fetchAC(q), 280);
+  // Local fast search first
+  const local = STOCKS.filter(s =>
+    s.t.startsWith(q.toUpperCase()) || s.n.toLowerCase().includes(q.toLowerCase())
+  ).slice(0, 6);
+  if (local.length) renderAC(local.map(s => ({ ticker: s.t, name: s.n, exchange: '' })));
+  // Then server search (if API available)
+  acTimer = setTimeout(() => serverSearch(q), 300);
 });
 
 heroInput.addEventListener('keydown', e => {
   const items = acBox.querySelectorAll('.ac-item');
-  if (e.key==='ArrowDown')  { e.preventDefault(); moveFocus(1, items); }
-  else if (e.key==='ArrowUp')   { e.preventDefault(); moveFocus(-1, items); }
-  else if (e.key==='Enter') {
-    if (acFocused>=0 && items[acFocused]) { items[acFocused].click(); }
-    else searchGo();
+  if (e.key === 'ArrowDown') { e.preventDefault(); moveFocus(1, items); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); moveFocus(-1, items); }
+  else if (e.key === 'Enter') {
+    if (acFocused >= 0 && items[acFocused]) items[acFocused].click();
+    else analyzeSymbol(heroInput.value.trim());
   }
-  else if (e.key==='Escape') closeAC();
+  else if (e.key === 'Escape') closeAC();
 });
 
 document.addEventListener('click', e => {
@@ -368,71 +553,41 @@ document.addEventListener('click', e => {
 function moveFocus(dir, items) {
   if (!items.length) return;
   items[acFocused]?.classList.remove('focused');
-  acFocused = Math.max(0, Math.min(items.length-1, acFocused+dir));
+  acFocused = Math.max(0, Math.min(items.length - 1, acFocused + dir));
   items[acFocused].classList.add('focused');
-  items[acFocused].scrollIntoView({block:'nearest'});
 }
 
-async function fetchAC(q) {
+function renderAC(results) {
+  acFocused = -1;
+  acBox.innerHTML = results.map(r => `
+    <div class="ac-item" data-ticker="${r.ticker}">
+      <span class="ac-sym">${r.ticker}</span>
+      <span class="ac-name">${r.name}</span>
+      <span class="ac-exch">${r.exchange}</span>
+    </div>`).join('');
+  acBox.querySelectorAll('.ac-item').forEach(item => {
+    item.addEventListener('click', () => {
+      heroInput.value = item.dataset.ticker;
+      closeAC();
+      analyzeSymbol(item.dataset.ticker);
+    });
+  });
+  acBox.style.display = 'block';
+}
+
+function closeAC() { acBox.style.display = 'none'; acBox.innerHTML = ''; acFocused = -1; }
+
+async function serverSearch(q) {
   try {
     const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
     if (!res.ok) return;
-    const {results} = await res.json();
-    if (!results?.length) { closeAC(); return; }
-    acFocused = -1;
-    acBox.innerHTML = results.map(r=>`
-      <div class="ac-item" data-ticker="${r.ticker}" tabindex="-1">
-        <span class="ac-ticker">${r.ticker}</span>
-        <span class="ac-name">${r.name}</span>
-        <span class="ac-exch">${r.exchange}</span>
-      </div>`).join('');
-    acBox.querySelectorAll('.ac-item').forEach(item=>{
-      item.addEventListener('click', ()=>{
-        heroInput.value = item.dataset.ticker;
-        closeAC();
-        searchGo();
-      });
-    });
-    acBox.style.display = 'block';
-  } catch(e) { /* ignore AC errors */ }
+    const { results } = await res.json();
+    if (results?.length) renderAC(results);
+  } catch (_) { /* API not available, local results shown */ }
 }
 
-function closeAC() { acBox.style.display='none'; acBox.innerHTML=''; acFocused=-1; }
-
-async function searchGo() {
-  const sym = heroInput.value.trim().toUpperCase();
-  if (!sym) return;
-  closeAC();
-
-  const resultBox = document.getElementById('search-result');
-  const card      = document.getElementById('result-card');
-  const lbl       = document.getElementById('result-label-txt');
-
-  resultBox.style.display = 'block';
-  card.innerHTML = `<div style="padding:16px 0;display:flex;align-items:center;gap:10px"><div class="mini-spinner"></div><span style="color:var(--muted);font-size:.85rem">正在分析 ${sym}…</span></div>`;
-  lbl.textContent = `搜尋結果：${sym}`;
-  searchGoBtn.disabled = true;
-
-  try {
-    const res  = await fetch(`/api/ticker?symbol=${encodeURIComponent(sym)}`);
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    card.innerHTML = '';
-    card.appendChild(buildCard(data));
-  } catch(e) {
-    card.innerHTML = `<div class="err-box" style="display:block;margin:0">找不到 ${sym} 的資料：${e.message}</div>`;
-  } finally {
-    searchGoBtn.disabled = false;
-  }
-}
-
-function clearSearchResult() {
-  document.getElementById('search-result').style.display='none';
-  document.getElementById('result-card').innerHTML='';
-  heroInput.value='';
-}
-
-loadStocks();
+// ── Init ──────────────────────────────────────────────────────────────────────
+renderGrid();
 </script>
 </body>
 </html>
