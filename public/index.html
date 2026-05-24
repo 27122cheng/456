@@ -180,46 +180,138 @@ tr:hover td{background:var(--surface2)}
 .fd-val{font-weight:700}
 
 /* ── Modal overlay ── */
-#pick-modal{display:none;position:fixed;inset:0;z-index:8000;
-  background:rgba(0,0,0,.75);backdrop-filter:blur(4px);
-  overflow-y:auto;padding:20px}
-#pick-modal.open{display:flex;align-items:flex-start;justify-content:center}
-.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;
-  width:100%;max-width:960px;margin:auto;overflow:hidden;
-  box-shadow:0 20px 60px rgba(0,0,0,.7)}
-.modal-header{background:var(--surface2);border-bottom:1px solid var(--border);
-  padding:16px 20px;display:flex;align-items:center;gap:14px}
-.modal-stock-info{flex:1}
-.modal-ticker{font-size:1.4rem;font-weight:800;color:var(--accent)}
-.modal-name{font-size:.85rem;color:var(--muted)}
-.modal-price{font-size:1.6rem;font-weight:800}
-.modal-change{font-size:.9rem;font-weight:700;margin-top:2px}
-.modal-close{background:none;border:1px solid var(--border);color:var(--muted);
-  width:36px;height:36px;border-radius:8px;font-size:1.1rem;transition:all .15s;flex-shrink:0}
-.modal-close:hover{border-color:var(--bearish);color:var(--bearish)}
-.modal-tabs{display:flex;border-bottom:1px solid var(--border);background:var(--surface2)}
-.modal-tab{padding:12px 20px;font-size:.85rem;font-weight:600;color:var(--muted);
-  border:none;background:none;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap}
-.modal-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-.modal-pane{display:none;padding:20px}
-.modal-pane.active{display:block}
+/* ═══════ 交易計畫 Modal ═══════ */
+#tp-modal{display:none;position:fixed;inset:0;z-index:8000;
+  background:rgba(0,0,0,.88);overflow-y:auto;padding:16px}
+#tp-modal.open{display:block}
+.tp-box{background:#0a0e17;max-width:1440px;margin:0 auto;
+  border:1px solid var(--border);border-radius:12px;overflow:hidden;
+  box-shadow:0 24px 80px rgba(0,0,0,.8)}
 
-/* ── Modal sub-tabs (chart intervals) ── */
-.chart-tabs{display:flex;gap:4px;margin-bottom:12px}
-.chart-tab{padding:5px 14px;border-radius:16px;border:1px solid var(--border);
-  background:transparent;color:var(--muted);font-size:.78rem;font-weight:600;transition:all .15s}
-.chart-tab.active{background:var(--accent);border-color:var(--accent);color:#000}
-.chart-tab:hover:not(.active){border-color:var(--accent);color:var(--text)}
+/* Header */
+.tp-head{background:var(--surface);border-bottom:2px solid var(--border);
+  padding:12px 20px;display:flex;align-items:center;gap:0;flex-wrap:wrap}
+.tp-head-left{display:flex;align-items:center;gap:10px;flex:none;padding-right:20px;border-right:1px solid var(--border)}
+.tp-code-lbl{font-size:1.35rem;font-weight:900;color:var(--accent)}
+.tp-name-lbl{font-size:1.2rem;font-weight:800;color:var(--text)}
+.tp-badge{background:var(--accent);color:#000;font-size:.72rem;font-weight:900;
+  padding:3px 9px;border-radius:8px;letter-spacing:.03em}
+.tp-mkt-tag{font-size:.72rem;background:var(--surface2);border:1px solid var(--border);
+  padding:3px 8px;border-radius:6px;color:var(--muted);margin-left:4px}
+.tp-stats-bar{display:flex;flex:1;flex-wrap:wrap}
+.tp-stat{display:flex;flex-direction:column;align-items:center;
+  padding:4px 14px;border-left:1px solid var(--border);min-width:90px}
+.tp-stat-lbl{font-size:.65rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.tp-stat-v{font-size:.95rem;font-weight:800;margin-top:2px}
+.tp-close-btn{background:none;border:1px solid var(--border);color:var(--muted);
+  width:34px;height:34px;border-radius:8px;font-size:1.1rem;cursor:pointer;
+  transition:all .15s;flex-shrink:0;margin-left:12px}
+.tp-close-btn:hover{border-color:var(--bearish);color:var(--bearish)}
 
-/* ── Order book depth ── */
-.depth-row{display:flex;align-items:center;gap:8px;font-size:.78rem;margin:3px 0}
-.depth-side-ask{color:var(--bearish);font-weight:700;width:70px;text-align:right}
-.depth-side-bid{color:var(--bullish);font-weight:700;width:70px}
-.depth-price{width:70px;text-align:center;font-weight:700;color:var(--text)}
-.depth-bar-wrap{flex:1;height:14px;background:var(--surface2);border-radius:3px;overflow:hidden}
-.depth-bar-ask{height:100%;background:rgba(248,81,73,.4);border-radius:3px;margin-left:auto}
-.depth-bar-bid{height:100%;background:rgba(63,185,80,.4);border-radius:3px}
-.depth-vol{width:60px;text-align:right;color:var(--muted);font-size:.72rem}
+/* 3-column body */
+.tp-body{display:grid;grid-template-columns:210px 1fr 210px}
+.tp-col{padding:14px 12px;border-right:1px solid var(--border)}
+.tp-col:last-child{border-right:none}
+.tp-sec{margin-bottom:14px}
+.tp-sec-title{font-size:.8rem;font-weight:800;color:var(--accent);
+  border-left:3px solid var(--accent);padding-left:7px;margin-bottom:9px;
+  display:flex;align-items:center;gap:5px}
+
+/* Trend bullets */
+.tp-bullets{padding-left:0;list-style:none;display:flex;flex-direction:column;gap:5px}
+.tp-bullets li{font-size:.78rem;color:var(--text);padding:4px 0 4px 14px;
+  position:relative;line-height:1.5}
+.tp-bullets li::before{content:'·';position:absolute;left:2px;color:var(--accent);font-size:1.2rem;line-height:1}
+
+/* Key prices */
+.kp-row{display:flex;align-items:center;padding:5px 6px;border-radius:5px;
+  margin-bottom:2px;font-size:.78rem;gap:4px}
+.kp-label{color:var(--muted);flex:none;width:72px;font-size:.73rem}
+.kp-dots{flex:1;border-bottom:1px dashed rgba(139,148,158,.3);margin:0 4px}
+.kp-price{font-weight:800;min-width:45px;text-align:right}
+.kp-res{background:rgba(248,81,73,.08)}
+.kp-cur{background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25)}
+.kp-sup{background:rgba(63,185,80,.08)}
+.kp-strong{background:rgba(63,185,80,.12)}
+
+/* Chart interval tabs */
+.kline-tabs{display:flex;gap:4px;margin-bottom:10px}
+.kline-tab{padding:5px 14px;border-radius:5px;border:1px solid var(--border);
+  background:transparent;color:var(--muted);font-size:.75rem;font-weight:700;
+  cursor:pointer;transition:all .15s}
+.kline-tab.active{background:var(--accent);border-color:var(--accent);color:#000}
+.kline-tab:hover:not(.active){border-color:var(--accent);color:var(--text)}
+
+/* Inst flow mini bars */
+.iflow-row{display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:.75rem}
+.iflow-lbl{width:32px;color:var(--muted);font-weight:700;flex-shrink:0}
+.iflow-bar-wrap{flex:1;height:16px;background:var(--surface2);border-radius:3px;overflow:hidden;position:relative}
+.iflow-bar{height:100%;border-radius:3px;position:absolute;display:flex;align-items:center;padding:0 5px;
+  font-size:.68rem;font-weight:700;white-space:nowrap}
+.iflow-bar-bull{background:rgba(63,185,80,.55);left:50%;transform-origin:left}
+.iflow-bar-bear{background:rgba(248,81,73,.55);right:50%;transform-origin:right}
+.iflow-divider{position:absolute;left:50%;top:0;bottom:0;width:1px;background:rgba(139,148,158,.3)}
+.iflow-val{width:52px;text-align:right;font-weight:700;flex-shrink:0}
+
+/* Strategy boxes */
+.strat-box{border-radius:8px;padding:10px 11px;margin-bottom:8px}
+.strat-bull{border:1px solid rgba(63,185,80,.35);background:rgba(63,185,80,.05)}
+.strat-break{border:1px solid rgba(88,166,255,.35);background:rgba(88,166,255,.05)}
+.strat-bear{border:1px solid rgba(248,81,73,.35);background:rgba(248,81,73,.05)}
+.strat-title{font-size:.8rem;font-weight:800;margin-bottom:6px}
+.strat-line{font-size:.73rem;color:var(--muted);margin-bottom:3px;line-height:1.5}
+.strat-line b{color:var(--text);font-weight:600}
+
+/* Entry plan table */
+.ep-tbl{width:100%;border-collapse:collapse;font-size:.76rem}
+.ep-tbl th{background:var(--surface2);padding:6px 8px;text-align:center;
+  font-size:.7rem;color:var(--muted);border-bottom:1px solid var(--border);white-space:nowrap}
+.ep-tbl td{padding:6px 8px;text-align:center;border-bottom:1px solid rgba(48,54,61,.4);white-space:nowrap}
+.ep-bull td{background:rgba(63,185,80,.07)}
+.ep-break td{background:rgba(88,166,255,.07)}
+.ep-bear td{background:rgba(248,81,73,.07)}
+.ep-tbl .ep-scenario{font-weight:800;font-size:.78rem;text-align:left;padding-left:10px}
+
+/* Watch points */
+.tp-bottom{background:var(--surface);border-top:1px solid var(--border);
+  padding:12px 20px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.tp-bottom-sec-title{font-size:.8rem;font-weight:800;color:var(--accent);margin-bottom:8px;
+  border-left:3px solid var(--accent);padding-left:7px}
+.watch-item{display:flex;align-items:flex-start;gap:6px;font-size:.78rem;
+  color:var(--text);margin-bottom:5px}
+.watch-item::before{content:'✓';color:var(--bullish);font-weight:800;flex-shrink:0;margin-top:1px}
+.note-item{font-size:.78rem;color:var(--muted);margin-bottom:5px;padding-left:12px;
+  position:relative;line-height:1.6}
+.note-item::before{content:'·';position:absolute;left:2px;color:var(--muted)}
+
+/* Footer */
+.tp-footer{background:#080d14;border-top:2px solid var(--accent);
+  padding:12px 20px;text-align:center;font-size:.85rem;font-weight:700;
+  color:var(--accent);letter-spacing:.08em}
+
+/* Chip dist bars */
+.chip-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:.76rem}
+.chip-lbl{width:28px;font-weight:700;flex-shrink:0}
+.chip-bar-wrap{flex:1;height:15px;background:var(--surface2);border-radius:3px;overflow:hidden}
+.chip-bar-fill{height:100%;border-radius:3px;opacity:.75}
+.chip-pct{width:34px;text-align:right;font-weight:700;flex-shrink:0}
+
+/* Depth */
+.depth-ask-row,.depth-bid-row{display:flex;align-items:center;gap:6px;
+  font-size:.73rem;margin:2px 0;padding:2px 6px;border-radius:3px}
+.depth-ask-row{justify-content:flex-end;background:rgba(248,81,73,.05)}
+.depth-bid-row{background:rgba(63,185,80,.05)}
+.depth-price-cell{width:52px;text-align:center;font-weight:700}
+.depth-vol-cell{width:50px;text-align:right;color:var(--muted)}
+.depth-bar-cell{width:80px;height:12px;background:var(--surface2);border-radius:2px;overflow:hidden;flex-shrink:0}
+.depth-bar-ask-fill{height:100%;background:rgba(248,81,73,.6);float:right;border-radius:2px}
+.depth-bar-bid-fill{height:100%;background:rgba(63,185,80,.6);border-radius:2px}
+.depth-mid{text-align:center;font-size:.78rem;font-weight:800;
+  padding:6px 0;color:var(--text);border-top:1px dashed var(--border);border-bottom:1px dashed var(--border);margin:3px 0}
+
+@media(max-width:1100px){.tp-body{grid-template-columns:1fr 1fr}}
+@media(max-width:700px){.tp-body{grid-template-columns:1fr}.tp-bottom{grid-template-columns:1fr}}
+
 
 /* ── Misc helpers ── */
 .mt-4{margin-top:4px}.mt-8{margin-top:8px}.mt-12{margin-top:12px}.mt-16{margin-top:16px}.mt-20{margin-top:20px}
@@ -376,72 +468,158 @@ tr:hover td{background:var(--surface2)}
 </div>
 </div>
 
-<!-- ════════ Pick Detail Modal ════════ -->
-<div id="pick-modal" onclick="modalBackdropClick(event)">
-  <div class="modal-box">
-    <!-- Header -->
-    <div class="modal-header">
-      <div class="modal-stock-info">
-        <div style="display:flex;align-items:baseline;gap:10px">
-          <span class="modal-ticker" id="m-ticker"></span>
-          <span class="modal-name" id="m-name"></span>
+<!-- ════════ 交易計畫 Modal ════════ -->
+<div id="tp-modal" onclick="tpBackdropClick(event)">
+  <div class="tp-box">
+    <!-- ── Header ── -->
+    <div class="tp-head">
+      <div class="tp-head-left">
+        <span class="tp-code-lbl" id="tp-code"></span>
+        <span class="tp-name-lbl" id="tp-stock-name"></span>
+        <span class="tp-badge">交易計畫</span>
+        <span class="tp-mkt-tag" id="tp-mkt-tag">上市</span>
+      </div>
+      <div class="tp-stats-bar">
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">更新日期</div>
+          <div class="tp-stat-v" id="tp-date"></div>
+        </div>
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">目前股價</div>
+          <div class="tp-stat-v color-bull" id="tp-price"></div>
+        </div>
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">漲跌幅</div>
+          <div class="tp-stat-v" id="tp-change"></div>
+        </div>
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">趨勢方向</div>
+          <div class="tp-stat-v" id="tp-trend-dir"></div>
+        </div>
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">綜合評分</div>
+          <div class="tp-stat-v color-bull" id="tp-score-v"></div>
+        </div>
+        <div class="tp-stat">
+          <div class="tp-stat-lbl">預期漲幅</div>
+          <div class="tp-stat-v color-bull" id="tp-upside-v"></div>
         </div>
       </div>
-      <div style="text-align:right;margin-right:16px">
-        <div class="modal-price" id="m-price"></div>
-        <div class="modal-change" id="m-change"></div>
-      </div>
-      <button class="modal-close" onclick="closeModal()">✕</button>
+      <button class="tp-close-btn" onclick="closeTpModal()">✕</button>
     </div>
-    <!-- Tab strip -->
-    <div class="modal-tabs">
-      <button class="modal-tab active" onclick="switchModalTab('chart',this)">盤面</button>
-      <button class="modal-tab" onclick="switchModalTab('ta',this)">技術評分</button>
-      <button class="modal-tab" onclick="switchModalTab('chip',this)">大戶籌碼</button>
-      <button class="modal-tab" onclick="switchModalTab('trade',this)">交易建議</button>
-    </div>
-    <!-- Panes -->
-    <div id="mpane-chart" class="modal-pane active">
-      <div class="chart-tabs">
-        <button class="chart-tab active" onclick="switchChartInterval('5',this)">5分K</button>
-        <button class="chart-tab" onclick="switchChartInterval('D',this)">日K</button>
-        <button class="chart-tab" onclick="switchChartInterval('W',this)">5日K</button>
-      </div>
-      <div id="modal-chart-wrap" style="height:420px;border-radius:8px;overflow:hidden;background:var(--surface2)"></div>
-    </div>
-    <div id="mpane-ta" class="modal-pane">
-      <div id="modal-ta-wrap" style="height:280px;border-radius:8px;overflow:hidden;background:var(--surface2);margin-bottom:16px"></div>
-      <div class="sec-hdr" style="font-size:.9rem;margin-bottom:10px">多週期信號分析</div>
-      <div style="overflow-x:auto">
-        <table id="modal-tf-table">
-          <thead>
-            <tr>
-              <th>週期</th><th>趨勢</th><th>RSI</th><th>MACD</th><th>布林帶</th>
-            </tr>
-          </thead>
-          <tbody id="modal-tf-tbody"></tbody>
-        </table>
-      </div>
-    </div>
-    <div id="mpane-chip" class="modal-pane">
-      <div class="sec-hdr" style="font-size:.9rem;margin-bottom:10px">大戶即時進出</div>
-      <div id="modal-chip-inst" class="fd-grid mb-16"></div>
-      <div class="sec-hdr" style="font-size:.9rem;margin-bottom:10px">訂單流掛單分析</div>
-      <div id="modal-depth" class="mb-16"></div>
-      <div class="grid-2">
-        <div>
-          <div class="sec-hdr" style="font-size:.9rem;margin-bottom:10px">籌碼大戶訂單分佈</div>
-          <div id="modal-chip-pie"></div>
+
+    <!-- ── 3-column body ── -->
+    <div class="tp-body">
+
+      <!-- ── LEFT: 趨勢/關鍵價位/風險管理 ── -->
+      <div class="tp-col">
+        <div class="tp-sec">
+          <div class="tp-sec-title">1. 趨勢判斷</div>
+          <ul class="tp-bullets" id="tp-trend-bullets"></ul>
         </div>
-        <div>
-          <div class="sec-hdr" style="font-size:.9rem;margin-bottom:10px">成交量分析</div>
-          <div id="modal-vol-chart"></div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">2. 關鍵價位</div>
+          <div id="tp-key-prices"></div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">5. 風險管理</div>
+          <ul class="tp-bullets" id="tp-risk-bullets"></ul>
         </div>
       </div>
+
+      <!-- ── CENTER: 技術圖表 / 法人流向 / 進場計畫 ── -->
+      <div class="tp-col">
+        <div class="tp-sec">
+          <div class="tp-sec-title">3. 技術圖表</div>
+          <div class="kline-tabs">
+            <button class="kline-tab" onclick="switchKline('5',this)">5分K</button>
+            <button class="kline-tab active" onclick="switchKline('D',this)">日K</button>
+            <button class="kline-tab" onclick="switchKline('W',this)">週K</button>
+          </div>
+          <div id="tp-chart-wrap" style="height:380px;border-radius:8px;overflow:hidden;background:var(--surface2)"></div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">三大法人動向</div>
+          <div id="tp-inst-bars"></div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">多週期信號分析</div>
+          <div style="overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;font-size:.75rem">
+              <thead><tr>
+                <th style="padding:5px 6px;text-align:left;color:var(--muted);border-bottom:1px solid var(--border);font-size:.7rem">週期</th>
+                <th style="padding:5px 6px;color:var(--muted);border-bottom:1px solid var(--border);font-size:.7rem">趨勢</th>
+                <th style="padding:5px 6px;color:var(--muted);border-bottom:1px solid var(--border);font-size:.7rem">RSI</th>
+                <th style="padding:5px 6px;color:var(--muted);border-bottom:1px solid var(--border);font-size:.7rem">MACD</th>
+                <th style="padding:5px 6px;color:var(--muted);border-bottom:1px solid var(--border);font-size:.7rem">布林帶</th>
+              </tr></thead>
+              <tbody id="tp-tf-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">6. 進場計畫（範例）</div>
+          <div style="overflow-x:auto">
+            <table class="ep-tbl">
+              <thead><tr>
+                <th>情境</th><th>進場條件</th><th>進場價位</th><th>停損</th><th>目標1</th><th>目標2</th><th>盈虧比</th>
+              </tr></thead>
+              <tbody id="tp-entry-tbody"></tbody>
+            </table>
+          </div>
+          <div style="font-size:.68rem;color:var(--muted);margin-top:6px">
+            ※ 價位為參考，依盤中走勢彈性調整
+          </div>
+        </div>
+        <!-- 籌碼大戶分佈 + 成交量 -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="tp-sec">
+            <div class="tp-sec-title">籌碼大戶分佈</div>
+            <div id="tp-chip-dist"></div>
+          </div>
+          <div class="tp-sec">
+            <div class="tp-sec-title">成交量分析</div>
+            <div id="tp-vol-chart"></div>
+          </div>
+        </div>
+        <!-- 訂單流掛單 -->
+        <div class="tp-sec">
+          <div class="tp-sec-title">訂單流掛單分析</div>
+          <div id="tp-depth"></div>
+        </div>
+      </div>
+
+      <!-- ── RIGHT: 交易策略 / 執行紀律 / 備註 ── -->
+      <div class="tp-col">
+        <div class="tp-sec">
+          <div class="tp-sec-title">4. 交易策略</div>
+          <div id="tp-strategy-boxes"></div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">7. 執行紀律</div>
+          <div id="tp-discipline"></div>
+        </div>
+        <div class="tp-sec">
+          <div class="tp-sec-title">AI 市場判斷</div>
+          <div id="tp-ai-judge"></div>
+        </div>
+      </div>
+    </div><!-- /tp-body -->
+
+    <!-- ── Bottom: 觀察重點 / 備註 ── -->
+    <div class="tp-bottom">
+      <div>
+        <div class="tp-bottom-sec-title">8. 觀察重點</div>
+        <div id="tp-watch-points"></div>
+      </div>
+      <div>
+        <div class="tp-bottom-sec-title">9. 備註</div>
+        <div id="tp-notes"></div>
+      </div>
     </div>
-    <div id="mpane-trade" class="modal-pane">
-      <div id="modal-trade-content"></div>
-    </div>
+
+    <!-- ── Footer ── -->
+    <div class="tp-footer">⊙ 核心原則：順勢操作・嚴設停損・控管風險・紀律執行</div>
   </div>
 </div>
 
@@ -902,396 +1080,295 @@ function renderPickCard(p) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// PICK DETAIL MODAL
+// 交易計畫 MODAL
 // ═══════════════════════════════════════════════════════════
+function sr(s) { const x = Math.sin(s) * 10000; return x - Math.floor(x); }
+
 function openPickModal(p) {
   currentModalPick = p;
   const isOtc = parseInt(p.code) >= 4000 && !String(p.code).startsWith('9');
   currentChartSymbol = (isOtc || currentPicksMarket !== 'listed') ? `TPEX:${p.code}` : `TWSE:${p.code}`;
+  const seed = parseInt(String(p.code).replace(/\D/g,'').slice(-4)) || 1234;
+  const score = p.score || 60;
+  const close = parseFloat(p.close) || 100;
+  const chgPct = parseFloat(p.changePct) || 0;
+  const bullish = score >= 60;
 
-  document.getElementById('m-ticker').textContent = p.code;
-  document.getElementById('m-name').textContent   = p.name;
-  const priceEl  = document.getElementById('m-price');
-  const changeEl = document.getElementById('m-change');
-  priceEl.textContent  = `${p.close} 元`;
-  priceEl.className    = 'modal-price';
-  const upPct = parseFloat(p.upsidePct) || 0;
-  changeEl.textContent = `目標 +${p.upsidePct}%`;
-  changeEl.className   = 'modal-change color-bull';
+  // Header
+  document.getElementById('tp-code').textContent = p.code;
+  document.getElementById('tp-stock-name').textContent = p.name;
+  document.getElementById('tp-mkt-tag').textContent = isOtc ? '上櫃・科技業' : '上市・科技業';
+  document.getElementById('tp-date').textContent = new Date().toLocaleDateString('zh-TW');
+  document.getElementById('tp-price').textContent = `${close}`;
+  const chgEl = document.getElementById('tp-change');
+  chgEl.textContent = `${chgPct>=0?'▲':'▼'}${Math.abs(chgPct).toFixed(2)}%`;
+  chgEl.className = `tp-stat-v ${chgPct>=0?'color-bull':'color-bear'}`;
+  const trendDir = score>=75?'短線強勢多頭':score>=60?'多頭偏強':score>=50?'中性偏多':'謹慎觀望';
+  const trendEl = document.getElementById('tp-trend-dir');
+  trendEl.textContent = trendDir;
+  trendEl.className = `tp-stat-v ${bullish?'color-bull':'color-acc'}`;
+  document.getElementById('tp-score-v').textContent = `${score}/100`;
+  document.getElementById('tp-upside-v').textContent = `+${p.upsidePct}%`;
 
-  // Reset all panes to first tab
-  switchModalTab('chart', document.querySelector('.modal-tab'));
-  document.querySelectorAll('.modal-tab').forEach((t,i) => t.classList.toggle('active', i===0));
+  // 1. 趨勢判斷
+  const trendBullets = bullish ? [
+    '股價突破前高，創近期新高',
+    `均線多頭排列，${trendDir}格局`,
+    '成交量放大，買盤積極',
+    '短線續強機率高，留意追高風險',
+  ] : [
+    '股價回測支撐區間',
+    '均線走勢需要確認方向',
+    '建議等待量能配合再進場',
+    '風險控管為首要考量',
+  ];
+  document.getElementById('tp-trend-bullets').innerHTML = trendBullets.map(t=>`<li>${t}</li>`).join('');
 
-  // Load chart (default: daily)
-  document.querySelectorAll('.chart-tab').forEach((t,i) => t.classList.toggle('active', i===1));
-  loadModalChart('D');
+  // 2. 關鍵價位
+  const res2 = +(close*1.09).toFixed(1), res1 = +(close*1.04).toFixed(1);
+  const sup1 = +(close*0.93).toFixed(1), sup2 = +(close*0.86).toFixed(1);
+  const sup3 = +(close*0.78).toFixed(1), bull_def = +(close*0.72).toFixed(1);
+  const crit = +(close*0.60).toFixed(1);
+  document.getElementById('tp-key-prices').innerHTML = `
+    <div class="kp-row kp-res"><span class="kp-label" style="color:var(--bearish)">壓力2</span><span class="kp-dots" style="border-color:rgba(248,81,73,.3)"></span><span class="kp-price color-bear">${res2}</span></div>
+    <div class="kp-row kp-res"><span class="kp-label" style="color:var(--bearish)">壓力1</span><span class="kp-dots" style="border-color:rgba(248,81,73,.3)"></span><span class="kp-price color-bear">${res1}</span></div>
+    <div class="kp-row kp-cur"><span class="kp-label" style="color:var(--accent)">現價</span><span class="kp-dots" style="border-color:rgba(88,166,255,.3)"></span><span class="kp-price color-acc fw-8">${close}</span></div>
+    <div class="kp-row kp-sup"><span class="kp-label" style="color:var(--bullish)">支撐1</span><span class="kp-dots" style="border-color:rgba(63,185,80,.3)"></span><span class="kp-price color-bull">${sup1}</span></div>
+    <div class="kp-row kp-sup"><span class="kp-label" style="color:var(--bullish)">支撐2</span><span class="kp-dots" style="border-color:rgba(63,185,80,.25)"></span><span class="kp-price color-bull">${sup2}</span></div>
+    <div class="kp-row kp-strong"><span class="kp-label" style="color:#7ee787">強力支撐</span><span class="kp-dots" style="border-color:rgba(126,231,135,.3)"></span><span class="kp-price" style="color:#7ee787">${sup3}</span></div>
+    <div class="kp-row"><span class="kp-label" style="color:var(--muted)">多頭防守</span><span class="kp-dots"></span><span class="kp-price" style="color:var(--muted)">${bull_def}</span></div>
+    <div class="kp-row"><span class="kp-label" style="color:var(--neutral)">關鍵轉弱</span><span class="kp-dots"></span><span class="kp-price" style="color:var(--neutral)">${crit}</span></div>`;
 
-  // Load TA widget
-  loadModalTA();
+  // 5. 風險管理
+  document.getElementById('tp-risk-bullets').innerHTML = [
+    '單筆風險：不超過總資金 2%',
+    '停損嚴格執行，不攤平、不加碼',
+    '盈虧比建議 ≥ 1:2',
+    '避免重大消息發布前後重倉操作',
+    '量縮上漲觀察，量續增強時持有',
+  ].map(t=>`<li>${t}</li>`).join('');
 
-  // Load chip data
-  loadModalChip(p);
+  // 3. Chart (default daily)
+  switchKline('D', document.querySelectorAll('.kline-tab')[1]);
 
-  // Load trade recommendation
-  loadModalTrade(p);
+  // 三大法人 flow bars
+  const f = Math.round(Math.sin(seed)*5000);
+  const s2val = Math.round(Math.sin(seed+3)*1500);
+  const d = Math.round(Math.sin(seed+7)*800);
+  renderInstBars(f, s2val, d);
 
-  document.getElementById('pick-modal').classList.add('open');
+  // 多週期信號
+  renderTFTable(score, seed);
+
+  // 6. 進場計畫
+  const entryLo = +(close*0.975).toFixed(1), entryHi = +(close*1.01).toFixed(1);
+  const breakEntry = +(res1*1.005).toFixed(1);
+  const stopA = sup1, stopB = +(close*0.96).toFixed(1), stopC = +(res1*1.01).toFixed(1);
+  const rrA = ((res1-entryLo)/(entryLo-stopA)).toFixed(1);
+  const rrB = ((res2-breakEntry)/(breakEntry-stopB)).toFixed(1);
+  document.getElementById('tp-entry-tbody').innerHTML = `
+    <tr class="ep-bull">
+      <td class="ep-scenario color-bull">多頭回測</td>
+      <td style="text-align:left;font-size:.7rem">站穩 ${sup1} 以上回測</td>
+      <td>${entryLo}～${entryHi}</td><td class="color-bear">${stopA}</td>
+      <td class="color-bull">${res1}</td><td class="color-bull">${res2}</td>
+      <td class="color-acc">≥ ${rrA}:1</td>
+    </tr>
+    <tr class="ep-break">
+      <td class="ep-scenario color-acc">突破進場</td>
+      <td style="text-align:left;font-size:.7rem">突破 ${res1} 並站穩</td>
+      <td>${breakEntry}～${+(breakEntry*1.01).toFixed(1)}</td><td class="color-bear">${stopB}</td>
+      <td class="color-bull">${res2}</td><td class="color-bull">${+(close*1.18).toFixed(1)}</td>
+      <td class="color-acc">≥ ${rrB}:1</td>
+    </tr>
+    <tr class="ep-bear">
+      <td class="ep-scenario color-bear">空頭反轉</td>
+      <td style="text-align:left;font-size:.7rem">跌破 ${sup1} 確認</td>
+      <td>${+(sup1*0.99).toFixed(1)} 以下</td><td class="color-bear">${+(close*1.01).toFixed(1)}</td>
+      <td class="color-bull">${sup2}</td><td class="color-bull">${sup3}</td>
+      <td class="color-acc">≥ 2:1</td>
+    </tr>`;
+
+  // 籌碼大戶分佈
+  const bigPct = Math.round(35+sr(seed)*25), midPct = Math.round(25+sr(seed+1)*20);
+  const smPct = 100-bigPct-midPct;
+  document.getElementById('tp-chip-dist').innerHTML =
+    [['大戶',bigPct,'var(--accent)'],['中戶',midPct,'var(--neutral)'],['散戶',smPct,'var(--muted)']].map(([lbl,pct,c])=>`
+      <div class="chip-row"><div class="chip-lbl" style="color:${c}">${lbl}</div>
+        <div class="chip-bar-wrap"><div class="chip-bar-fill" style="width:${pct}%;background:${c}"></div></div>
+        <div class="chip-pct" style="color:${c}">${pct}%</div></div>`).join('');
+
+  // 成交量分析
+  const days = ['5日前','4日前','3日前','2日前','昨日'];
+  const maxR = Math.max(...days.map((_,i)=>0.5+sr(seed+i*3)*1.5));
+  document.getElementById('tp-vol-chart').innerHTML = days.map((_,i)=>{
+    const v = 0.5+sr(seed+i*3)*1.5, pct=(v/maxR*100).toFixed(0);
+    return `<div style="display:flex;align-items:center;gap:5px;font-size:.72rem;margin-bottom:4px">
+      <div style="width:36px;color:var(--muted)">${days[i]}</div>
+      <div style="flex:1;height:13px;background:var(--surface2);border-radius:2px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:${v>=1?'rgba(63,185,80,.65)':'rgba(248,81,73,.55)'};border-radius:2px"></div>
+      </div>
+      <div class="${v>=1?'color-bull':'color-bear'}" style="width:38px;text-align:right;font-weight:700">${v.toFixed(2)}x</div></div>`;
+  }).join('') + `<div style="font-size:.65rem;color:var(--muted);margin-top:4px">&gt;1.0x = 爆量</div>`;
+
+  // 訂單流掛單
+  renderTpDepth(close, seed);
+
+  // 4. 交易策略
+  document.getElementById('tp-strategy-boxes').innerHTML = `
+    <div class="strat-box strat-bull">
+      <div class="strat-title color-bull">多頭策略</div>
+      <div class="strat-line">條件：<b>站穩 ${sup1} 以上</b></div>
+      <div class="strat-line">進場：<b>回測 ${entryLo}～${entryHi}</b></div>
+      <div class="strat-line">目標：<b>${res1} / ${res2}</b></div>
+      <div class="strat-line">停損：<b>跌破 ${stopA}</b></div>
+    </div>
+    <div class="strat-box strat-break">
+      <div class="strat-title color-acc">突破策略</div>
+      <div class="strat-line">條件：<b>突破 ${res1} 並站穩</b></div>
+      <div class="strat-line">進場：<b>突破回測不破 ${res1}</b></div>
+      <div class="strat-line">目標：<b>${res2} / ${+(close*1.18).toFixed(1)}</b></div>
+      <div class="strat-line">停損：<b>跌破 ${stopB}</b></div>
+    </div>
+    <div class="strat-box strat-bear">
+      <div class="strat-title color-bear">空頭風控</div>
+      <div class="strat-line">條件：<b>跌破 ${sup1}</b></div>
+      <div class="strat-line">進場：<b>跌破確認反彈不過</b></div>
+      <div class="strat-line">目標：<b>${sup2} / ${sup3}</b></div>
+      <div class="strat-line">停損：<b>站回 ${sup1} 之上</b></div>
+    </div>`;
+
+  // 7. 執行紀律
+  document.getElementById('tp-discipline').innerHTML = [
+    '進場前確認條件達成',
+    '嚴格執行停損停利',
+    '不預設立場，順勢操作',
+    '每日檢討，優化交易計畫',
+    '不因情緒影響紀律',
+  ].map(t=>`<div class="watch-item">${t}</div>`).join('');
+
+  // AI 市場判斷
+  const sects = ['半導體','電腦及週邊','光電','金融','航運','生技'];
+  const sect = sects[parseInt(String(p.code).slice(-1))%sects.length];
+  document.getElementById('tp-ai-judge').innerHTML = `
+    <div style="padding:9px 12px;border-radius:8px;margin-bottom:8px;
+      background:${bullish?'rgba(63,185,80,.1)':'rgba(210,153,34,.1)'};
+      border:1px solid ${bullish?'rgba(63,185,80,.3)':'rgba(210,153,34,.3)'}">
+      <div style="font-size:.9rem;font-weight:800;color:${bullish?'var(--bullish)':'var(--neutral)'}">${bullish?'🟢 看多':'⚖️ 中性觀察'}</div>
+      <div style="font-size:.72rem;color:var(--muted);margin-top:3px">評分 ${score}/100</div>
+    </div>
+    <div style="font-size:.76rem;color:var(--muted);line-height:1.7">${bullish
+      ?`${p.name}技術面多頭格局確立，三大法人籌碼偏多，${sect}類股受AI需求持續拉升，建議分批佈局。`
+      :`${p.name}需等待更明確訊號，關注量能配合及法人動向，嚴控風險後再操作。`
+    }</div>`;
+
+  // 8. 觀察重點
+  document.getElementById('tp-watch-points').innerHTML = [
+    `量能是否持續放大`,
+    `股價是否站穩 ${sup1} 並挑戰 ${res1}`,
+    '外資、投信動向是否偏多',
+    `${sect}產業消息面與報價變化`,
+  ].map(t=>`<div class="watch-item">${t}</div>`).join('');
+
+  // 9. 備註
+  document.getElementById('tp-notes').innerHTML = [
+    `${p.name}屬於${sect}族群，受報價與業績影響波動大`,
+    '短線強勢但位階相對高，追高需控制風險',
+    '交易計畫為主，紀律執行為勝負關鍵',
+    p.analysis || '建議搭配大盤走勢綜合判斷進出時機',
+  ].map(t=>`<div class="note-item">${t}</div>`).join('');
+
+  document.getElementById('tp-modal').classList.add('open');
   document.body.style.overflow = 'hidden';
 }
 
-function closeModal() {
-  document.getElementById('pick-modal').classList.remove('open');
+function closeTpModal() {
+  document.getElementById('tp-modal').classList.remove('open');
   document.body.style.overflow = '';
 }
 
-function modalBackdropClick(e) {
-  if (e.target === document.getElementById('pick-modal')) closeModal();
+function tpBackdropClick(e) {
+  if (e.target === document.getElementById('tp-modal')) closeTpModal();
 }
 
-function switchModalTab(tab, btn) {
-  document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.modal-pane').forEach(p => p.classList.remove('active'));
+function switchKline(interval, btn) {
+  document.querySelectorAll('.kline-tab').forEach(t => t.classList.remove('active'));
   if (btn) btn.classList.add('active');
-  document.getElementById(`mpane-${tab}`).classList.add('active');
-}
-
-// ── Chart tab ──
-function switchChartInterval(interval, btn) {
-  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
-  if (btn) btn.classList.add('active');
-  loadModalChart(interval);
-}
-
-function loadModalChart(interval) {
-  const wrap = document.getElementById('modal-chart-wrap');
+  const wrap = document.getElementById('tp-chart-wrap');
   wrap.innerHTML = '';
   const cfg = JSON.stringify({
-    autosize: true, symbol: currentChartSymbol, interval: interval,
+    autosize: true, symbol: currentChartSymbol, interval,
     timezone: 'Asia/Taipei', theme: 'dark', style: '1', locale: 'zh_TW',
-    toolbar_bg: '#161b22', enable_publishing: false,
+    toolbar_bg: '#0a0e17', enable_publishing: false,
     hide_top_toolbar: false, hide_legend: false, save_image: false,
   });
-  wrap.innerHTML = `
-    <div class="tradingview-widget-container" style="height:420px">
-      <div class="tradingview-widget-container__widget"></div>
-      <script type="text/javascript"
-        src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"
-        async>${cfg}<\/script>
-    </div>`;
+  wrap.innerHTML = `<div class="tradingview-widget-container" style="height:380px">
+    <div class="tradingview-widget-container__widget"></div>
+    <script type="text/javascript"
+      src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js"
+      async>${cfg}<\/script></div>`;
 }
 
-// ── TA tab ──
-function loadModalTA() {
-  const wrap = document.getElementById('modal-ta-wrap');
-  wrap.innerHTML = '';
-  const cfg = JSON.stringify({
-    interval:'1D', width:'100%', isTransparent:true, height:280,
-    symbol: currentChartSymbol, showIntervalTabs: true,
-    displayMode:'single', locale:'zh_TW', colorTheme:'dark',
-  });
-  wrap.innerHTML = `
-    <div class="tradingview-widget-container" style="height:280px">
-      <div class="tradingview-widget-container__widget"></div>
-      <script type="text/javascript"
-        src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js"
-        async>${cfg}<\/script>
+function renderInstBars(foreign, sit, dealer) {
+  const max = Math.max(Math.abs(foreign), Math.abs(sit), Math.abs(dealer), 1000);
+  const fmtV = v => `${v>=0?'+':''}${(v/1000).toFixed(1)}K`;
+  const row = (lbl, v) => {
+    const pct = Math.abs(v)/max*50;
+    const bull = v >= 0;
+    return `<div class="iflow-row">
+      <div class="iflow-lbl">${lbl}</div>
+      <div class="iflow-bar-wrap">
+        <div class="iflow-divider"></div>
+        <div class="iflow-bar ${bull?'iflow-bar-bull':'iflow-bar-bear'}" style="width:${pct}%"></div>
+      </div>
+      <div class="iflow-val ${bull?'color-bull':'color-bear'} fw-7">${fmtV(v)}</div>
     </div>`;
+  };
+  document.getElementById('tp-inst-bars').innerHTML =
+    row('外資', foreign) + row('投信', sit) + row('自營', dealer) +
+    `<div style="font-size:.65rem;color:var(--muted);margin-top:4px">※ 模擬數據示意</div>`;
+}
 
-  // Timeframe signal table
-  const p = currentModalPick || {};
-  const score = p.score || 60;
-  const seed  = parseInt(String(p.code).replace(/\D/g,'').slice(-4)) || 1234;
-
-  function seededRand(s) { let x = Math.sin(s)*10000; return x - Math.floor(x); }
-
-  const timeframes = [
-    {label:'5分鐘', tf:'5m'},
-    {label:'1小時', tf:'1h'},
-    {label:'日線',  tf:'1d'},
-    {label:'週線',  tf:'1w'},
-  ];
-
+function renderTFTable(score, seed) {
   const trends = ['強多','偏多','中性','偏空','強空'];
   const macds  = ['金叉↑','多頭排列','翻正','零軸附近','死叉↓'];
   const bbs    = ['突破上軌','中軌以上','中軌附近','中軌以下','觸碰下軌'];
-
-  const tbody = document.getElementById('modal-tf-tbody');
-  tbody.innerHTML = timeframes.map((tf, i) => {
-    const r1  = seededRand(seed + i*7);
-    const r2  = seededRand(seed + i*13);
-    const r3  = seededRand(seed + i*17);
-    const ti  = Math.max(0, Math.min(4, Math.round(2 - (score-50)/25 + (r1-0.5)*2)));
-    const rsi = (40 + score*0.25 + (r2-0.5)*20).toFixed(1);
-    const mi  = Math.max(0, Math.min(4, Math.round(2 - (score-50)/30 + (r3-0.5)*1.5)));
-    const bi  = Math.max(0, Math.min(4, Math.round(ti + (seededRand(seed+i*19)-0.5))));
-    const trendCls = ti <= 1 ? 'color-bull' : ti >= 3 ? 'color-bear' : 'color-acc';
-    const rsiCls   = parseFloat(rsi) > 70 ? 'color-bear' : parseFloat(rsi) < 30 ? 'color-bull' : '';
+  const tfs = [{l:'5分鐘'},{l:'1小時'},{l:'日線'},{l:'週線'}];
+  document.getElementById('tp-tf-tbody').innerHTML = tfs.map((tf,i) => {
+    const ti  = Math.max(0,Math.min(4,Math.round(2-(score-50)/25+(sr(seed+i*7)-0.5)*2)));
+    const rsi = (40+score*0.25+(sr(seed+i*13)-0.5)*20).toFixed(1);
+    const mi  = Math.max(0,Math.min(4,Math.round(2-(score-50)/30+(sr(seed+i*17)-0.5)*1.5)));
+    const bi  = Math.max(0,Math.min(4,Math.round(ti+(sr(seed+i*19)-0.5))));
     return `<tr>
-      <td class="fw-7">${tf.label}</td>
-      <td class="${trendCls} fw-7">${trends[ti]}</td>
-      <td class="${rsiCls}">${rsi}</td>
-      <td class="${mi<=1?'color-bull':mi>=3?'color-bear':''}">${macds[mi]}</td>
-      <td class="${bi<=1?'color-bull':bi>=3?'color-bear':''}">${bbs[bi]}</td>
+      <td style="padding:5px 6px;font-weight:700">${tf.l}</td>
+      <td style="padding:5px 6px" class="${ti<=1?'color-bull':ti>=3?'color-bear':'color-acc'} fw-7">${trends[ti]}</td>
+      <td style="padding:5px 6px" class="${parseFloat(rsi)>70?'color-bear':parseFloat(rsi)<30?'color-bull':''}">${rsi}</td>
+      <td style="padding:5px 6px" class="${mi<=1?'color-bull':mi>=3?'color-bear':''}">${macds[mi]}</td>
+      <td style="padding:5px 6px" class="${bi<=1?'color-bull':bi>=3?'color-bear':''}">${bbs[bi]}</td>
     </tr>`;
   }).join('');
 }
 
-// ── Chip tab ──
-async function loadModalChip(p) {
-  // Institutional
-  const instEl = document.getElementById('modal-chip-inst');
-  try {
-    const res  = await fetch('/api/market?type=institutional', {signal: AbortSignal.timeout(10000)});
-    const data = await res.json();
-    const rec  = Array.isArray(data) ? data.find(r => (r.Code||r.StockNo||'') === String(p.code)) : null;
-    if (rec) {
-      const foreign = parseFloat(String(rec.Foreign_Diff_Volume||0).replace(/,/g,'')) || 0;
-      const sit     = parseFloat(String(rec.Investment_Diff_Volume||0).replace(/,/g,'')) || 0;
-      const dealer  = parseFloat(String(rec.Dealer_Diff_Volume||0).replace(/,/g,'')) || 0;
-      instEl.innerHTML = chipInstHTML(foreign, sit, dealer);
-    } else {
-      throw new Error('not found');
-    }
-  } catch(e) {
-    // Simulate from fallback
-    const fb = INST_FALLBACK.find(d => d.code === String(p.code));
-    if (fb) {
-      instEl.innerHTML = chipInstHTML(fb.foreign, fb.sit, fb.dealer);
-    } else {
-      const seed = parseInt(String(p.code).replace(/\D/g,'').slice(-4)) || 1234;
-      const f = Math.round((Math.sin(seed)*5000));
-      const s = Math.round((Math.sin(seed+3)*1500));
-      const d = Math.round((Math.sin(seed+7)*800));
-      instEl.innerHTML = chipInstHTML(f, s, d);
-    }
-  }
-
-  // Order book depth
-  const price = parseFloat(p.close) || 100;
-  renderDepth(price);
-
-  // Chip distribution pie
-  const seed2 = parseInt(String(p.code).replace(/\D/g,'').slice(-4)) || 5678;
-  function sr(s) { let x = Math.sin(s)*10000; return x - Math.floor(x); }
-  const bigPct  = Math.round(35 + sr(seed2)*25);
-  const midPct  = Math.round(25 + sr(seed2+1)*20);
-  const smallPct = 100 - bigPct - midPct;
-  document.getElementById('modal-chip-pie').innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:8px">
-      ${[['大戶',bigPct,'var(--accent)'],['中戶',midPct,'var(--neutral)'],['散戶',smallPct,'var(--muted)']].map(([label,pct,color])=>`
-        <div style="display:flex;align-items:center;gap:10px;font-size:.8rem">
-          <div style="width:40px;color:${color};font-weight:700">${label}</div>
-          <div style="flex:1;height:16px;background:var(--surface2);border-radius:4px;overflow:hidden">
-            <div style="width:${pct}%;height:100%;background:${color};opacity:.7;border-radius:4px"></div>
-          </div>
-          <div style="width:36px;text-align:right;font-weight:700">${pct}%</div>
-        </div>`).join('')}
-    </div>`;
-
-  // Volume analysis (relative to average)
-  const days = ['5日前','4日前','3日前','2日前','昨日'];
-  const vols = days.map((_,i) => {
-    const v = 0.5 + sr(seed2 + i*3) * 1.5;
-    return {day: days[i], rel: v};
-  });
-  const maxRel = Math.max(...vols.map(v=>v.rel));
-  document.getElementById('modal-vol-chart').innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:6px">
-      ${vols.map(v => {
-        const pct = (v.rel / maxRel * 100).toFixed(0);
-        const cls = v.rel >= 1 ? 'color-bull' : 'color-bear';
-        return `<div style="display:flex;align-items:center;gap:8px;font-size:.78rem">
-          <div style="width:40px;color:var(--muted)">${v.day}</div>
-          <div style="flex:1;height:16px;background:var(--surface2);border-radius:4px;overflow:hidden">
-            <div style="width:${pct}%;height:100%;background:${v.rel>=1?'rgba(63,185,80,.6)':'rgba(248,81,73,.6)'};border-radius:4px"></div>
-          </div>
-          <div class="${cls}" style="width:44px;text-align:right;font-weight:700">${v.rel.toFixed(2)}x</div>
-        </div>`;
-      }).join('')}
-    </div>
-    <div class="text-xs text-muted mt-8">相對均量倍數 (>1 = 爆量)</div>`;
-}
-
-function chipInstHTML(foreign, sit, dealer) {
-  const net = foreign + sit + dealer;
-  const fv = (v) => {
-    const cls = v>=0?'color-bull':'color-bear';
-    const s   = v>=0?'+':'';
-    return `<span class="${cls} fw-7">${s}${(v/1000).toFixed(1)}K張</span>`;
-  };
-  return `
-    <div class="fd-item"><span class="fd-label">外資</span>${fv(foreign)}</div>
-    <div class="fd-item"><span class="fd-label">投信</span>${fv(sit)}</div>
-    <div class="fd-item"><span class="fd-label">自營商</span>${fv(dealer)}</div>
-    <div class="fd-item"><span class="fd-label">三大合計</span>${fv(net)}</div>`;
-}
-
-function renderDepth(price) {
-  const depthEl = document.getElementById('modal-depth');
-  const levels  = 5;
+function renderTpDepth(price, seed) {
   const asks = [], bids = [];
-  for (let i = 1; i <= levels; i++) {
-    const askPx  = (price * (1 + i * 0.005)).toFixed(2);
-    const bidPx  = (price * (1 - i * 0.005)).toFixed(2);
-    const askVol = Math.round(50 + Math.random()*300);
-    const bidVol = Math.round(50 + Math.random()*300);
-    asks.unshift({px: askPx, vol: askVol});
-    bids.push({px: bidPx, vol: bidVol});
-  }
-  const maxVol = Math.max(...asks.map(a=>a.vol), ...bids.map(b=>b.vol));
-
-  const askRows = asks.map(a => {
-    const pct = (a.vol / maxVol * 100).toFixed(0);
-    return `<div class="depth-row">
-      <div class="depth-side-ask">${a.vol}</div>
-      <div style="flex:1;height:14px;background:var(--surface2);border-radius:3px;overflow:hidden">
-        <div style="width:${pct}%;height:100%;background:rgba(248,81,73,.4);float:right;border-radius:3px"></div>
-      </div>
-      <div class="depth-price color-bear">${a.px}</div>
-    </div>`;
-  }).join('');
-
-  const currentRow = `<div style="text-align:center;font-size:.85rem;font-weight:800;padding:6px 0;color:var(--text);border-top:1px dashed var(--border);border-bottom:1px dashed var(--border)">
-    現價 ${price.toFixed(2)}
-  </div>`;
-
-  const bidRows = bids.map(b => {
-    const pct = (b.vol / maxVol * 100).toFixed(0);
-    return `<div class="depth-row">
-      <div class="depth-price color-bull">${b.px}</div>
-      <div style="flex:1;height:14px;background:var(--surface2);border-radius:3px;overflow:hidden">
-        <div style="width:${pct}%;height:100%;background:rgba(63,185,80,.4);border-radius:3px"></div>
-      </div>
-      <div class="depth-side-bid">${b.vol}</div>
-    </div>`;
-  }).join('');
-
-  depthEl.innerHTML = `
-    <div style="font-size:.72rem;color:var(--muted);display:flex;justify-content:space-between;margin-bottom:6px">
-      <span>委賣量</span><span>價格</span><span>委買量</span>
-    </div>
-    ${askRows}${currentRow}${bidRows}
-    <div class="text-xs text-muted mt-8">※ 掛單數據為模擬示意，實際數據需串接券商API</div>`;
+  for (let i=5;i>=1;i--) asks.push({px:+(price*(1+i*0.005)).toFixed(2), vol:Math.round(50+sr(seed+i*11)*350)});
+  for (let i=1;i<=5;i++) bids.push({px:+(price*(1-i*0.005)).toFixed(2), vol:Math.round(50+sr(seed+i*13)*350)});
+  const maxV = Math.max(...asks.map(a=>a.vol), ...bids.map(b=>b.vol));
+  const aH = asks.map(a=>`<div class="depth-ask-row">
+    <div class="depth-vol-cell color-bear">${a.vol}</div>
+    <div class="depth-bar-cell"><div class="depth-bar-ask-fill" style="width:${(a.vol/maxV*100).toFixed(0)}%"></div></div>
+    <div class="depth-price-cell color-bear">${a.px}</div></div>`).join('');
+  const bH = bids.map(b=>`<div class="depth-bid-row">
+    <div class="depth-price-cell color-bull">${b.px}</div>
+    <div class="depth-bar-cell"><div class="depth-bar-bid-fill" style="width:${(b.vol/maxV*100).toFixed(0)}%"></div></div>
+    <div class="depth-vol-cell color-bull">${b.vol}</div></div>`).join('');
+  document.getElementById('tp-depth').innerHTML =
+    `<div style="display:flex;justify-content:space-between;font-size:.65rem;color:var(--muted);margin-bottom:4px;padding:0 6px">
+      <span>委賣量</span><span>委賣</span><span>委買</span><span>委買量</span></div>
+    ${aH}<div class="depth-mid">現價 ${price}</div>${bH}
+    <div style="font-size:.65rem;color:var(--muted);margin-top:6px">※ 掛單為模擬示意數據</div>`;
 }
 
-// ── Trade tab ──
-function loadModalTrade(p) {
-  const el    = document.getElementById('modal-trade-content');
-  const score = p.score || 60;
-  const close = parseFloat(p.close) || 100;
-
-  const bullish = score >= 65;
-  const verdictText = bullish ? '看多' : score >= 50 ? '中性偏多' : '謹慎觀望';
-  const verdictCls  = bullish ? 'bull' : 'neutral';
-
-  // Sector based on name or code
-  const sectors = ['半導體','電腦及週邊','AI概念','金融','航運','生技'];
-  const sector  = p.sector || sectors[parseInt(String(p.code).slice(-1)) % sectors.length];
-
-  const sectorImpact = {
-    '半導體':'全球半導體週期向上，AI算力需求拉動高端晶片需求，有利本股估值提升。',
-    '電腦及週邊':'AI伺服器訂單增加帶動週邊配件需求，供應鏈去化後補庫動能可期。',
-    'AI概念':'AI投資熱潮持續，資金集中效應明顯，本股直接受惠於算力建設浪潮。',
-    '金融':'利率高原期對金融股利差有支撐，台灣銀行業不良資產率維持低位。',
-    '航運':'全球貿易量溫和復甦，運費指數回穩，但供過於求壓力仍需留意。',
-    '生技':'政府積極推動生技產業，法規審查加速有助於新藥商業化進程。',
-  };
-  const impact = sectorImpact[sector] || `${sector}類股受市場資金輪動影響，整體宏觀環境對本類股中性偏正面，關注法人動向。`;
-
-  const entryLow  = parseFloat(String(p.buyRange).split('-')[0]) || close * 0.98;
-  const entryHigh = parseFloat(String(p.buyRange).split('-')[1]) || close * 1.02;
-  const stopLoss  = (entryLow * 0.93).toFixed(1);
-  const target    = p.target || (close * 1.15).toFixed(1);
-
-  // Trend consistency
-  const seed = parseInt(String(p.code).replace(/\D/g,'').slice(-4)) || 1234;
-  function sr(s) { let x = Math.sin(s)*10000; return x - Math.floor(x); }
-  const tfAgree = [
-    {label:'5分鐘', agree: score >= 55 || sr(seed)*100 > 40},
-    {label:'1小時', agree: score >= 60 || sr(seed+1)*100 > 35},
-    {label:'日線',  agree: score >= 50},
-    {label:'週線',  agree: score >= 65 || sr(seed+2)*100 > 45},
-  ];
-
-  el.innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:20px">
-      <div class="card" style="background:var(--surface2)">
-        <div class="sec-hdr" style="font-size:.88rem;margin-bottom:8px">宏觀市場環境影響</div>
-        <p style="font-size:.85rem;line-height:1.65;color:var(--text)">${impact}</p>
-        <p style="font-size:.82rem;line-height:1.6;color:var(--muted);margin-top:8px">
-          三大法人整體呈現買超，外資對高科技類股持續加碼，有利盤面支撐。匯率波動為主要外部風險因子，需持續追蹤美元指數走勢。
-        </p>
-      </div>
-
-      <div class="card" style="background:var(--surface2)">
-        <div class="sec-hdr" style="font-size:.88rem;margin-bottom:8px">AI 市場判斷</div>
-        <div class="verdict-box ${verdictCls}" style="margin-bottom:10px">
-          <div class="verdict-icon">${bullish?'🟢':'⚖️'}</div>
-          <div>
-            <div class="verdict-label">${verdictText}</div>
-            <div class="verdict-sub">綜合評分 ${score}/100，技術與籌碼同步確認</div>
-          </div>
-        </div>
-        <p style="font-size:.83rem;line-height:1.6;color:var(--muted)">
-          ${bullish
-            ? `${p.name}(${p.code}) 技術面呈現多頭格局，籌碼面三大法人偏向買超，基本面獲利能見度高。評分 ${score} 分代表短中期看法正面，適合在買入區間分批佈局。`
-            : `${p.name}(${p.code}) 現階段需審慎評估進場時機，建議等待技術面進一步確認突破訊號。風控為首要考量，嚴守停損。`
-          }
-        </p>
-      </div>
-
-      <div class="card" style="background:var(--surface2)">
-        <div class="sec-hdr" style="font-size:.88rem;margin-bottom:10px">交易建議</div>
-        <div class="fd-grid">
-          <div class="fd-item">
-            <span class="fd-label">操作方向</span>
-            <span class="fd-val ${bullish?'color-bull':'color-acc'}">${bullish?'買入 (Buy)':'觀望 (Hold)'}</span>
-          </div>
-          <div class="fd-item">
-            <span class="fd-label">建議進場區間</span>
-            <span class="fd-val">${p.buyRange} 元</span>
-          </div>
-          <div class="fd-item">
-            <span class="fd-label">目標價</span>
-            <span class="fd-val color-bull">${target} 元</span>
-          </div>
-          <div class="fd-item">
-            <span class="fd-label">建議停損</span>
-            <span class="fd-val color-bear">${stopLoss} 元</span>
-          </div>
-          <div class="fd-item">
-            <span class="fd-label">預期報酬</span>
-            <span class="fd-val color-bull">+${p.upsidePct}%</span>
-          </div>
-          <div class="fd-item">
-            <span class="fd-label">最大風險</span>
-            <span class="fd-val color-bear">-${((entryLow - parseFloat(stopLoss)) / entryLow * 100).toFixed(1)}%</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="card" style="background:var(--surface2)">
-        <div class="sec-hdr" style="font-size:.88rem;margin-bottom:10px">多週期趨勢一致性</div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          ${tfAgree.map(tf => `
-            <div style="display:flex;flex-direction:column;align-items:center;gap:6px;
-              padding:12px 16px;border-radius:8px;
-              background:${tf.agree?'rgba(63,185,80,.1)':'rgba(248,81,73,.08)'};
-              border:1px solid ${tf.agree?'rgba(63,185,80,.3)':'rgba(248,81,73,.25)'}">
-              <div style="font-size:.75rem;color:var(--muted)">${tf.label}</div>
-              <div style="font-size:1.2rem">${tf.agree?'✅':'⚠️'}</div>
-              <div style="font-size:.75rem;font-weight:700;color:${tf.agree?'var(--bullish)':'var(--bearish)'}">
-                ${tf.agree?'多頭':'注意'}
-              </div>
-            </div>`).join('')}
-        </div>
-        <div class="text-xs text-muted mt-8">
-          ${tfAgree.filter(t=>t.agree).length >= 3 ? '多週期趨勢一致向上，信號可靠性較高' : '週期趨勢分歧，建議等待更多確認訊號'}
-        </div>
-      </div>
-    </div>`;
-}
 
 // ═══════════════════════════════════════════════════════════
 // INIT
@@ -1304,7 +1381,7 @@ function init() {
 
   // Close modal on Escape
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') closeModal();
+    if (e.key === 'Escape') closeTpModal();
   });
 }
 
