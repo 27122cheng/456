@@ -1,8 +1,3 @@
 {
-  "version": 2,
-  "functions": {
-    "api/market.js":   { "maxDuration": 15 },
-    "api/ai.js":       { "maxDuration": 30 },
-    "api/telegram.js": { "maxDuration": 10 }
-  }
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
