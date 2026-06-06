@@ -1,3 +1,5 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+  "buildCommand": "",
+  "outputDirectory": ".",
+  "rewrites": [{ "source": "/((?!js|css|favicon).*)", "destination": "/index.html" }]
 }
