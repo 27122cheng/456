@@ -62,9 +62,10 @@ async function initApp() {
   renderCustomStocksList();
   initNavSearch();
   initEventListeners();
-  await startScan();
+  // Hide loader immediately — scan runs in background with its own progress bar
   hideLoader();
   startRefreshCycle();
+  startScan();
 }
 
 // ── Scan ───────────────────────────────────────────────────────────────────

@@ -1,20 +1,34 @@
 // ── API — Taiwan Stocks via allorigins + Yahoo Finance + TWSE ─────────────
 
-const PROXY = 'https://api.allorigins.win/get?url=';
-
-async function proxyFetch(url, timeout = 12000) {
+async function fetchWithTimeout(url, timeout) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const res = await fetch(`${PROXY}${encodeURIComponent(url)}`, { signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
-    if (!res.ok) return null;
-    const json = await res.json();
-    return JSON.parse(json.contents);
+    return res.ok ? res : null;
   } catch {
     clearTimeout(timer);
     return null;
   }
+}
+
+// Primary: allorigins (JSON wrapper). Fallback: corsproxy.io (raw body).
+async function proxyFetch(url, timeout = 12000) {
+  // 1. allorigins
+  let res = await fetchWithTimeout(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, timeout);
+  if (res) {
+    try {
+      const json = await res.json();
+      if (json?.contents) return JSON.parse(json.contents);
+    } catch {}
+  }
+  // 2. corsproxy.io
+  res = await fetchWithTimeout(`https://corsproxy.io/?url=${encodeURIComponent(url)}`, timeout);
+  if (res) {
+    try { return await res.json(); } catch {}
+  }
+  return null;
 }
 
 // ── Yahoo Finance ─────────────────────────────────────────────────────────
