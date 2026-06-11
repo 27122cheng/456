@@ -13,18 +13,24 @@ async function fetchWithTimeout(url, timeout) {
   }
 }
 
-// Primary: allorigins (JSON wrapper). Fallback: corsproxy.io (raw body).
+// 3-layer proxy fallback: allorigins JSON wrapper → allorigins raw → corsproxy.io
 async function proxyFetch(url, timeout = 12000) {
-  // 1. allorigins
-  let res = await fetchWithTimeout(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, timeout);
+  const enc = encodeURIComponent(url);
+  // 1. allorigins /get (JSON wrapper)
+  let res = await fetchWithTimeout(`https://api.allorigins.win/get?url=${enc}`, timeout);
   if (res) {
     try {
       const json = await res.json();
       if (json?.contents) return JSON.parse(json.contents);
     } catch {}
   }
-  // 2. corsproxy.io
-  res = await fetchWithTimeout(`https://corsproxy.io/?url=${encodeURIComponent(url)}`, timeout);
+  // 2. allorigins /raw (direct body)
+  res = await fetchWithTimeout(`https://api.allorigins.win/raw?url=${enc}`, timeout);
+  if (res) {
+    try { return await res.json(); } catch {}
+  }
+  // 3. corsproxy.io
+  res = await fetchWithTimeout(`https://corsproxy.io/?url=${enc}`, timeout);
   if (res) {
     try { return await res.json(); } catch {}
   }

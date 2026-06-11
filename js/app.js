@@ -65,8 +65,7 @@ async function initApp() {
   // Hide loader immediately — scan runs in background with its own progress bar
   hideLoader();
   renderEvents();
-  const tfDate = document.getElementById('tf-date');
-  if (tfDate) tfDate.value = new Date().toISOString().slice(0, 10);
+  renderCapitalFlow();
   startRefreshCycle();
   startScan();
 }
@@ -119,6 +118,11 @@ async function startScan() {
 
   // Re-render outlook now that breadth (bull/bear counts) is known
   renderMarketOutlook();
+
+  // AI 自動交易：結算既有部位 → 產生新建議
+  processPositions();
+  generatePendingSuggestions();
+  if (currentPage === 'positions') renderPositions();
 
   // Auto Telegram notification for strong signals
   autoNotifyTelegram();
@@ -310,6 +314,7 @@ function renderMarketOutlook() {
 
   // Composite verdict: normalize to -100..+100
   const norm = maxPts ? Math.round((totalPts / maxPts) * 100) : 0;
+  outlookData.norm = norm;
   let vClass, vIcon, vTitle, vAction;
   if (norm >= 35)       { vClass = 'v-bull';    vIcon = '🐂'; vTitle = '偏多 BULLISH';   vAction = '順勢偏多操作，回檔找買點'; }
   else if (norm >= 15)  { vClass = 'v-bull';    vIcon = '📈'; vTitle = '中性偏多';        vAction = '可小幅偏多，嚴設停損'; }
@@ -526,27 +531,44 @@ function saveTrades(trades) {
   localStorage.setItem('trade-log', JSON.stringify(trades));
 }
 
-function addTrade() {
-  const id    = document.getElementById('tf-id').value.trim();
-  const dir   = document.getElementById('tf-dir').value;
-  const entry = parseFloat(document.getElementById('tf-entry').value);
-  const exit  = parseFloat(document.getElementById('tf-exit').value);
-  const qty   = parseInt(document.getElementById('tf-qty').value) || 1000;
-  const date  = document.getElementById('tf-date').value || new Date().toISOString().slice(0, 10);
-  const note  = document.getElementById('tf-note').value.trim();
+// ── 匯入 / 匯出 ────────────────────────────────────────────────────────────
 
-  if (!id || !entry || !exit) { showToast('請填寫代號、進場價、出場價', 'error'); return; }
+function exportTrades() {
+  const payload = {
+    exported: new Date().toISOString(),
+    trades: getTrades(),
+    positions: getPositions(),
+    stopAdj: localStorage.getItem('stop-adj') || '0.99',
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `taistock-trades-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('已匯出交易紀錄', 'success');
+}
 
-  const pnl = dir === 'long' ? (exit - entry) * qty : (entry - exit) * qty;
-  const retPct = dir === 'long' ? (exit - entry) / entry * 100 : (entry - exit) / entry * 100;
-
-  const trades = getTrades();
-  trades.push({ id, dir, entry, exit, qty, date, note, pnl: Math.round(pnl), retPct: +retPct.toFixed(2) });
-  saveTrades(trades);
-
-  ['tf-id','tf-entry','tf-exit','tf-note'].forEach(x => document.getElementById(x).value = '');
-  renderTradelog();
-  showToast('已新增交易紀錄', 'success');
+function importTrades(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (Array.isArray(data.trades)) saveTrades(data.trades);
+      else if (Array.isArray(data)) saveTrades(data); // bare array format
+      if (Array.isArray(data.positions)) savePositions(data.positions);
+      if (data.stopAdj) localStorage.setItem('stop-adj', data.stopAdj);
+      renderTradelog();
+      renderPositions();
+      showToast(`已匯入 ${(data.trades || data).length} 筆交易紀錄`, 'success');
+    } catch {
+      showToast('匯入失敗：JSON 格式錯誤', 'error');
+    }
+  };
+  reader.readAsText(file);
+  event.target.value = '';
 }
 
 function deleteTrade(idx) {
@@ -588,9 +610,10 @@ function renderTradelog() {
   tbody.innerHTML = newest.length ? newest.map((t, i) => {
     const realIdx = trades.length - 1 - i;
     const pnlCls = t.pnl > 0 ? 'change-up' : t.pnl < 0 ? 'change-dn' : '';
+    const penalty = t.penalty || 0;
     return `<tr>
       <td style="font-family:var(--mono);font-size:0.75rem">${t.date}</td>
-      <td><span class="stock-cell-id">${t.id}</span></td>
+      <td><span class="stock-cell-id">${t.id}</span> <span style="font-size:0.7rem;color:var(--text3)">${t.name || ''}</span></td>
       <td>${t.dir === 'long' ? '<span style="color:var(--bull)">多</span>' : '<span style="color:var(--bear)">空</span>'}</td>
       <td class="price-mono">${t.entry}</td>
       <td class="price-mono">${t.exit}</td>
@@ -598,9 +621,10 @@ function renderTradelog() {
       <td class="${pnlCls}">${t.pnl > 0 ? '+' : ''}${t.pnl.toLocaleString()}</td>
       <td class="${pnlCls}">${t.retPct > 0 ? '+' : ''}${t.retPct}%</td>
       <td style="font-size:0.75rem;color:var(--text3)">${t.note || '--'}</td>
+      <td>${penalty < 0 ? `<span style="color:var(--bear);font-family:var(--mono)">${penalty}</span>` : '<span style="color:var(--text3)">0</span>'}</td>
       <td><button class="del-trade-btn" onclick="deleteTrade(${realIdx})" title="刪除">×</button></td>
     </tr>`;
-  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:20px">尚無交易紀錄，於上方表單新增</td></tr>';
+  }).join('') : '<tr><td colspan="11" style="text-align:center;color:var(--text3);padding:20px">尚無已結算交易（AI 訊號成交並出場後自動寫入）</td></tr>';
 
   // Cumulative PnL chart
   renderPnlChart(trades);
@@ -667,6 +691,326 @@ function renderRiskLearning(trades) {
     ${insights.map(i => `<div class="learn-item"><span class="learn-icon">${i.icon}</span><span>${i.txt}</span></div>`).join('')}
     <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3)">
       目前自動止損參數：5日低點 × ${stopAdj}（個股「交易建議」的止損價已套用此規則）
+    </div>`;
+}
+
+// ── AI 自動交易系統（待進場 → 回踩成交 → 持倉 → 自動止損/停利） ─────────────
+
+function getPositions() {
+  try { return JSON.parse(localStorage.getItem('positions') || '[]'); } catch { return []; }
+}
+function savePositions(p) { localStorage.setItem('positions', JSON.stringify(p)); }
+
+// AI 訊號 → 建立待進場單（進場價 = 回踩 EMA20）
+function generatePendingSuggestions() {
+  const positions = getPositions();
+  const today = new Date().toISOString().slice(0, 10);
+  const threshold = getThreshold('bull') + 10;
+  const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  const newOnes = [];
+
+  for (const s of allStocks) {
+    const a = s.analysis;
+    if (!a || a.score < threshold) continue;
+    // 已有同檔 pending / open 就跳過
+    if (positions.find(p => p.id === s.id && (p.status === 'pending' || p.status === 'open'))) continue;
+
+    const lows = s.ohlcv.map(d => d.low);
+    // 回踩進場價：EMA20（若 EMA20 已高於現價則用現價 -1.5%）
+    let entry = a.ema20 && a.ema20 < a.price ? a.ema20 : a.price * 0.985;
+    entry = +entry.toFixed(2);
+    const stop = +(Math.min(...lows.slice(-5)) * stopAdj).toFixed(2);
+    if (stop >= entry) continue;
+    const r = entry - stop;
+    const pos = {
+      uid: Date.now() + '-' + s.id,
+      id: s.id, name: s.name, dir: 'long',
+      score: a.score, suggestedAt: today,
+      entry, stopLoss: stop,
+      tp1: +(entry + r * 2).toFixed(2),
+      tp2: +(entry + r * 3).toFixed(2),
+      qty: 1000, status: 'pending', lastPrice: a.price,
+    };
+    positions.push(pos);
+    newOnes.push(pos);
+  }
+
+  if (newOnes.length) {
+    savePositions(positions);
+    showToast(`AI 新增 ${newOnes.length} 筆待進場建議`, 'info');
+    // Telegram 推送
+    const enabled = localStorage.getItem('tg-enabled') === 'true';
+    const token = localStorage.getItem('tg-token');
+    const chatId = localStorage.getItem('tg-chatid');
+    if (enabled && token && chatId) {
+      const lines = newOnes.map(p => `${p.name}(${p.id}) 評分${p.score}\n回踩進場 ${p.entry}｜止損 ${p.stopLoss}｜目標 ${p.tp1}/${p.tp2}`).join('\n\n');
+      sendTelegram(token, chatId, `📡 台股雷達 AI 交易建議（待回踩進場）\n\n${lines}`);
+    }
+  }
+}
+
+// 每次掃描後：檢查回踩成交、止損、停利
+function processPositions() {
+  const positions = getPositions();
+  const now = new Date();
+  let changed = false;
+
+  for (const p of positions) {
+    const s = allStocks.find(x => x.id === p.id);
+    const bars = s?.ohlcv;
+    if (!bars?.length) continue;
+    p.lastPrice = bars[bars.length - 1].close;
+
+    if (p.status === 'pending') {
+      // 7 天未成交 → 過期
+      if ((now - new Date(p.suggestedAt)) / 86400000 > 7) {
+        p.status = 'expired'; changed = true; continue;
+      }
+      // 回踩成交：建議日之後任一根 K 棒低點觸及進場價
+      const fill = bars.find(b => b.time > p.suggestedAt && b.low <= p.entry);
+      if (fill) { p.status = 'open'; p.entryDate = fill.time; changed = true; }
+    } else if (p.status === 'open') {
+      const after = bars.filter(b => b.time > p.entryDate);
+      for (const b of after) {
+        if (b.low <= p.stopLoss) { settlePosition(p, p.stopLoss, b.time, '跌破止損'); changed = true; break; }
+        if (b.high >= p.tp1)     { settlePosition(p, p.tp1, b.time, '達標停利');  changed = true; break; }
+      }
+    }
+  }
+
+  savePositions(positions.filter(p => p.status === 'pending' || p.status === 'open'));
+  if (changed && currentPage === 'positions') renderPositions();
+}
+
+// 平倉結算 → 寫入交易日誌（含止損原因 + 風控扣分）
+function settlePosition(p, exitPrice, exitDate, reason) {
+  p.status = 'closed';
+  const pnl = Math.round((exitPrice - p.entry) * p.qty);
+  const retPct = +((exitPrice - p.entry) / p.entry * 100).toFixed(2);
+
+  // 風控扣分規則
+  let penalty = 0;
+  const penaltyNotes = [];
+  if (reason === '跌破止損') {
+    penalty -= 5; penaltyNotes.push('止損出場 -5');
+    if (retPct < -8) { penalty -= 5; penaltyNotes.push('單筆大虧>8% -5'); }
+    if ((outlookData.norm ?? 0) <= -15) { penalty -= 5; penaltyNotes.push('大盤偏空逆勢做多 -5'); }
+  }
+
+  const trades = getTrades();
+  trades.push({
+    id: p.id, name: p.name, dir: p.dir,
+    entry: p.entry, exit: exitPrice, qty: p.qty,
+    date: exitDate, note: reason + (penaltyNotes.length ? `（${penaltyNotes.join('、')}）` : ''),
+    pnl, retPct, penalty,
+  });
+  saveTrades(trades);
+  showToast(`${p.name}(${p.id}) ${reason}：${pnl > 0 ? '+' : ''}${pnl.toLocaleString()} 元`, pnl >= 0 ? 'success' : 'error');
+}
+
+function cancelPending(uid) {
+  savePositions(getPositions().filter(p => p.uid !== uid));
+  renderPositions();
+}
+
+function closeManual(uid) {
+  const positions = getPositions();
+  const p = positions.find(x => x.uid === uid);
+  if (!p || !p.lastPrice) return;
+  settlePosition(p, p.lastPrice, new Date().toISOString().slice(0, 10), '手動平倉');
+  savePositions(positions.filter(x => x.status === 'pending' || x.status === 'open'));
+  renderPositions();
+}
+
+function getRiskScore() {
+  const totalPenalty = getTrades().reduce((s, t) => s + (t.penalty || 0), 0);
+  return Math.max(0, Math.min(100, 100 + totalPenalty));
+}
+
+function renderPositions() {
+  const positions = getPositions();
+  const pending = positions.filter(p => p.status === 'pending');
+  const open    = positions.filter(p => p.status === 'open');
+
+  // 統計卡
+  const unrealized = open.reduce((s, p) => s + (p.lastPrice ? (p.lastPrice - p.entry) * p.qty : 0), 0);
+  const uEl = document.getElementById('pos-unrealized');
+  uEl.textContent = open.length ? (unrealized > 0 ? '+' : '') + Math.round(unrealized).toLocaleString() : '--';
+  uEl.style.color = unrealized > 0 ? 'var(--bull)' : unrealized < 0 ? 'var(--bear)' : 'var(--text1)';
+  document.getElementById('pos-open-count').textContent = open.length;
+  document.getElementById('pos-pending-count').textContent = pending.length;
+  const rs = getRiskScore();
+  const rsEl = document.getElementById('pos-risk-score');
+  rsEl.textContent = rs;
+  rsEl.style.color = rs >= 80 ? 'var(--bull)' : rs >= 60 ? 'var(--yellow)' : 'var(--bear)';
+
+  // 待進場表
+  document.getElementById('pending-badge').textContent = pending.length;
+  document.getElementById('pending-tbody').innerHTML = pending.length ? pending.map(p => {
+    const dist = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(1) : null;
+    return `<tr>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span></td>
+      <td><span class="score-val" style="color:${scoreToColor(p.score)}">${p.score}</span></td>
+      <td style="font-family:var(--mono);font-size:0.75rem">${p.suggestedAt}</td>
+      <td class="price-mono" style="color:var(--blue)">${p.entry}</td>
+      <td class="price-mono" style="color:var(--bear)">${p.stopLoss}</td>
+      <td class="price-mono" style="color:var(--bull)">${p.tp1}</td>
+      <td class="price-mono" style="color:var(--bull)">${p.tp2}</td>
+      <td class="price-mono">${p.lastPrice ?? '--'}</td>
+      <td>${dist !== null ? `<span style="color:var(--yellow);font-family:var(--mono)">${dist > 0 ? '+' : ''}${dist}%</span>` : '--'}</td>
+      <td><button class="del-trade-btn" onclick="cancelPending('${p.uid}')" title="取消">×</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:20px">無待進場單 — 掃描到強勢訊號時 AI 自動建立</td></tr>';
+
+  // 持倉表
+  document.getElementById('open-badge').textContent = open.length;
+  document.getElementById('open-tbody').innerHTML = open.length ? open.map(p => {
+    const pnl = p.lastPrice ? Math.round((p.lastPrice - p.entry) * p.qty) : null;
+    const ret = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(2) : null;
+    const cls = pnl > 0 ? 'change-up' : pnl < 0 ? 'change-dn' : '';
+    return `<tr>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span></td>
+      <td style="font-family:var(--mono);font-size:0.75rem">${p.entryDate}</td>
+      <td class="price-mono">${p.entry}</td>
+      <td class="price-mono">${p.lastPrice ?? '--'}</td>
+      <td class="${cls}">${pnl !== null ? (pnl > 0 ? '+' : '') + pnl.toLocaleString() : '--'}</td>
+      <td class="${cls}">${ret !== null ? (ret > 0 ? '+' : '') + ret + '%' : '--'}</td>
+      <td class="price-mono" style="color:var(--bear)">${p.stopLoss}</td>
+      <td class="price-mono" style="color:var(--bull)">${p.tp1}</td>
+      <td><button class="btn-ghost" style="padding:3px 10px;font-size:0.72rem" onclick="closeManual('${p.uid}')">平倉</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:20px">尚無持倉 — 待進場單回踩成交後自動轉入</td></tr>';
+}
+
+// ── 台股資金流入流出事件（六個月內） ──────────────────────────────────────
+
+function thirdFriday(y, m) {
+  const d = new Date(y, m, 1);
+  while (d.getDay() !== 5) d.setDate(d.getDate() + 1);
+  d.setDate(d.getDate() + 14);
+  return d;
+}
+
+function getCapitalFlowEvents() {
+  const now = new Date();
+  const horizon = 183 * 86400000;
+  const out = [];
+  const push = (d, name, dir, desc) => {
+    const diff = d - now;
+    if (diff > -86400000 && diff <= horizon) out.push({ date: d, name, dir, desc });
+  };
+  for (const y of [now.getFullYear(), now.getFullYear() + 1]) {
+    push(new Date(y, 0, 10), '年終獎金行情', 'in', '散戶資金回流，中小型與題材股活躍');
+    push(new Date(y, 4, 1),  '綜所稅繳稅賣壓（5月）', 'out', '繳稅資金抽離市場，量能轉弱');
+    push(new Date(y, 6, 1),  '除權息旺季（7-8月）', 'in', '現金股利逾兆元回流市場，高股息與權值股受惠');
+    for (const m of [1, 4, 7, 10]) push(new Date(y, m, 28), 'MSCI 季度調整生效', 'mix', '外資被動資金調整台股權重，尾盤爆量');
+    for (const m of [2, 5, 8, 11]) push(thirdFriday(y, m), '富時/ETF 成分股調整', 'mix', '0050 等被動基金換股，成分股進出現大量');
+    for (const m of [2, 5, 8, 11]) push(new Date(y, m + 1, 0), '投信季底作帳', 'in', '投信拉抬持股淨值，集中買超中小型股');
+    for (const m of [0, 3, 6, 9]) push(new Date(y, m, 15), '台積電法說會', 'mix', '電子權值風向球，半導體族群波動加大');
+  }
+  return out.sort((a, b) => a.date - b.date).slice(0, 8);
+}
+
+function renderCapitalFlow() {
+  const el = document.getElementById('capital-flow-body');
+  if (!el) return;
+  const events = getCapitalFlowEvents();
+  const now = new Date();
+  const dirTag = d => d === 'in'
+    ? '<span class="event-predict" style="background:rgba(34,197,94,0.12);color:var(--bull)">資金流入</span>'
+    : d === 'out'
+    ? '<span class="event-predict" style="background:rgba(239,68,68,0.12);color:var(--bear)">資金流出</span>'
+    : '<span class="event-predict" style="background:rgba(245,158,11,0.1);color:var(--yellow)">雙向波動</span>';
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">台股資金流動事件</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">未來六個月內影響台股資金動能的關鍵日程</span>
+    <div style="margin-top:10px">
+      ${events.map(e => {
+        const days = Math.max(0, Math.ceil((e.date - now) / 86400000));
+        return `<div class="event-row">
+          <div class="event-countdown">${days === 0 ? '本週' : days + '天'}</div>
+          <div style="min-width:0">
+            <div class="event-name">${e.name}</div>
+            <div class="event-date">${e.date.getMonth()+1}/${e.date.getDate()} · ${e.desc}</div>
+          </div>
+          ${dirTag(e.dir)}
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+// ── 策略報表（月度 / 年度） ────────────────────────────────────────────────
+
+let reportPeriod = 'month';
+
+function switchReportPeriod(period, btn) {
+  reportPeriod = period;
+  btn.parentElement.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderReport();
+}
+
+function renderReport() {
+  const el = document.getElementById('report-content');
+  const trades = getTrades();
+  if (!trades.length) {
+    el.innerHTML = '<div class="adv-loading">尚無已結算交易，等待 AI 訊號成交後產生報表</div>';
+    return;
+  }
+
+  const keyLen = reportPeriod === 'month' ? 7 : 4;
+  const groups = {};
+  trades.forEach(t => {
+    const k = (t.date || '').slice(0, keyLen);
+    if (!k) return;
+    (groups[k] = groups[k] || []).push(t);
+  });
+
+  const keys = Object.keys(groups).sort().reverse();
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const wins = trades.filter(t => t.pnl > 0).length;
+
+  el.innerHTML = `
+    <div class="overview-grid" style="margin-bottom:16px">
+      <div class="ov-card ov-total"><div class="ov-body" style="padding-left:4px"><div class="ov-value">${trades.length}</div><div class="ov-label">累計交易</div></div></div>
+      <div class="ov-card ov-bull"><div class="ov-body" style="padding-left:4px"><div class="ov-value">${(wins / trades.length * 100).toFixed(0)}%</div><div class="ov-label">總勝率</div></div></div>
+      <div class="ov-card"><div class="ov-body" style="padding-left:4px"><div class="ov-value" style="color:${totalPnl >= 0 ? 'var(--bull)' : 'var(--bear)'}">${totalPnl > 0 ? '+' : ''}${totalPnl.toLocaleString()}</div><div class="ov-label">累計損益 (元)</div></div></div>
+      <div class="ov-card ov-neutral"><div class="ov-body" style="padding-left:4px"><div class="ov-value">${getRiskScore()}</div><div class="ov-label">風控分數</div></div></div>
+    </div>
+    <div class="tbl-card full-tbl">
+      <div class="tbl-head">
+        <div class="tbl-title"><span class="dot" style="background:var(--blue)"></span> ${reportPeriod === 'month' ? '月度' : '年度'}績效</div>
+      </div>
+      <div class="tbl-scroll">
+        <table class="data-tbl">
+          <thead><tr>
+            <th>${reportPeriod === 'month' ? '月份' : '年度'}</th><th>筆數</th><th>勝率</th><th>損益</th><th>平均報酬</th><th>最佳</th><th>最差</th><th>風控扣分</th>
+          </tr></thead>
+          <tbody>
+            ${keys.map(k => {
+              const g = groups[k];
+              const w = g.filter(t => t.pnl > 0).length;
+              const pnl = g.reduce((s, t) => s + t.pnl, 0);
+              const avgRet = g.reduce((s, t) => s + t.retPct, 0) / g.length;
+              const best = Math.max(...g.map(t => t.pnl));
+              const worst = Math.min(...g.map(t => t.pnl));
+              const pen = g.reduce((s, t) => s + (t.penalty || 0), 0);
+              const cls = pnl > 0 ? 'change-up' : pnl < 0 ? 'change-dn' : '';
+              return `<tr>
+                <td style="font-family:var(--mono)">${k}</td>
+                <td>${g.length}</td>
+                <td>${(w / g.length * 100).toFixed(0)}%</td>
+                <td class="${cls}">${pnl > 0 ? '+' : ''}${pnl.toLocaleString()}</td>
+                <td class="${avgRet >= 0 ? 'change-up' : 'change-dn'}">${avgRet > 0 ? '+' : ''}${avgRet.toFixed(2)}%</td>
+                <td class="change-up">+${best.toLocaleString()}</td>
+                <td class="change-dn">${worst.toLocaleString()}</td>
+                <td>${pen < 0 ? `<span style="color:var(--bear);font-family:var(--mono)">${pen}</span>` : '0'}</td>
+              </tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
     </div>`;
 }
 
@@ -1112,6 +1456,8 @@ function navigateTo(page, opts = {}) {
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
   if (page === 'tradelog') renderTradelog();
+  if (page === 'positions') renderPositions();
+  if (page === 'report') renderReport();
 
   // Apply filter from opts
   if (opts.filter) {

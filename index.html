@@ -54,9 +54,17 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 7 13.5 15.5 8.5 10.5 1 18"/><polyline points="16 7 22 7 22 13"/></svg>
           個股分析
         </a>
+        <a class="nav-link" data-page="positions" onclick="navigateTo('positions')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/><polyline points="16 7 22 7 22 13"/></svg>
+          持有中
+        </a>
         <a class="nav-link" data-page="tradelog" onclick="navigateTo('tradelog')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
           交易日誌
+        </a>
+        <a class="nav-link" data-page="report" onclick="navigateTo('report')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          策略報表
         </a>
         <a class="nav-link" data-page="settings" onclick="navigateTo('settings')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -92,7 +100,9 @@
   <div class="mobile-drawer" id="mobile-drawer">
     <a class="mob-link" onclick="navigateTo('dashboard');toggleMobileMenu()">儀表板</a>
     <a class="mob-link" onclick="navigateTo('ranking');toggleMobileMenu()">市場排名</a>
+    <a class="mob-link" onclick="navigateTo('positions');toggleMobileMenu()">持有中</a>
     <a class="mob-link" onclick="navigateTo('tradelog');toggleMobileMenu()">交易日誌</a>
+    <a class="mob-link" onclick="navigateTo('report');toggleMobileMenu()">策略報表</a>
     <a class="mob-link" onclick="navigateTo('settings');toggleMobileMenu()">設定</a>
     <div class="mob-tf">
       <span class="mob-tf-label">時間週期</span>
@@ -203,53 +213,9 @@
         <div id="institutional-body"><div class="adv-loading">載入三大法人資料...</div></div>
       </div>
 
-      <!-- 強勢多頭 / 強勢空頭 表格 -->
-      <div class="tables-row">
-        <div class="tbl-card tbl-bull">
-          <div class="tbl-head">
-            <div class="tbl-title">
-              <span class="dot dot-bull"></span>
-              強勢多頭排名
-            </div>
-            <span class="tbl-badge badge-bull" id="bull-count">0</span>
-          </div>
-          <div class="tbl-scroll">
-            <table class="data-tbl" id="bull-tbl">
-              <thead><tr>
-                <th>股票</th>
-                <th>股價</th>
-                <th>趨勢</th>
-                <th>評分</th>
-                <th>RSI</th>
-                <th>成交量</th>
-              </tr></thead>
-              <tbody id="bull-tbody"><tr><td colspan="6" class="loading-cell"><div class="spinner"></div></td></tr></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="tbl-card tbl-bear">
-          <div class="tbl-head">
-            <div class="tbl-title">
-              <span class="dot dot-bear"></span>
-              強勢空頭排名
-            </div>
-            <span class="tbl-badge badge-bear" id="bear-count">0</span>
-          </div>
-          <div class="tbl-scroll">
-            <table class="data-tbl" id="bear-tbl">
-              <thead><tr>
-                <th>股票</th>
-                <th>股價</th>
-                <th>趨勢</th>
-                <th>評分</th>
-                <th>RSI</th>
-                <th>成交量</th>
-              </tr></thead>
-              <tbody id="bear-tbody"><tr><td colspan="6" class="loading-cell"><div class="spinner"></div></td></tr></tbody>
-            </table>
-          </div>
-        </div>
+      <!-- 台股資金流入流出事件（六個月內） -->
+      <div class="market-outlook-card">
+        <div id="capital-flow-body"><div class="adv-loading">載入資金流動事件...</div></div>
       </div>
 
       <!-- 反轉機會 -->
@@ -295,6 +261,55 @@
             </tr></thead>
             <tbody id="ranking-tbody"></tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- 強勢多頭 / 強勢空頭 表格 -->
+      <div class="tables-row" style="margin-top:16px">
+        <div class="tbl-card tbl-bull">
+          <div class="tbl-head">
+            <div class="tbl-title">
+              <span class="dot dot-bull"></span>
+              強勢多頭排名
+            </div>
+            <span class="tbl-badge badge-bull" id="bull-count">0</span>
+          </div>
+          <div class="tbl-scroll">
+            <table class="data-tbl" id="bull-tbl">
+              <thead><tr>
+                <th>股票</th>
+                <th>股價</th>
+                <th>趨勢</th>
+                <th>評分</th>
+                <th>RSI</th>
+                <th>成交量</th>
+              </tr></thead>
+              <tbody id="bull-tbody"><tr><td colspan="6" class="loading-cell"><div class="spinner"></div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tbl-card tbl-bear">
+          <div class="tbl-head">
+            <div class="tbl-title">
+              <span class="dot dot-bear"></span>
+              強勢空頭排名
+            </div>
+            <span class="tbl-badge badge-bear" id="bear-count">0</span>
+          </div>
+          <div class="tbl-scroll">
+            <table class="data-tbl" id="bear-tbl">
+              <thead><tr>
+                <th>股票</th>
+                <th>股價</th>
+                <th>趨勢</th>
+                <th>評分</th>
+                <th>RSI</th>
+                <th>成交量</th>
+              </tr></thead>
+              <tbody id="bear-tbody"><tr><td colspan="6" class="loading-cell"><div class="spinner"></div></td></tr></tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -513,44 +528,117 @@
         </div>
       </div>
 
-      <!-- 新增交易表單 -->
+      <!-- 匯入/匯出 -->
       <div class="settings-card" style="margin-bottom:16px">
-        <h3 class="settings-group-ttl">新增交易紀錄</h3>
-        <div class="trade-form">
-          <div class="tg-field"><label class="tg-label">股票代號</label><input id="tf-id" class="setting-input" placeholder="2330" /></div>
-          <div class="tg-field"><label class="tg-label">方向</label>
-            <select id="tf-dir" class="setting-select" style="width:100%">
-              <option value="long">做多</option>
-              <option value="short">做空</option>
-            </select>
-          </div>
-          <div class="tg-field"><label class="tg-label">進場價</label><input id="tf-entry" type="number" step="0.01" class="setting-input" placeholder="900" /></div>
-          <div class="tg-field"><label class="tg-label">出場價</label><input id="tf-exit" type="number" step="0.01" class="setting-input" placeholder="930" /></div>
-          <div class="tg-field"><label class="tg-label">股數</label><input id="tf-qty" type="number" class="setting-input" placeholder="1000" value="1000" /></div>
-          <div class="tg-field"><label class="tg-label">日期</label><input id="tf-date" type="date" class="setting-input" /></div>
-          <div class="tg-field" style="grid-column:1/-1"><label class="tg-label">備註（選填，如：止損出場、達標停利）</label><input id="tf-note" class="setting-input" placeholder="止損出場" /></div>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:14px">
-          <button class="btn-primary" onclick="addTrade()">＋ 新增紀錄</button>
+        <h3 class="settings-group-ttl">止損紀錄管理（匯入 / 匯出）</h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn-primary" onclick="exportTrades()">⬇ 匯出 JSON</button>
+          <button class="btn-ghost" onclick="document.getElementById('import-file').click()">⬆ 匯入 JSON</button>
+          <input type="file" id="import-file" accept=".json" style="display:none" onchange="importTrades(event)" />
           <button class="btn-ghost" onclick="clearTrades()" style="color:var(--bear)">清空全部</button>
         </div>
+        <p style="font-size:0.75rem;color:var(--text3);margin-top:10px">交易由 AI 訊號自動產生與結算（見「持有中」頁面），此處可備份或還原全部紀錄。</p>
       </div>
 
       <!-- 交易紀錄表 -->
       <div class="tbl-card full-tbl">
         <div class="tbl-head">
-          <div class="tbl-title"><span class="dot" style="background:var(--blue)"></span> 歷史交易</div>
+          <div class="tbl-title"><span class="dot" style="background:var(--blue)"></span> 歷史交易（AI 自動結算）</div>
           <span class="tbl-badge" style="background:rgba(0,212,255,0.1);color:var(--blue)" id="trades-count">0</span>
         </div>
         <div class="tbl-scroll">
           <table class="data-tbl">
             <thead><tr>
-              <th>日期</th><th>股票</th><th>方向</th><th>進場</th><th>出場</th><th>股數</th><th>損益</th><th>報酬率</th><th>備註</th><th></th>
+              <th>日期</th><th>股票</th><th>方向</th><th>進場</th><th>出場</th><th>股數</th><th>損益</th><th>報酬率</th><th>出場原因</th><th>風控扣分</th><th></th>
             </tr></thead>
             <tbody id="trades-tbody"></tbody>
           </table>
         </div>
       </div>
+    </section>
+
+    <!-- ═══════════════════ 持有中頁面 ═══════════════════ -->
+    <section class="page" id="page-positions">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">持有中</h1>
+          <p class="page-subtitle">AI 訊號自動建立待進場單，回踩成交後轉入持倉，自動止損停利</p>
+        </div>
+      </div>
+
+      <div class="overview-grid">
+        <div class="ov-card" id="pos-pnl-card">
+          <div class="ov-body" style="padding-left:4px">
+            <div class="ov-value" id="pos-unrealized">--</div>
+            <div class="ov-label">未實現盈虧 (元)</div>
+          </div>
+        </div>
+        <div class="ov-card ov-bull">
+          <div class="ov-body" style="padding-left:4px">
+            <div class="ov-value" id="pos-open-count">0</div>
+            <div class="ov-label">持倉筆數</div>
+          </div>
+        </div>
+        <div class="ov-card ov-neutral">
+          <div class="ov-body" style="padding-left:4px">
+            <div class="ov-value" id="pos-pending-count">0</div>
+            <div class="ov-label">待進場</div>
+          </div>
+        </div>
+        <div class="ov-card ov-total">
+          <div class="ov-body" style="padding-left:4px">
+            <div class="ov-value" id="pos-risk-score">100</div>
+            <div class="ov-label">風控分數</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 待進場 -->
+      <div class="tbl-card full-tbl" style="margin-bottom:16px">
+        <div class="tbl-head">
+          <div class="tbl-title"><span class="dot" style="background:var(--yellow)"></span> 待進場（等待回踩成交）</div>
+          <span class="tbl-badge" style="background:rgba(245,158,11,0.12);color:var(--yellow)" id="pending-badge">0</span>
+        </div>
+        <div class="tbl-scroll">
+          <table class="data-tbl">
+            <thead><tr>
+              <th>股票</th><th>訊號評分</th><th>建議日</th><th>回踩進場價</th><th>止損</th><th>目標一</th><th>目標二</th><th>現價</th><th>距進場</th><th></th>
+            </tr></thead>
+            <tbody id="pending-tbody"><tr><td colspan="10" style="text-align:center;color:var(--text3);padding:20px">掃描後 AI 將自動建立建議</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 持倉中 -->
+      <div class="tbl-card full-tbl">
+        <div class="tbl-head">
+          <div class="tbl-title"><span class="dot dot-bull"></span> 持倉中</div>
+          <span class="tbl-badge badge-bull" id="open-badge">0</span>
+        </div>
+        <div class="tbl-scroll">
+          <table class="data-tbl">
+            <thead><tr>
+              <th>股票</th><th>進場日</th><th>進場價</th><th>現價</th><th>未實現盈虧</th><th>報酬率</th><th>止損</th><th>目標一</th><th></th>
+            </tr></thead>
+            <tbody id="open-tbody"><tr><td colspan="9" style="text-align:center;color:var(--text3);padding:20px">尚無持倉</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 策略報表頁面 ═══════════════════ -->
+    <section class="page" id="page-report">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">策略報表</h1>
+          <p class="page-subtitle">AI 交易系統的月度與年度績效統計</p>
+        </div>
+        <div class="tf-group">
+          <button class="tf-btn active" data-period="month" onclick="switchReportPeriod('month',this)">月度</button>
+          <button class="tf-btn" data-period="year" onclick="switchReportPeriod('year',this)">年度</button>
+        </div>
+      </div>
+      <div id="report-content"><div class="adv-loading">尚無已結算交易，等待 AI 訊號成交後產生報表</div></div>
     </section>
 
     <!-- ═══════════════════ 設定頁面 ═══════════════════ -->
