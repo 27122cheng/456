@@ -79,11 +79,10 @@ async function startScan() {
   showScanBar(true);
   updateLoadingText('掃描台股技術指標...');
 
-  // Fetch market index first
+  // Fetch market index + outlook + institutional overview in parallel
   fetchTWII().then(renderMarketIndex).catch(() => {});
-
-  // Fetch institutional overview (top 10)
-  fetchInstitutional('2330').then(() => {}).catch(() => {});
+  loadMarketOutlook();
+  loadInstitutionalOverview();
 
   for (let i = 0; i < allStocks.length; i++) {
     const s = allStocks[i];
@@ -113,6 +112,9 @@ async function startScan() {
   setTimeout(() => showScanBar(false), 1500);
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString('zh-TW');
   scanning = false;
+
+  // Re-render outlook now that breadth (bull/bear counts) is known
+  renderMarketOutlook();
 
   // Auto Telegram notification for strong signals
   autoNotifyTelegram();
@@ -202,6 +204,214 @@ function reversalCard(s) {
     <div class="rev-card-price">${a.price?.toFixed(2) ?? '--'}</div>
     <div class="rev-card-rsi">${r.desc}</div>
   </div>`;
+}
+
+// ── Market Outlook (多空總覽) ──────────────────────────────────────────────
+
+let outlookData = { factors: [], instTotal: null };
+
+const OUTLOOK_SYMBOLS = [
+  { sym: '^TWII', name: '加權指數',     weight: 2, type: 'index' },
+  { sym: '^SOX',  name: '費城半導體',   weight: 2, type: 'index' },
+  { sym: '^GSPC', name: 'S&P 500',     weight: 1, type: 'index' },
+  { sym: '^IXIC', name: '那斯達克',     weight: 1, type: 'index' },
+  { sym: '^DJI',  name: '道瓊工業',     weight: 1, type: 'index' },
+  { sym: '^VIX',  name: 'VIX 恐慌指數', weight: 1, type: 'vix' },
+  { sym: 'TWD=X', name: '美元兌台幣',   weight: 1, type: 'fx' },
+];
+
+async function loadMarketOutlook() {
+  const factors = [];
+  for (const cfg of OUTLOOK_SYMBOLS) {
+    const q = await fetchIndexQuote(cfg.sym).catch(() => null);
+    if (q) factors.push({ ...cfg, ...q });
+    await delay(150);
+  }
+  outlookData.factors = factors;
+  renderMarketOutlook();
+}
+
+// Score one factor: returns { pts, dir } where dir is 'up'|'dn'|'flat' for display
+function scoreFactor(f) {
+  if (f.type === 'vix') {
+    // VIX: level matters more than change. >25 fear, <16 calm.
+    if (f.price >= 28) return { pts: -2 * f.weight, dir: 'dn' };
+    if (f.price >= 22) return { pts: -1 * f.weight, dir: 'dn' };
+    if (f.price <= 15) return { pts: 1 * f.weight, dir: 'up' };
+    return { pts: 0, dir: 'flat' };
+  }
+  if (f.type === 'fx') {
+    // USD/TWD rising = TWD depreciation = foreign outflow pressure = bearish for TW stocks
+    if (f.chg5 > 0.8) return { pts: -1 * f.weight, dir: 'dn' };
+    if (f.chg5 < -0.8) return { pts: 1 * f.weight, dir: 'up' };
+    return { pts: 0, dir: 'flat' };
+  }
+  // Regular index: combine 1d + 5d momentum
+  let pts = 0;
+  if (f.chg1 > 0.5) pts += 1; else if (f.chg1 < -0.5) pts -= 1;
+  if (f.chg5 > 1.5) pts += 1; else if (f.chg5 < -1.5) pts -= 1;
+  pts = Math.max(-1, Math.min(1, pts)) * f.weight;
+  return { pts, dir: pts > 0 ? 'up' : pts < 0 ? 'dn' : 'flat' };
+}
+
+function renderMarketOutlook() {
+  const el = document.getElementById('market-outlook-body');
+  if (!el) return;
+  const { factors, instTotal } = outlookData;
+  if (!factors.length) {
+    el.innerHTML = '<div class="adv-loading">載入市場多空分析...</div>';
+    return;
+  }
+
+  let totalPts = 0, maxPts = 0;
+  const rows = factors.map(f => {
+    const { pts, dir } = scoreFactor(f);
+    totalPts += pts;
+    maxPts += Math.abs(f.weight) * (f.type === 'vix' ? 2 : 1);
+    return { f, pts, dir };
+  });
+
+  // 三大法人 factor
+  if (instTotal !== null) {
+    let pts = 0;
+    if (instTotal.foreign > 5000) pts = 2;
+    else if (instTotal.foreign > 0) pts = 1;
+    else if (instTotal.foreign < -5000) pts = -2;
+    else if (instTotal.foreign < 0) pts = -1;
+    totalPts += pts; maxPts += 2;
+    rows.push({
+      f: { name: '外資買賣超(全市場)', price: null, chg1: null,
+           display: fmtK(instTotal.foreign) },
+      pts, dir: pts > 0 ? 'up' : pts < 0 ? 'dn' : 'flat',
+    });
+  }
+
+  // 市場寬度 factor (from scanned stocks)
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length >= 10) {
+    const bullN = ready.filter(s => s.analysis.score >= getThreshold('bull')).length;
+    const bearN = ready.filter(s => s.analysis.score <= getThreshold('bear')).length;
+    const pct = bullN / ready.length;
+    let pts = 0;
+    if (pct > 0.5) pts = 2; else if (pct > 0.35) pts = 1;
+    else if (bearN / ready.length > 0.5) pts = -2;
+    else if (bearN / ready.length > 0.35) pts = -1;
+    totalPts += pts; maxPts += 2;
+    rows.push({
+      f: { name: '市場寬度(掃描池)', price: null, chg1: null,
+           display: `多${bullN} / 空${bearN} / 共${ready.length}` },
+      pts, dir: pts > 0 ? 'up' : pts < 0 ? 'dn' : 'flat',
+    });
+  }
+
+  // Composite verdict: normalize to -100..+100
+  const norm = maxPts ? Math.round((totalPts / maxPts) * 100) : 0;
+  let vClass, vIcon, vTitle, vAction;
+  if (norm >= 35)       { vClass = 'v-bull';    vIcon = '🐂'; vTitle = '偏多 BULLISH';   vAction = '順勢偏多操作，回檔找買點'; }
+  else if (norm >= 15)  { vClass = 'v-bull';    vIcon = '📈'; vTitle = '中性偏多';        vAction = '可小幅偏多，嚴設停損'; }
+  else if (norm <= -35) { vClass = 'v-bear';    vIcon = '🐻'; vTitle = '偏空 BEARISH';   vAction = '降低持股、避免追高，反彈減碼'; }
+  else if (norm <= -15) { vClass = 'v-bear';    vIcon = '📉'; vTitle = '中性偏空';        vAction = '保守操作，現金為王'; }
+  else                  { vClass = 'v-neutral'; vIcon = '⚖️'; vTitle = '中性盤整';        vAction = '區間操作，等待方向表態'; }
+
+  // Prediction text from the strongest factors
+  const sorted = [...rows].sort((a, b) => Math.abs(b.pts) - Math.abs(a.pts));
+  const drivers = sorted.filter(r => r.pts !== 0).slice(0, 4)
+    .map(r => `${r.f.name}${r.pts > 0 ? '偏多' : '偏空'}`).join('、');
+  const twii = factors.find(f => f.sym === '^TWII');
+  const sox  = factors.find(f => f.sym === '^SOX');
+  let predict = `綜合 ${rows.length} 項因子，市場評分 <strong>${norm > 0 ? '+' : ''}${norm}</strong>（區間 -100 ~ +100）。`;
+  if (drivers) predict += `主要驅動：${drivers}。`;
+  if (twii) predict += ` 加權指數 5 日${twii.chg5 >= 0 ? '上漲' : '下跌'} ${Math.abs(twii.chg5).toFixed(1)}%`;
+  if (sox)  predict += `，費半 5 日${sox.chg5 >= 0 ? '+' : ''}${sox.chg5.toFixed(1)}%（台股電子權值高度連動）`;
+  predict += `。<strong>後市看法：${vAction}。</strong>`;
+
+  const arrow = d => d === 'up' ? '<span style="color:var(--bull)">▲</span>' : d === 'dn' ? '<span style="color:var(--bear)">▼</span>' : '<span style="color:var(--text3)">─</span>';
+
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);display:flex;align-items:center;gap:8px">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        市場多空總覽
+      </h3>
+      <span style="font-size:0.72rem;color:var(--text3)">台股・美股・匯率・法人・寬度 綜合判斷</span>
+    </div>
+
+    <div class="verdict-box ${vClass}">
+      <div class="verdict-icon">${vIcon}</div>
+      <div>
+        <div class="verdict-title">${vTitle}</div>
+        <div class="verdict-sub">${vAction}</div>
+      </div>
+      <div class="verdict-score-wrap">
+        <div class="verdict-score" style="color:${norm >= 15 ? 'var(--bull)' : norm <= -15 ? 'var(--bear)' : 'var(--yellow)'}">${norm > 0 ? '+' : ''}${norm}</div>
+        <div class="verdict-score-lbl">綜合評分 (-100~+100)</div>
+      </div>
+    </div>
+
+    <div class="factor-grid">
+      ${rows.map(({ f, dir }) => `
+        <div class="factor-row">
+          <span class="factor-arrow">${arrow(dir)}</span>
+          <span class="factor-name">${f.name}</span>
+          <span class="factor-val">${f.display ?? (f.price != null ? f.price.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '--')}</span>
+          ${f.chg1 != null ? `<span class="factor-chg ${f.chg1 >= 0 ? 'change-up' : 'change-dn'}">${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(2)}%</span>` : ''}
+        </div>`).join('')}
+    </div>
+
+    <div class="outlook-text">${predict}<br>
+      <span style="font-size:0.75rem;color:var(--text3)">⚠ 以上為技術面與資金面的規則化分析，僅供參考，非投資建議。</span>
+    </div>`;
+}
+
+// ── Institutional Overview (全市場三大法人) ────────────────────────────────
+
+async function loadInstitutionalOverview() {
+  const el = document.getElementById('institutional-body');
+  const rows = await fetchT86All();
+  if (!rows || !rows.length) {
+    if (el) el.innerHTML = '<p style="color:var(--text3);font-size:0.85rem">三大法人資料暫時無法取得（非交易日或 TWSE API 未更新）</p>';
+    return;
+  }
+
+  // Sum market-wide totals (張)
+  let foreign = 0, investment = 0, dealer = 0, total = 0;
+  const parsed = rows.map(r => ({
+    id: r[0]?.trim(), name: r[1]?.trim(),
+    foreign: parseK(r[4]), investment: parseK(r[7]), dealer: parseK(r[10]), total: parseK(r[11]),
+  }));
+  parsed.forEach(p => { foreign += p.foreign; investment += p.investment; dealer += p.dealer; total += p.total; });
+
+  outlookData.instTotal = { foreign, investment, dealer, total };
+  renderMarketOutlook();
+
+  const topBuy  = [...parsed].sort((a, b) => b.foreign - a.foreign).slice(0, 5);
+  const topSell = [...parsed].sort((a, b) => a.foreign - b.foreign).slice(0, 5);
+
+  const fmtInst = v => {
+    const cls = v > 0 ? 'inst-bull' : v < 0 ? 'inst-bear' : 'inst-neutral';
+    return `<span class="${cls}">${v > 0 ? '+' : ''}${v.toLocaleString()} 張</span>`;
+  };
+
+  if (el) el.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2)">三大法人全市場買賣超</h3>
+      <span style="font-size:0.72rem;color:var(--text3)">單位：張</span>
+    </div>
+    <div class="inst-grid">
+      <div class="inst-card"><div class="inst-card-lbl">外資</div><div class="inst-card-val">${fmtInst(foreign)}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">投信</div><div class="inst-card-val">${fmtInst(investment)}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">自營商</div><div class="inst-card-val">${fmtInst(dealer)}</div></div>
+    </div>
+    <div class="inst-top-row">
+      <div class="inst-top-list">
+        <div class="inst-top-ttl">🟢 外資買超 Top 5</div>
+        ${topBuy.map(p => `<div class="inst-top-item" onclick="openStock('${p.id}')"><span>${p.id} ${p.name}</span>${fmtInst(p.foreign)}</div>`).join('')}
+      </div>
+      <div class="inst-top-list">
+        <div class="inst-top-ttl">🔴 外資賣超 Top 5</div>
+        ${topSell.map(p => `<div class="inst-top-item" onclick="openStock('${p.id}')"><span>${p.id} ${p.name}</span>${fmtInst(p.foreign)}</div>`).join('')}
+      </div>
+    </div>`;
 }
 
 // ── Market Index ───────────────────────────────────────────────────────────

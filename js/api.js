@@ -58,7 +58,31 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
 
 // Fetch TWII (加權指數) for market overview
 async function fetchTWII() {
-  return fetchYahooOHLCV('%5ETWII', '1d', '5d');
+  return fetchYahooOHLCV('^TWII', '1d', '5d');
+}
+
+// Fetch a single index quote: latest price + 1d / 5d change %
+async function fetchIndexQuote(sym) {
+  const data = await fetchYahooOHLCV(sym, '1d', '1mo');
+  if (data.length < 2) return null;
+  const last = data[data.length - 1];
+  const prev = data[data.length - 2];
+  const w    = data.length >= 6 ? data[data.length - 6] : data[0];
+  return {
+    price: last.close,
+    chg1: (last.close - prev.close) / prev.close * 100,
+    chg5: (last.close - w.close) / w.close * 100,
+  };
+}
+
+// Fetch full T86 table (every listed stock's institutional net buy/sell)
+async function fetchT86All() {
+  try {
+    const dateStr = getLastTradingDateStr();
+    const url = `https://www.twse.com.tw/rwd/zh/fund/T86?date=${dateStr}&selectType=ALL&response=json`;
+    const data = await proxyFetch(url, 12000);
+    return data?.data || null;
+  } catch { return null; }
 }
 
 // ── TWSE Institutional T86 ────────────────────────────────────────────────

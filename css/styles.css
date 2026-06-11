@@ -615,6 +615,49 @@ input, select { font-family: var(--font); }
 .toast.info { border-color: rgba(0,212,255,0.4); }
 .toast.hide { animation: slideOutRight 0.3s ease forwards; }
 
+/* ── Market Outlook (多空總覽) ─────────────────── */
+.verdict-box {
+  display: flex; align-items: center; gap: 16px;
+  border-radius: var(--radius); padding: 18px 22px; margin-bottom: 16px;
+}
+.verdict-box.v-bull { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.35); }
+.verdict-box.v-bear { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.35); }
+.verdict-box.v-neutral { background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.3); }
+.verdict-icon { font-size: 2rem; line-height: 1; }
+.verdict-title { font-size: 1.15rem; font-weight: 800; margin-bottom: 3px; }
+.v-bull .verdict-title { color: var(--bull); }
+.v-bear .verdict-title { color: var(--bear); }
+.v-neutral .verdict-title { color: var(--yellow); }
+.verdict-sub { font-size: 0.8rem; color: var(--text3); }
+.verdict-score-wrap { margin-left: auto; text-align: right; }
+.verdict-score { font-family: var(--mono); font-size: 1.6rem; font-weight: 800; }
+.verdict-score-lbl { font-size: 0.7rem; color: var(--text3); }
+
+.factor-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 8px; margin-bottom: 14px; }
+.factor-row {
+  display: flex; align-items: center; gap: 10px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px;
+}
+.factor-arrow { font-size: 0.95rem; width: 18px; text-align: center; flex-shrink: 0; }
+.factor-name { font-size: 0.8rem; color: var(--text2); }
+.factor-val { font-family: var(--mono); font-size: 0.8rem; margin-left: auto; color: var(--text1); white-space: nowrap; }
+.factor-chg { font-family: var(--mono); font-size: 0.75rem; white-space: nowrap; }
+
+.outlook-text {
+  font-size: 0.85rem; color: var(--text2); line-height: 1.7;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 14px 16px;
+}
+.outlook-text strong { color: var(--text1); }
+
+.inst-top-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.inst-top-list { font-size: 0.78rem; }
+.inst-top-ttl { color: var(--text3); font-size: 0.75rem; margin-bottom: 6px; }
+.inst-top-item { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer; }
+.inst-top-item:hover { color: var(--blue); }
+@media (max-width: 768px) { .inst-top-row { grid-template-columns: 1fr; } }
+
 /* Market Index Card */
 .index-row { display: flex; gap: 16px; flex-wrap: wrap; }
 .index-card {
