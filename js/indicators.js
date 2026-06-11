@@ -194,7 +194,9 @@ function generateSetup(ohlcv, analysis) {
   const highs = ohlcv.map(d => d.high);
   const price = analysis.price;
 
-  const stopLoss = Math.min(...lows.slice(-5)) * 0.99;
+  // Stop multiplier auto-tuned by the trade-log learning system (default 0.99 = 1% below 5d low)
+  const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  const stopLoss = Math.min(...lows.slice(-5)) * stopAdj;
   const risk = price - stopLoss;
   if (risk <= 0) return null;
 

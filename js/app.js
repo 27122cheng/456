@@ -64,6 +64,9 @@ async function initApp() {
   initEventListeners();
   // Hide loader immediately — scan runs in background with its own progress bar
   hideLoader();
+  renderEvents();
+  const tfDate = document.getElementById('tf-date');
+  if (tfDate) tfDate.value = new Date().toISOString().slice(0, 10);
   startRefreshCycle();
   startScan();
 }
@@ -361,6 +364,309 @@ function renderMarketOutlook() {
 
     <div class="outlook-text">${predict}<br>
       <span style="font-size:0.75rem;color:var(--text3)">⚠ 以上為技術面與資金面的規則化分析，僅供參考，非投資建議。</span>
+    </div>`;
+
+  // Refresh dependent widgets
+  renderSentiment();
+  renderEvents();
+}
+
+// ── 台股恐慌貪婪指數 ───────────────────────────────────────────────────────
+// 自行計算（台股無官方恐貪 API）：VIX、大盤動能、市場寬度、外資資金流 加權合成
+
+function computeFearGreed() {
+  const { factors, instTotal } = outlookData;
+  if (!factors.length) return null;
+
+  let score = 50;
+  const vix  = factors.find(f => f.type === 'vix');
+  const twii = factors.find(f => f.sym === '^TWII');
+  const sox  = factors.find(f => f.sym === '^SOX');
+
+  // VIX: 12→+15, 35→-25
+  if (vix) score += Math.max(-25, Math.min(15, (20 - vix.price) * 1.8));
+  // TWII momentum
+  if (twii) { score += Math.max(-12, Math.min(12, twii.chg5 * 3)); score += Math.max(-6, Math.min(6, twii.chg1 * 4)); }
+  // SOX momentum
+  if (sox) score += Math.max(-8, Math.min(8, sox.chg5 * 2));
+  // Foreign flow
+  if (instTotal) score += instTotal.foreign > 0 ? Math.min(10, instTotal.foreign / 2000) : Math.max(-10, instTotal.foreign / 2000);
+  // Breadth
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length >= 10) {
+    const bullPct = ready.filter(s => s.analysis.score >= getThreshold('bull')).length / ready.length;
+    score += (bullPct - 0.3) * 40;
+  }
+
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function fgLabel(v) {
+  if (v >= 75) return { txt: '極度貪婪', color: 'var(--bull)' };
+  if (v >= 60) return { txt: '貪婪', color: '#86efac' };
+  if (v >= 40) return { txt: '中性', color: 'var(--neutral)' };
+  if (v >= 25) return { txt: '恐慌', color: '#fca5a5' };
+  return { txt: '極度恐慌', color: 'var(--bear)' };
+}
+
+function renderSentiment() {
+  const el = document.getElementById('sentiment-body');
+  if (!el) return;
+  const fg = computeFearGreed();
+  if (fg === null) { el.innerHTML = '<div class="adv-loading">計算台股恐貪指數...</div>'; return; }
+  const lbl = fgLabel(fg);
+
+  // 今日 / 本週 AI 偏向
+  const twii = outlookData.factors.find(f => f.sym === '^TWII');
+  const biasOf = chg => chg > 0.4 ? { txt: '偏多 📈', c: 'var(--bull)' } : chg < -0.4 ? { txt: '偏空 📉', c: 'var(--bear)' } : { txt: '中性 ⚖️', c: 'var(--yellow)' };
+  const today = twii ? biasOf(twii.chg1) : { txt: '--', c: 'var(--text3)' };
+  const week  = twii ? biasOf(twii.chg5) : { txt: '--', c: 'var(--text3)' };
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">台股恐慌貪婪指數</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">VIX・大盤動能・市場寬度・外資資金流 合成</span>
+    <div class="fg-gauge-wrap">
+      <div>
+        <div class="fg-value" style="color:${lbl.color}">${fg}</div>
+        <div class="fg-label" style="color:${lbl.color}">${lbl.txt}</div>
+      </div>
+      <div style="flex:1">
+        <div class="fg-bar-track"><div class="fg-bar-marker" style="left:${fg}%"></div></div>
+        <div class="fg-scale"><span>0 極恐</span><span>25</span><span>50</span><span>75</span><span>100 極貪</span></div>
+      </div>
+    </div>
+    <div class="bias-chips">
+      <div class="bias-chip">
+        <div class="bias-chip-lbl">今日 AI 走勢偏向</div>
+        <div class="bias-chip-val" style="color:${today.c}">${today.txt}</div>
+      </div>
+      <div class="bias-chip">
+        <div class="bias-chip-lbl">本週 AI 走勢偏向</div>
+        <div class="bias-chip-val" style="color:${week.c}">${week.txt}</div>
+      </div>
+    </div>`;
+}
+
+// ── 重要財經事件倒計時 ─────────────────────────────────────────────────────
+
+function getUpcomingEvents() {
+  const now = new Date();
+  const events = [];
+
+  // 每月10日：台灣上市公司營收公布截止
+  const rev = new Date(now.getFullYear(), now.getMonth(), 10);
+  if (rev < now) rev.setMonth(rev.getMonth() + 1);
+  events.push({ name: '台灣上市櫃月營收公布截止', date: rev, impact: '個股波動' });
+
+  // 美國 CPI（約每月 13 日公布）
+  const cpi = new Date(now.getFullYear(), now.getMonth(), 13);
+  if (cpi < now) cpi.setMonth(cpi.getMonth() + 1);
+  events.push({ name: '美國 CPI 通膨數據', date: cpi, impact: '全球風向' });
+
+  // FOMC 2026 會議（已知排程）
+  const fomcDates = ['2026-01-28','2026-03-18','2026-04-29','2026-06-17','2026-07-29','2026-09-16','2026-10-28','2026-12-09'];
+  const nextFomc = fomcDates.map(d => new Date(d + 'T14:00:00')).find(d => d > now);
+  if (nextFomc) events.push({ name: 'FOMC 利率決議', date: nextFomc, impact: '重大' });
+
+  // 台灣央行理監事會（季度，2026 約 3/6/9/12 月中下旬）
+  const cbcDates = ['2026-03-19','2026-06-18','2026-09-24','2026-12-17'];
+  const nextCbc = cbcDates.map(d => new Date(d)).find(d => d > now);
+  if (nextCbc) events.push({ name: '台灣央行理監事會議', date: nextCbc, impact: '台股利率' });
+
+  // 美國非農（每月第一個週五）
+  const nfp = new Date(now.getFullYear(), now.getMonth(), 1);
+  while (nfp.getDay() !== 5) nfp.setDate(nfp.getDate() + 1);
+  if (nfp < now) {
+    nfp.setMonth(nfp.getMonth() + 1); nfp.setDate(1);
+    while (nfp.getDay() !== 5) nfp.setDate(nfp.getDate() + 1);
+  }
+  events.push({ name: '美國非農就業數據', date: nfp, impact: '全球風向' });
+
+  return events.sort((a, b) => a.date - b.date).slice(0, 5);
+}
+
+function renderEvents() {
+  const el = document.getElementById('events-body');
+  if (!el) return;
+  const events = getUpcomingEvents();
+  const now = new Date();
+
+  // AI 預測：以當前綜合多空評分作為事件前偏向
+  const twii = outlookData.factors?.find(f => f.sym === '^TWII');
+  const bias = twii && twii.chg5 > 0.5 ? { txt: '預測偏多', bg: 'rgba(34,197,94,0.12)', c: 'var(--bull)' }
+             : twii && twii.chg5 < -0.5 ? { txt: '預測偏空', bg: 'rgba(239,68,68,0.12)', c: 'var(--bear)' }
+             : { txt: '預測中性', bg: 'rgba(245,158,11,0.1)', c: 'var(--yellow)' };
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">重要財經事件倒計時</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">AI 依當前市場動能給出事件前偏向預測</span>
+    <div style="margin-top:10px">
+      ${events.map(e => {
+        const days = Math.ceil((e.date - now) / 86400000);
+        const dateStr = `${e.date.getMonth()+1}/${e.date.getDate()}`;
+        return `<div class="event-row">
+          <div class="event-countdown">${days <= 0 ? '今日' : days + '天'}</div>
+          <div>
+            <div class="event-name">${e.name}</div>
+            <div class="event-date">${dateStr} · 影響：${e.impact}</div>
+          </div>
+          <span class="event-predict" style="background:${bias.bg};color:${bias.c}">${bias.txt}</span>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+// ── 交易日誌 + 止損學習系統 ────────────────────────────────────────────────
+
+function getTrades() {
+  try { return JSON.parse(localStorage.getItem('trade-log') || '[]'); } catch { return []; }
+}
+
+function saveTrades(trades) {
+  localStorage.setItem('trade-log', JSON.stringify(trades));
+}
+
+function addTrade() {
+  const id    = document.getElementById('tf-id').value.trim();
+  const dir   = document.getElementById('tf-dir').value;
+  const entry = parseFloat(document.getElementById('tf-entry').value);
+  const exit  = parseFloat(document.getElementById('tf-exit').value);
+  const qty   = parseInt(document.getElementById('tf-qty').value) || 1000;
+  const date  = document.getElementById('tf-date').value || new Date().toISOString().slice(0, 10);
+  const note  = document.getElementById('tf-note').value.trim();
+
+  if (!id || !entry || !exit) { showToast('請填寫代號、進場價、出場價', 'error'); return; }
+
+  const pnl = dir === 'long' ? (exit - entry) * qty : (entry - exit) * qty;
+  const retPct = dir === 'long' ? (exit - entry) / entry * 100 : (entry - exit) / entry * 100;
+
+  const trades = getTrades();
+  trades.push({ id, dir, entry, exit, qty, date, note, pnl: Math.round(pnl), retPct: +retPct.toFixed(2) });
+  saveTrades(trades);
+
+  ['tf-id','tf-entry','tf-exit','tf-note'].forEach(x => document.getElementById(x).value = '');
+  renderTradelog();
+  showToast('已新增交易紀錄', 'success');
+}
+
+function deleteTrade(idx) {
+  const trades = getTrades();
+  trades.splice(idx, 1);
+  saveTrades(trades);
+  renderTradelog();
+}
+
+function clearTrades() {
+  if (!confirm('確定要清空所有交易紀錄？')) return;
+  saveTrades([]);
+  renderTradelog();
+}
+
+function renderTradelog() {
+  const trades = getTrades().sort((a, b) => a.date.localeCompare(b.date));
+
+  // Stats
+  const wins   = trades.filter(t => t.pnl > 0);
+  const losses = trades.filter(t => t.pnl < 0);
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const grossWin  = wins.reduce((s, t) => s + t.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+  const winRate = trades.length ? (wins.length / trades.length * 100).toFixed(0) : null;
+  const pf = grossLoss > 0 ? (grossWin / grossLoss).toFixed(2) : (grossWin > 0 ? '∞' : '--');
+
+  document.getElementById('ts-total').textContent = trades.length;
+  document.getElementById('ts-winrate').textContent = winRate !== null ? winRate + '%' : '--%';
+  const pnlEl = document.getElementById('ts-pnl');
+  pnlEl.textContent = trades.length ? (totalPnl > 0 ? '+' : '') + totalPnl.toLocaleString() : '--';
+  pnlEl.style.color = totalPnl > 0 ? 'var(--bull)' : totalPnl < 0 ? 'var(--bear)' : 'var(--text1)';
+  document.getElementById('ts-pf').textContent = pf;
+
+  // Trades table (newest first)
+  const tbody = document.getElementById('trades-tbody');
+  document.getElementById('trades-count').textContent = trades.length;
+  const newest = [...trades].reverse();
+  tbody.innerHTML = newest.length ? newest.map((t, i) => {
+    const realIdx = trades.length - 1 - i;
+    const pnlCls = t.pnl > 0 ? 'change-up' : t.pnl < 0 ? 'change-dn' : '';
+    return `<tr>
+      <td style="font-family:var(--mono);font-size:0.75rem">${t.date}</td>
+      <td><span class="stock-cell-id">${t.id}</span></td>
+      <td>${t.dir === 'long' ? '<span style="color:var(--bull)">多</span>' : '<span style="color:var(--bear)">空</span>'}</td>
+      <td class="price-mono">${t.entry}</td>
+      <td class="price-mono">${t.exit}</td>
+      <td class="vol-cell">${t.qty.toLocaleString()}</td>
+      <td class="${pnlCls}">${t.pnl > 0 ? '+' : ''}${t.pnl.toLocaleString()}</td>
+      <td class="${pnlCls}">${t.retPct > 0 ? '+' : ''}${t.retPct}%</td>
+      <td style="font-size:0.75rem;color:var(--text3)">${t.note || '--'}</td>
+      <td><button class="del-trade-btn" onclick="deleteTrade(${realIdx})" title="刪除">×</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:20px">尚無交易紀錄，於上方表單新增</td></tr>';
+
+  // Cumulative PnL chart
+  renderPnlChart(trades);
+  // Stop-loss learning
+  renderRiskLearning(trades);
+}
+
+function renderPnlChart(trades) {
+  const el = document.getElementById('pnl-chart');
+  if (!trades.length) { el.innerHTML = '<div class="adv-loading">尚無交易紀錄</div>'; return; }
+
+  let cum = 0;
+  const points = trades.map(t => { cum += t.pnl; return { date: t.date, cum }; });
+  const maxAbs = Math.max(...points.map(p => Math.abs(p.cum)), 1);
+
+  el.innerHTML = points.map(p => {
+    const h = Math.max(4, Math.abs(p.cum) / maxAbs * 140);
+    const cls = p.cum >= 0 ? 'up' : 'dn';
+    return `<div class="pnl-bar ${cls}" style="height:${h}px;${p.cum < 0 ? 'align-self:flex-start;margin-top:10px' : ''}"
+      data-tip="${p.date}: ${p.cum > 0 ? '+' : ''}${p.cum.toLocaleString()}"></div>`;
+  }).join('');
+}
+
+function renderRiskLearning(trades) {
+  const el = document.getElementById('risk-learn-body');
+  if (trades.length < 3) {
+    el.innerHTML = '<div class="adv-loading">需要至少 3 筆交易紀錄才能開始學習</div>';
+    return;
+  }
+
+  const losses = trades.filter(t => t.pnl < 0);
+  const wins   = trades.filter(t => t.pnl > 0);
+  const winRate = wins.length / trades.length;
+  const avgLossPct = losses.length ? losses.reduce((s, t) => s + t.retPct, 0) / losses.length : 0;
+  const avgWinPct  = wins.length ? wins.reduce((s, t) => s + t.retPct, 0) / wins.length : 0;
+  const stopOuts = losses.filter(t => /止損|停損/.test(t.note || ''));
+
+  const insights = [];
+  let stopAdj = 0.99;
+
+  if (avgLossPct < -8) {
+    stopAdj = 0.995;
+    insights.push({ icon: '⚠️', txt: `平均虧損 ${avgLossPct.toFixed(1)}% 過大 → 已自動<strong>調緊止損</strong>（5日低點 -0.5%）。大虧是績效殺手，寧可被洗出場再進。` });
+  } else if (losses.length >= 3 && avgLossPct > -3 && winRate < 0.45) {
+    stopAdj = 0.975;
+    insights.push({ icon: '🔄', txt: `多次小額止損（平均 ${avgLossPct.toFixed(1)}%）但勝率僅 ${(winRate*100).toFixed(0)}% → 止損可能設太緊被洗出場，已自動<strong>放寬止損</strong>（5日低點 -2.5%）。` });
+  } else {
+    insights.push({ icon: '✅', txt: `風控正常：平均虧損 ${avgLossPct.toFixed(1)}%，維持預設止損（5日低點 -1%）。` });
+  }
+  localStorage.setItem('stop-adj', stopAdj);
+
+  if (winRate >= 0.5 && avgWinPct < Math.abs(avgLossPct)) {
+    insights.push({ icon: '📏', txt: `勝率 ${(winRate*100).toFixed(0)}% 不錯，但平均獲利 ${avgWinPct.toFixed(1)}% 小於平均虧損 → <strong>賺要讓它跑</strong>，建議至少抱到 2R 目標一。` });
+  }
+  if (stopOuts.length >= 2) {
+    const stopStocks = [...new Set(stopOuts.map(t => t.id))];
+    insights.push({ icon: '🧠', txt: `止損出場 ${stopOuts.length} 次（${stopStocks.join('、')}）→ 檢查這些是否都在<strong>大盤偏空時逆勢做多</strong>，市場多空總覽偏空時應降低部位。` });
+  }
+  if (winRate >= 0.55 && parseFloat(avgWinPct) > Math.abs(avgLossPct) * 1.5) {
+    insights.push({ icon: '🏆', txt: `系統表現優異（勝率 ${(winRate*100).toFixed(0)}%、盈虧比 ${(avgWinPct/Math.abs(avgLossPct||1)).toFixed(1)}）→ 可考慮小幅放大部位。` });
+  }
+
+  el.innerHTML = `
+    ${insights.map(i => `<div class="learn-item"><span class="learn-icon">${i.icon}</span><span>${i.txt}</span></div>`).join('')}
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3)">
+      目前自動止損參數：5日低點 × ${stopAdj}（個股「交易建議」的止損價已套用此規則）
     </div>`;
 }
 
@@ -733,12 +1039,28 @@ function renderInstitutional(inst) {
 function renderMTF(mtf) {
   const el = document.getElementById('mtf-body');
   if (!mtf?.length) { el.innerHTML = '<div class="adv-loading">無法載入多週期數據</div>'; return; }
-  el.innerHTML = `<div class="mtf-grid">${mtf.map(m => `
-    <div class="mtf-item">
-      <div class="mtf-tf">${m.label}</div>
-      <div class="mtf-sig trend-badge trend-${signalClass(m.signal)}" style="display:inline-flex">${m.signal}</div>
-      <div class="mtf-score">${m.score !== null ? `評分 ${m.score}` : '--'}</div>
-    </div>`).join('')}</div>`;
+
+  // 訊號品質：60分 / 日線 / 週線 三時框同向才是高品質訊號
+  const dirs = mtf.map(m => m.score === null ? 0 : m.score > 55 ? 1 : m.score < 45 ? -1 : 0);
+  const bullN = dirs.filter(d => d === 1).length;
+  const bearN = dirs.filter(d => d === -1).length;
+  let quality;
+  if (bullN === 3)      quality = { txt: '🟢 高品質做多訊號 — 三時框同步偏多', c: 'var(--bull)', bg: 'rgba(34,197,94,0.08)' };
+  else if (bearN === 3) quality = { txt: '🔴 高品質做空訊號 — 三時框同步偏空', c: 'var(--bear)', bg: 'rgba(239,68,68,0.08)' };
+  else if (bullN === 2) quality = { txt: '🟡 中等品質 — 2/3 時框偏多，等待第三時框確認', c: 'var(--yellow)', bg: 'rgba(245,158,11,0.07)' };
+  else if (bearN === 2) quality = { txt: '🟡 中等品質 — 2/3 時框偏空，等待第三時框確認', c: 'var(--yellow)', bg: 'rgba(245,158,11,0.07)' };
+  else                  quality = { txt: '⚪ 低品質訊號 — 時框分歧，建議觀望不進場', c: 'var(--neutral)', bg: 'rgba(148,163,184,0.06)' };
+
+  el.innerHTML = `
+    <div class="mtf-grid">${mtf.map(m => `
+      <div class="mtf-item">
+        <div class="mtf-tf">${m.label}</div>
+        <div class="mtf-sig trend-badge trend-${signalClass(m.signal)}" style="display:inline-flex">${m.signal}</div>
+        <div class="mtf-score">${m.score !== null ? `評分 ${m.score}` : '--'}</div>
+      </div>`).join('')}</div>
+    <div style="margin-top:12px;padding:12px 14px;border-radius:8px;background:${quality.bg};border:1px solid ${quality.c}33;font-size:0.84rem;font-weight:600;color:${quality.c}">
+      ${quality.txt}
+    </div>`;
 }
 
 // ── TradingView Chart ─────────────────────────────────────────────────────
@@ -789,6 +1111,7 @@ function navigateTo(page, opts = {}) {
 
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
+  if (page === 'tradelog') renderTradelog();
 
   // Apply filter from opts
   if (opts.filter) {

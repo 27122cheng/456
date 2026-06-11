@@ -134,9 +134,9 @@ async function fetchInstitutional(stockId) {
 
 async function fetchMTFSignals(stockId) {
   const intervals = [
+    { label: '60分', tf: '60m', range: '1mo' },
     { label: '日線', tf: '1d',  range: '6mo' },
     { label: '週線', tf: '1wk', range: '2y' },
-    { label: '月線', tf: '1mo', range: '5y' },
   ];
   const results = [];
   for (const { label, tf, range } of intervals) {
