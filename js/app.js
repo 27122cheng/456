@@ -88,29 +88,33 @@ async function startScan() {
   loadMarketOutlook();
   loadInstitutionalOverview();
 
-  for (let i = 0; i < allStocks.length; i++) {
-    const s = allStocks[i];
-    setScanProgress((i / allStocks.length) * 100, `分析 ${s.name} (${s.id})...`);
-
-    try {
-      const ohlcv = await fetchStockOHLCV(s.id, currentTF, currentTF === '1d' ? '6mo' : '2y');
-      s.ohlcv = ohlcv;
-      if (ohlcv.length >= 20) {
-        s.analysis = calculateScore(ohlcv);
-        s.reversal = detectReversal(ohlcv, s.analysis);
+  // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
+  const queue = [...allStocks];
+  const total = allStocks.length;
+  let done = 0;
+  async function scanWorker() {
+    while (queue.length) {
+      const s = queue.shift();
+      try {
+        const ohlcv = await fetchStockOHLCV(s.id, currentTF, currentTF === '1d' ? '6mo' : '2y');
+        s.ohlcv = ohlcv;
+        if (ohlcv.length >= 20) {
+          s.analysis = calculateScore(ohlcv);
+          s.reversal = detectReversal(ohlcv, s.analysis);
+        }
+      } catch (e) {
+        console.warn(`Failed ${s.id}:`, e);
       }
-    } catch (e) {
-      console.warn(`Failed ${s.id}:`, e);
+      done++;
+      setScanProgress((done / total) * 100, `分析 ${s.name} (${s.id})... ${done}/${total}`);
+      // Render incrementally every 5 stocks
+      if (done % 5 === 0 || done === total) {
+        renderDashboard();
+        if (currentPage === 'ranking') renderRanking();
+      }
     }
-
-    // Render incrementally every 5 stocks
-    if ((i + 1) % 5 === 0 || i === allStocks.length - 1) {
-      renderDashboard();
-      if (currentPage === 'ranking') renderRanking();
-    }
-
-    await delay(300); // rate limit
   }
+  await Promise.all(Array.from({ length: 5 }, scanWorker));
 
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
@@ -1619,13 +1623,18 @@ async function renderAnalysisPanels(s, inst) {
   const sector = meta.sector || '其他';
   const rng = srng(idSeed(s.id));
 
-  // Try Yahoo quoteSummary for real fundamentals
+  // Try Yahoo quoteSummary for real fundamentals（memo：同一檔不重複抓）
   let fd = null;
-  try {
-    const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${s.id}.TW?modules=defaultKeyStatistics,summaryDetail`;
-    const raw = await proxyFetch(url, 8000);
-    fd = raw?.quoteSummary?.result?.[0] || null;
-  } catch {}
+  if (s._fd !== undefined) {
+    fd = s._fd;
+  } else {
+    try {
+      const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${s.id}.TW?modules=defaultKeyStatistics,summaryDetail`;
+      const raw = await proxyFetch(url, 8000);
+      fd = raw?.quoteSummary?.result?.[0] || null;
+    } catch {}
+    s._fd = fd;
+  }
 
   const pe = fd?.defaultKeyStatistics?.forwardPE?.raw ?? fd?.summaryDetail?.trailingPE?.raw ?? +(8 + rng()*22).toFixed(1);
   const pb = fd?.defaultKeyStatistics?.priceToBook?.raw ?? +(0.8 + rng()*3.5).toFixed(2);
@@ -1815,23 +1824,31 @@ async function renderAnalysisPanels(s, inst) {
     </div>`;
 
   // ── Render 產業面 ──────────────────────────────────────────────
-  const news = getSectorNews(sector);
   const sectorTrend = a.score>=60 ? {l:'上升趨勢',c:'ind-bull'} : a.score>=45 ? {l:'盤整觀望',c:'ind-neutral'} : {l:'下行壓力',c:'ind-bear'};
-
-  document.getElementById('ind-body').innerHTML = `
+  const renderIndBody = (news, isLive) => {
+    const box = document.getElementById('ind-body');
+    if (!box) return;
+    box.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
       <span style="font-size:0.82rem;color:var(--text3)">所屬產業：</span>
       <strong style="color:var(--text1)">${sector}</strong>
       <span class="ind-trend-badge ${sectorTrend.c}">${sectorTrend.l}</span>
+      ${isLive ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 即時新聞</span>' : ''}
     </div>
     <div class="fund-block-ttl">最新產業動態</div>
     <div class="news-list">${news.map(n=>`
-      <div class="news-item">
-        <div class="news-date">${n.date}</div>
+      <div class="news-item" ${n.link ? `style="cursor:pointer" onclick="window.open('${n.link}','_blank')"` : ''}>
+        <div class="news-date">${n.date}${n.source ? ' · ' + n.source : ''}</div>
         <div class="news-headline">${n.headline}</div>
         <span class="news-tag ${n.tagClass}">${n.tag}</span>
       </div>`).join('')}
     </div>`;
+  };
+  // 先用內建清單即時顯示，真實新聞抓到後無縫替換（不阻塞其他面板）
+  renderIndBody(getSectorNews(sector), false);
+  fetchNewsRSS(`${s.name} ${sector === '其他' ? '台股' : sector}`, 3).then(live => {
+    if (live?.length && currentStockId === s.id) renderIndBody(live, true);
+  });
 
   // ── Render AI 綜合分析 ─────────────────────────────────────────
   const macdBull = a.macd?.macd > a.macd?.signal;
@@ -2252,10 +2269,16 @@ function getWeeklyNews() {
   ];
 }
 
-function renderWeeklyNews() {
+async function renderWeeklyNews() {
   const el = document.getElementById('weekly-news-body');
   if (!el) return;
-  const news = getWeeklyNews();
+
+  // 先抓真實新聞（Google News RSS 台股 近7日），失敗才用內建清單
+  let news = await fetchNewsRSS('台股 股市', 7);
+  let isLive = true;
+  if (!news?.length) { news = getWeeklyNews(); isLive = false; }
+  news = news.map(n => ({ impact: n.source || n.impact || '台股', ...n }));
+
   const bullCount = news.filter(n => n.cls === 'bull').length;
   const bearCount = news.filter(n => n.cls === 'bear').length;
   const overall = bullCount > bearCount + 1 ? { t: '本週新聞面整體偏多', c: 'var(--bull)' }
@@ -2263,15 +2286,15 @@ function renderWeeklyNews() {
                 : { t: '本週新聞面多空拉鋸', c: 'var(--yellow)' };
 
   el.innerHTML = `
-    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞</h3>
-    <span style="font-size:0.7rem;color:var(--text3)">近 7 日影響台股的關鍵訊息 + AI 多空判讀</span>
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞 ${isLive ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull);vertical-align:2px">● 即時</span>' : ''}</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">近 7 日影響台股的關鍵訊息 + AI 多空判讀${isLive ? '（Google News 即時來源）' : ''}</span>
     <div style="margin-top:10px">
       ${news.map(n => `
-        <div class="event-row">
+        <div class="event-row" ${n.link ? `style="cursor:pointer" onclick="window.open('${n.link}','_blank')"` : ''}>
           <div class="event-countdown" style="min-width:44px">${n.date}</div>
           <div style="flex:1">
             <div class="event-name">${n.headline}</div>
-            <div class="event-date">影響：${n.impact}</div>
+            <div class="event-date">來源：${n.impact}</div>
           </div>
           <span class="news-tag ${n.cls}" style="flex-shrink:0">${n.dir}</span>
         </div>`).join('')}
