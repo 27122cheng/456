@@ -203,6 +203,16 @@
         <div id="market-outlook-body"><div class="adv-loading">載入市場多空分析...</div></div>
       </div>
 
+      <!-- 每日 / 每週重點關注股 -->
+      <div class="market-outlook-card">
+        <div id="focus-body"><div class="adv-loading">掃描完成後產生每日 / 每週重點關注股...</div></div>
+      </div>
+
+      <!-- 本週重點財經新聞 -->
+      <div class="market-outlook-card">
+        <div id="weekly-news-body"><div class="adv-loading">載入本週重點財經新聞...</div></div>
+      </div>
+
       <!-- 大盤指數 -->
       <div class="market-outlook-card">
         <div id="market-index-body"><div class="adv-loading">載入大盤指數...</div></div>
@@ -785,6 +795,18 @@
                 <label class="tg-label">Chat ID</label>
                 <input id="s-tg-chatid" type="text" class="setting-input" placeholder="123456789" />
               </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:rgba(255,255,255,0.02);border-radius:8px">
+              <div style="font-size:0.72rem;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">推送內容</div>
+              <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
+                <input type="checkbox" id="s-tg-sig" checked /> 交易訊號（長線單 / 當沖單，含進場・止損・目標價）
+              </label>
+              <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
+                <input type="checkbox" id="s-tg-event" checked /> 重要數據公布倒數 + AI 方向預測（CPI、FOMC、非農…）
+              </label>
+              <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
+                <input type="checkbox" id="s-tg-focus" checked /> 每日重點關注股清單（每天推送一次）
+              </label>
             </div>
             <div style="display:flex;gap:8px">
               <button class="btn-ghost" onclick="testTelegramNotif()" style="font-size:0.82rem">📨 發送測試訊息</button>

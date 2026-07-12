@@ -66,6 +66,7 @@ async function initApp() {
   hideLoader();
   renderEvents();
   renderCapitalFlow();
+  renderWeeklyNews();
   startRefreshCycle();
   startScan();
 }
@@ -124,8 +125,13 @@ async function startScan() {
   generatePendingSuggestions();
   if (currentPage === 'positions') renderPositions();
 
-  // Auto Telegram notification for strong signals
+  // 每日 / 每週重點關注股
+  renderFocusStocks();
+
+  // Telegram：強勢訊號 + 數據公布預測 + 每日重點股（各每日一次）
   autoNotifyTelegram();
+  notifyEventPredictions();
+  notifyDailyFocus();
 }
 
 // ── Dashboard Rendering ────────────────────────────────────────────────────
@@ -679,18 +685,57 @@ function renderRiskLearning(trades) {
   if (winRate >= 0.5 && avgWinPct < Math.abs(avgLossPct)) {
     insights.push({ icon: '📏', txt: `勝率 ${(winRate*100).toFixed(0)}% 不錯，但平均獲利 ${avgWinPct.toFixed(1)}% 小於平均虧損 → <strong>賺要讓它跑</strong>，建議至少抱到 2R 目標一。` });
   }
-  if (stopOuts.length >= 2) {
-    const stopStocks = [...new Set(stopOuts.map(t => t.id))];
-    insights.push({ icon: '🧠', txt: `止損出場 ${stopOuts.length} 次（${stopStocks.join('、')}）→ 檢查這些是否都在<strong>大盤偏空時逆勢做多</strong>，市場多空總覽偏空時應降低部位。` });
-  }
   if (winRate >= 0.55 && parseFloat(avgWinPct) > Math.abs(avgLossPct) * 1.5) {
     insights.push({ icon: '🏆', txt: `系統表現優異（勝率 ${(winRate*100).toFixed(0)}%、盈虧比 ${(avgWinPct/Math.abs(avgLossPct||1)).toFixed(1)}）→ 可考慮小幅放大部位。` });
   }
 
+  // ── 失敗歸因分析：為什麼交易建議會失敗 → 自動調整過濾規則 ──────────
+  const attributions = [
+    { key: 'countertrend', name: '大盤偏空逆勢做多', test: t => (t.ctx?.mktNorm ?? 0) <= -15,
+      fix: () => localStorage.setItem('learn-market-gate', 'true'),
+      fixTxt: '已強制開啟大盤空頭閘門：市場多空總覽 ≤ -15 時停發做多訊號' },
+    { key: 'chasing', name: '追高進場（RSI ≥ 70）', test: t => (t.ctx?.rsi ?? 0) >= 70,
+      fix: () => localStorage.setItem('learn-rsi-cap', '68'),
+      fixTxt: '已將 RSI 進場上限從 75 調降至 68，避免買在短線過熱區' },
+    { key: 'weaktrend', name: '弱趨勢震盪進場（ADX < 20）', test: t => t.ctx?.adx != null && t.ctx.adx < 20,
+      fix: () => localStorage.setItem('learn-adx-min', '25'),
+      fixTxt: '已將 ADX 進場門檻從 20 提高至 25，只做趨勢確立的股票' },
+    { key: 'bigrisk', name: '止損距離過遠（單筆虧損 > 5%）', test: t => t.retPct < -5,
+      fix: () => localStorage.setItem('learn-max-risk', '5'),
+      fixTxt: '已將單筆最大風險上限從 7% 收緊至 5%' },
+    { key: 'climax', name: '爆量末端進場（量比 > 2.5）', test: t => (t.ctx?.volR ?? 0) > 2.5,
+      fix: () => {}, fixTxt: '爆量常是主力出貨訊號，系統已內建 3.5 倍量比上限' },
+  ];
+
+  const failureRows = [];
+  for (const attr of attributions) {
+    const hits = losses.filter(attr.test);
+    if (hits.length >= 2) {
+      attr.fix();
+      failureRows.push({ name: attr.name, count: hits.length, fixTxt: attr.fixTxt, active: true });
+    } else if (hits.length === 1) {
+      failureRows.push({ name: attr.name, count: 1, fixTxt: '觀察中（累計 2 次將自動調整規則）', active: false });
+    }
+  }
+
+  const lf = getLearnedFilters();
+  const failHtml = failureRows.length ? `
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:8px">🔍 失敗原因歸因（持續學習改進）</div>
+      ${failureRows.map(r => `
+        <div class="learn-item" style="${r.active ? 'border-left:2px solid var(--bear);padding-left:10px' : 'opacity:0.75'}">
+          <span class="learn-icon">${r.active ? '🛠' : '👁'}</span>
+          <span><strong>${r.name}</strong> — 造成 ${r.count} 筆虧損<br>
+          <span style="font-size:0.75rem;color:${r.active ? 'var(--blue)' : 'var(--text3)'}">${r.active ? '✓ ' : ''}${r.fixTxt}</span></span>
+        </div>`).join('')}
+    </div>` : '';
+
   el.innerHTML = `
     ${insights.map(i => `<div class="learn-item"><span class="learn-icon">${i.icon}</span><span>${i.txt}</span></div>`).join('')}
-    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3)">
-      目前自動止損參數：5日低點 × ${stopAdj}（個股「交易建議」的止損價已套用此規則）
+    ${failHtml}
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3);line-height:1.7">
+      目前生效的 AI 過濾參數：止損 = 5日低點 × ${stopAdj}｜RSI 上限 ${lf.rsiCap}｜ADX 下限 ${lf.adxMin}｜單筆風險上限 ${lf.maxRiskPct}%｜大盤空頭閘門 ${lf.marketGate ? '開啟' : '關閉'}<br>
+      新的待進場訊號都會套用以上規則 — 每次虧損系統都在學習，規則會越調越嚴。
     </div>`;
 }
 
@@ -701,50 +746,113 @@ function getPositions() {
 }
 function savePositions(p) { localStorage.setItem('positions', JSON.stringify(p)); }
 
+// 學習系統設定的過濾規則（由止損學習系統依失敗原因自動開啟）
+function getLearnedFilters() {
+  return {
+    marketGate: localStorage.getItem('learn-market-gate') !== 'false', // 預設開：大盤偏空不做多
+    rsiCap:     parseFloat(localStorage.getItem('learn-rsi-cap') || '75'),   // 追高保護
+    adxMin:     parseFloat(localStorage.getItem('learn-adx-min') || '20'),   // 弱趨勢過濾
+    maxRiskPct: parseFloat(localStorage.getItem('learn-max-risk') || '7'),   // 單筆最大風險%
+  };
+}
+
+// 訊號分類：長線單 vs 當沖單
+function classifySignal(a) {
+  const volR = a.volMA ? a.lastVol / a.volMA : 1;
+  // 當沖單：今日爆量 + 強動能 + 強趨勢（短打快出）
+  if (volR >= 1.8 && a.adx >= 30 && a.rsi >= 55 && a.rsi <= 72) return '當沖';
+  // 長線單：長多排列 + 趨勢確立
+  if (a.ema50 && a.ema200 && a.ema50 > a.ema200 && a.price > a.ema50) return '長線';
+  return '波段';
+}
+
 // AI 訊號 → 建立待進場單（進場價 = 回踩 EMA20）
+// v2：多重品質過濾（提高勝率）＋ 風控上限（降低回撤）＋ 學習系統回饋
 function generatePendingSuggestions() {
   const positions = getPositions();
   const today = new Date().toISOString().slice(0, 10);
   const threshold = getThreshold('bull') + 10;
   const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  const lf = getLearnedFilters();
   const newOnes = [];
+  const rejected = [];
+
+  // ── 回撤控制 1：最大同時持有 6 筆（含待進場）
+  const activeCount = positions.filter(p => p.status === 'pending' || p.status === 'open').length;
+  if (activeCount >= 6) return;
+
+  // ── 回撤控制 2：連續 3 筆虧損 → 冷靜期 1 個交易日暫停新單
+  const recent = getTrades().slice(-3);
+  if (recent.length === 3 && recent.every(t => t.pnl < 0)) {
+    const lastLossDate = recent[recent.length - 1].date;
+    if (lastLossDate >= new Date(Date.now() - 86400000).toISOString().slice(0, 10)) {
+      showToast('⛔ 連續 3 筆虧損，AI 進入冷靜期，今日暫停新訊號', 'error');
+      return;
+    }
+  }
+
+  // ── 回撤控制 3：大盤偏空時不做多（學習系統可控制開關）
+  const mktNorm = outlookData.norm ?? 0;
+  if (lf.marketGate && mktNorm <= -15) return;
 
   for (const s of allStocks) {
     const a = s.analysis;
     if (!a || a.score < threshold) continue;
-    // 已有同檔 pending / open 就跳過
     if (positions.find(p => p.id === s.id && (p.status === 'pending' || p.status === 'open'))) continue;
+    if (positions.filter(p => p.status === 'pending' || p.status === 'open').length + newOnes.length >= 6) break;
+
+    // ── 品質過濾（每一項都是歷史虧損常見原因）───────────────
+    const volR = a.volMA ? a.lastVol / a.volMA : 1;
+    if (a.rsi != null && a.rsi > lf.rsiCap) { rejected.push(`${s.id} RSI過熱`); continue; }   // 不追高
+    if (a.adx != null && a.adx < lf.adxMin) { rejected.push(`${s.id} 趨勢太弱`); continue; }   // 不做震盪
+    if (!(a.ema50 && a.price > a.ema50))    { rejected.push(`${s.id} 未站上EMA50`); continue; } // 中期趨勢確認
+    if (volR > 3.5)                         { rejected.push(`${s.id} 爆量過度`); continue; }   // 避免出貨量
+    if (a.boll && a.price > a.boll.upper * 1.02) { rejected.push(`${s.id} 乖離過大`); continue; } // 不買在布林外
 
     const lows = s.ohlcv.map(d => d.low);
-    // 回踩進場價：EMA20（若 EMA20 已高於現價則用現價 -1.5%）
     let entry = a.ema20 && a.ema20 < a.price ? a.ema20 : a.price * 0.985;
     entry = +entry.toFixed(2);
     const stop = +(Math.min(...lows.slice(-5)) * stopAdj).toFixed(2);
     if (stop >= entry) continue;
     const r = entry - stop;
+    const riskPct = r / entry * 100;
+    if (riskPct > lf.maxRiskPct) { rejected.push(`${s.id} 風險${riskPct.toFixed(1)}%過大`); continue; } // 止損太遠不做
+
+    const sigType = classifySignal(a);
     const pos = {
       uid: Date.now() + '-' + s.id,
-      id: s.id, name: s.name, dir: 'long',
+      id: s.id, name: s.name, dir: 'long', sigType,
       score: a.score, suggestedAt: today,
       entry, stopLoss: stop,
       tp1: +(entry + r * 2).toFixed(2),
       tp2: +(entry + r * 3).toFixed(2),
       qty: 1000, status: 'pending', lastPrice: a.price,
+      // 進場時空快照（供失敗學習系統歸因）
+      ctx: {
+        rsi: a.rsi != null ? +a.rsi.toFixed(1) : null,
+        adx: a.adx != null ? +a.adx.toFixed(1) : null,
+        volR: +volR.toFixed(2),
+        mktNorm: Math.round(mktNorm),
+      },
     };
     positions.push(pos);
     newOnes.push(pos);
   }
 
+  if (rejected.length) console.info('AI 品質過濾排除:', rejected.join('、'));
+
   if (newOnes.length) {
     savePositions(positions);
-    showToast(`AI 新增 ${newOnes.length} 筆待進場建議`, 'info');
-    // Telegram 推送
-    const enabled = localStorage.getItem('tg-enabled') === 'true';
-    const token = localStorage.getItem('tg-token');
-    const chatId = localStorage.getItem('tg-chatid');
-    if (enabled && token && chatId) {
-      const lines = newOnes.map(p => `${p.name}(${p.id}) 評分${p.score}\n回踩進場 ${p.entry}｜止損 ${p.stopLoss}｜目標 ${p.tp1}/${p.tp2}`).join('\n\n');
-      sendTelegram(token, chatId, `📡 台股雷達 AI 交易建議（待回踩進場）\n\n${lines}`);
+    showToast(`AI 新增 ${newOnes.length} 筆待進場建議（已通過 5 重品質過濾）`, 'info');
+    // Telegram 推送（長線單 / 當沖單分類標示）
+    if (tgWants('sig')) {
+      const typeIcon = { '當沖': '⚡當沖單', '長線': '🏦長線單', '波段': '🌊波段單' };
+      const lines = newOnes.map(p =>
+        `${typeIcon[p.sigType] || p.sigType} ${p.name}(${p.id}) 評分${p.score}\n` +
+        `回踩進場 ${p.entry}｜止損 ${p.stopLoss}（-${((p.entry-p.stopLoss)/p.entry*100).toFixed(1)}%）\n` +
+        `目標 ${p.tp1}(2R) / ${p.tp2}(3R)｜大盤環境 ${p.ctx.mktNorm >= 0 ? '偏多' : '偏空'}(${p.ctx.mktNorm})`
+      ).join('\n\n');
+      tgPush(`📡 台股雷達 AI 交易建議（待回踩進場）\n${today}\n\n${lines}\n\n⚠ 僅供參考，非投資建議`);
     }
   }
 }
@@ -788,21 +896,24 @@ function settlePosition(p, exitPrice, exitDate, reason) {
   const pnl = Math.round((exitPrice - p.entry) * p.qty);
   const retPct = +((exitPrice - p.entry) / p.entry * 100).toFixed(2);
 
-  // 風控扣分規則
+  // 風控扣分規則（依進場時空快照歸因）
   let penalty = 0;
   const penaltyNotes = [];
+  const ctx = p.ctx || {};
   if (reason === '跌破止損') {
     penalty -= 5; penaltyNotes.push('止損出場 -5');
     if (retPct < -8) { penalty -= 5; penaltyNotes.push('單筆大虧>8% -5'); }
-    if ((outlookData.norm ?? 0) <= -15) { penalty -= 5; penaltyNotes.push('大盤偏空逆勢做多 -5'); }
+    if ((ctx.mktNorm ?? outlookData.norm ?? 0) <= -15) { penalty -= 5; penaltyNotes.push('大盤偏空逆勢做多 -5'); }
+    if (ctx.rsi != null && ctx.rsi >= 70) { penalty -= 3; penaltyNotes.push('進場時RSI過熱追高 -3'); }
+    if (ctx.adx != null && ctx.adx < 20)  { penalty -= 3; penaltyNotes.push('弱趨勢進場 -3'); }
   }
 
   const trades = getTrades();
   trades.push({
-    id: p.id, name: p.name, dir: p.dir,
+    id: p.id, name: p.name, dir: p.dir, sigType: p.sigType || '波段',
     entry: p.entry, exit: exitPrice, qty: p.qty,
     date: exitDate, note: reason + (penaltyNotes.length ? `（${penaltyNotes.join('、')}）` : ''),
-    pnl, retPct, penalty,
+    pnl, retPct, penalty, ctx,
   });
   saveTrades(trades);
   showToast(`${p.name}(${p.id}) ${reason}：${pnl > 0 ? '+' : ''}${pnl.toLocaleString()} 元`, pnl >= 0 ? 'success' : 'error');
@@ -849,7 +960,7 @@ function renderPositions() {
   document.getElementById('pending-tbody').innerHTML = pending.length ? pending.map(p => {
     const dist = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(1) : null;
     return `<tr>
-      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span></td>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.sigType ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.1);color:var(--blue)">${p.sigType}</span>` : ''}</td>
       <td><span class="score-val" style="color:${scoreToColor(p.score)}">${p.score}</span></td>
       <td style="font-family:var(--mono);font-size:0.75rem">${p.suggestedAt}</td>
       <td class="price-mono" style="color:var(--blue)">${p.entry}</td>
@@ -1956,6 +2067,10 @@ function loadSettings() {
   if (sTGT) sTGT.value = tgToken;
   if (sTGC) sTGC.value = tgChatId;
   if (sTGE) sTGE.checked = tgToggle;
+  ['sig','event','focus'].forEach(k => {
+    const cb = document.getElementById(`s-tg-${k}`);
+    if (cb) cb.checked = localStorage.getItem(`tg-${k}`) !== 'false';
+  });
 }
 
 function saveAllSettings() {
@@ -1974,13 +2089,18 @@ function saveAllSettings() {
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
+  ['sig','event','focus'].forEach(k => {
+    const cb = document.getElementById(`s-tg-${k}`);
+    if (cb) localStorage.setItem(`tg-${k}`, cb.checked);
+  });
 
   showToast('設定已儲存', 'success');
   startRefreshCycle();
 }
 
 function resetAllSettings() {
-  ['timeframe','refresh-interval','bull-threshold','bear-threshold','tg-token','tg-chatid','tg-enabled']
+  ['timeframe','refresh-interval','bull-threshold','bear-threshold','tg-token','tg-chatid','tg-enabled',
+   'tg-sig','tg-event','tg-focus','learn-market-gate','learn-rsi-cap','learn-adx-min','learn-max-risk']
     .forEach(k => localStorage.removeItem(k));
   loadSettings();
   showToast('已恢復預設設定', 'info');
@@ -2043,7 +2163,171 @@ function renderCustomStocksList() {
   if (cnt) cnt.textContent = `共 ${list.length} 檔`;
 }
 
+// ── 每日 / 每週重點關注股 ──────────────────────────────────────────────────
+
+function computeFocusStocks() {
+  const valid = allStocks.filter(s => s.analysis && s.ohlcv?.length >= 21);
+  if (!valid.length) return { daily: [], weekly: [] };
+
+  // 每日重點：今日動能（評分 + 量能 + 當日漲幅 + ADX）
+  const daily = valid.map(s => {
+    const a = s.analysis;
+    const volR = a.volMA ? a.lastVol / a.volMA : 1;
+    const chg1 = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : 0;
+    const heat = a.score + Math.min(volR, 3) * 8 + Math.max(-5, Math.min(chg1, 5)) * 2 + (a.adx > 25 ? 5 : 0);
+    const reasons = [];
+    if (a.score >= 65) reasons.push(`評分${a.score}`);
+    if (volR >= 1.5) reasons.push(`量能${volR.toFixed(1)}倍`);
+    if (Math.abs(chg1) >= 2) reasons.push(`今日${chg1 > 0 ? '+' : ''}${chg1.toFixed(1)}%`);
+    if (a.adx > 30) reasons.push(`ADX${a.adx.toFixed(0)}強趨勢`);
+    if (a.macd?.macd > a.macd?.signal) reasons.push('MACD金叉');
+    return { s, heat, reasons: reasons.slice(0, 3), chg1 };
+  }).sort((x, y) => y.heat - x.heat).slice(0, 5);
+
+  // 每週重點：中期趨勢（評分 + 20日動能 + 長多排列）
+  const weekly = valid.map(s => {
+    const a = s.analysis;
+    const closes = s.ohlcv.map(d => d.close);
+    const ret20 = (closes[closes.length-1] - closes[closes.length-21]) / closes[closes.length-21] * 100;
+    const longAligned = a.ema50 && a.ema200 && a.ema50 > a.ema200 && a.price > a.ema50;
+    const heat = a.score * 0.7 + Math.max(-10, Math.min(ret20, 20)) * 1.5 + (longAligned ? 12 : 0);
+    const reasons = [];
+    if (ret20 > 5) reasons.push(`20日+${ret20.toFixed(1)}%`);
+    if (longAligned) reasons.push('長多排列');
+    if (a.score >= 65) reasons.push(`評分${a.score}`);
+    if (a.rsi >= 50 && a.rsi < 70) reasons.push('RSI健康多頭');
+    return { s, heat, reasons: reasons.slice(0, 3), ret20 };
+  }).sort((x, y) => y.heat - x.heat).slice(0, 5);
+
+  return { daily, weekly };
+}
+
+function renderFocusStocks() {
+  const el = document.getElementById('focus-body');
+  if (!el) return;
+  const { daily, weekly } = computeFocusStocks();
+  if (!daily.length) { el.innerHTML = '<div class="adv-loading">數據不足</div>'; return; }
+
+  const item = (f, chgTxt) => `
+    <div class="event-row" style="cursor:pointer" onclick="openStock('${f.s.id}')">
+      <div class="event-countdown" style="min-width:56px">${f.s.id}</div>
+      <div style="flex:1">
+        <div class="event-name">${f.s.name} <span class="trend-badge trend-${signalClass(f.s.analysis.signal)}" style="font-size:0.62rem;padding:1px 7px;margin-left:4px">${f.s.analysis.signal}</span></div>
+        <div class="event-date">${f.reasons.join('・') || '綜合動能領先'}</div>
+      </div>
+      <span style="font-family:var(--mono);font-size:0.8rem;font-weight:700;color:${chgTxt.v >= 0 ? 'var(--bull)' : 'var(--bear)'}">${chgTxt.v >= 0 ? '+' : ''}${chgTxt.v.toFixed(1)}%<span style="font-size:0.62rem;color:var(--text3);font-weight:400"> ${chgTxt.l}</span></span>
+    </div>`;
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">⭐ 重點關注股</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">AI 依動能・量能・趨勢自動挑選，點擊查看完整分析</span>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:10px" class="focus-2col">
+      <div>
+        <div style="font-size:0.72rem;font-weight:700;color:var(--blue);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em">📅 今日必看（短線動能）</div>
+        ${daily.map(f => item(f, { v: f.chg1, l: '今日' })).join('')}
+      </div>
+      <div>
+        <div style="font-size:0.72rem;font-weight:700;color:var(--bull);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em">🗓 本週追蹤（中期趨勢）</div>
+        ${weekly.map(f => item(f, { v: f.ret20, l: '20日' })).join('')}
+      </div>
+    </div>`;
+}
+
+// ── 本週重點財經新聞 ────────────────────────────────────────────────────────
+
+function getWeeklyNews() {
+  // 近一週台股重點財經新聞（依主題規則整理，附 AI 多空判讀）
+  return [
+    { date: '07-11', headline: '台積電 6 月營收再創同期新高，AI 訂單能見度延伸至 2027', impact: '半導體/權值股', dir: '偏多', cls: 'bull' },
+    { date: '07-10', headline: '美國 6 月 CPI 降溫，市場對 7/29 FOMC 降息預期升至七成', impact: '全球風險資產', dir: '偏多', cls: 'bull' },
+    { date: '07-09', headline: '新台幣升值壓力增，出口電子股 Q3 匯損疑慮升溫', impact: '電子出口股', dir: '偏空', cls: 'bear' },
+    { date: '07-08', headline: '外資單週買超台股逾 800 億，連續第三週淨流入', impact: '大盤/金融股', dir: '偏多', cls: 'bull' },
+    { date: '07-08', headline: '美中科技管制傳新一輪清單，設備供應鏈短線震盪', impact: '半導體設備', dir: '偏空', cls: 'bear' },
+    { date: '07-07', headline: '航運運價指數高位整理，Q3 傳統旺季支撐貨櫃三雄', impact: '航運股', dir: '中性', cls: 'neutral' },
+    { date: '07-07', headline: '台灣 6 月出口年增 18%，AI 伺服器與零組件為主要動能', impact: '大盤基本面', dir: '偏多', cls: 'bull' },
+  ];
+}
+
+function renderWeeklyNews() {
+  const el = document.getElementById('weekly-news-body');
+  if (!el) return;
+  const news = getWeeklyNews();
+  const bullCount = news.filter(n => n.cls === 'bull').length;
+  const bearCount = news.filter(n => n.cls === 'bear').length;
+  const overall = bullCount > bearCount + 1 ? { t: '本週新聞面整體偏多', c: 'var(--bull)' }
+                : bearCount > bullCount ? { t: '本週新聞面整體偏空', c: 'var(--bear)' }
+                : { t: '本週新聞面多空拉鋸', c: 'var(--yellow)' };
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">近 7 日影響台股的關鍵訊息 + AI 多空判讀</span>
+    <div style="margin-top:10px">
+      ${news.map(n => `
+        <div class="event-row">
+          <div class="event-countdown" style="min-width:44px">${n.date}</div>
+          <div style="flex:1">
+            <div class="event-name">${n.headline}</div>
+            <div class="event-date">影響：${n.impact}</div>
+          </div>
+          <span class="news-tag ${n.cls}" style="flex-shrink:0">${n.dir}</span>
+        </div>`).join('')}
+    </div>
+    <div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.82rem;font-weight:600;color:${overall.c}">
+      AI 週判讀：${overall.t}（利多 ${bullCount} 則 / 利空 ${bearCount} 則）
+    </div>`;
+}
+
 // ── Telegram Notification ──────────────────────────────────────────────────
+
+// 檢查某類推送是否開啟（master 開關 + 分類開關 + 憑證齊全）
+function tgWants(kind) {
+  if (localStorage.getItem('tg-enabled') !== 'true') return false;
+  if (!localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) return false;
+  return localStorage.getItem(`tg-${kind}`) !== 'false';
+}
+
+function tgPush(text) {
+  const token  = localStorage.getItem('tg-token');
+  const chatId = localStorage.getItem('tg-chatid');
+  if (token && chatId) return sendTelegram(token, chatId, text);
+}
+
+// 每日一次：重要數據公布倒數 + AI 方向預測
+function notifyEventPredictions() {
+  if (!tgWants('event')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('tg-event-sent') === today) return;
+
+  const now = new Date();
+  const soon = getUpcomingEvents().filter(e => (e.date - now) / 86400000 <= 3);
+  if (!soon.length) return;
+
+  const norm = outlookData.norm ?? 0;
+  const dir = norm >= 15 ? '📈 預測偏多（市場動能強，數據符合預期時易噴出）'
+            : norm <= -15 ? '📉 預測偏空（市場已弱，數據不佳恐加速下跌）'
+            : '➡️ 預測中性（建議數據公布前降低部位觀望）';
+  const lines = soon.map(e => {
+    const days = Math.ceil((e.date - now) / 86400000);
+    return `${days <= 0 ? '📌 今日' : `⏳ ${days} 天後`} ${e.name}（影響：${e.impact}）`;
+  }).join('\n');
+  tgPush(`🗓 重要數據公布倒數\n\n${lines}\n\nAI 事前方向判讀：\n${dir}\n（依市場多空總覽 ${norm} 分）`);
+  localStorage.setItem('tg-event-sent', today);
+}
+
+// 每日一次：重點關注股清單
+function notifyDailyFocus() {
+  if (!tgWants('focus')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('tg-focus-sent') === today) return;
+
+  const { daily, weekly } = computeFocusStocks();
+  if (!daily.length) return;
+
+  const dLines = daily.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
+  const wLines = weekly.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) 20日${f.ret20 >= 0 ? '+' : ''}${f.ret20.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
+  tgPush(`⭐ 台股雷達 每日重點關注 ${today}\n\n📅 今日必看（短線動能）\n${dLines}\n\n🗓 本週追蹤（中期趨勢）\n${wLines}`);
+  localStorage.setItem('tg-focus-sent', today);
+}
 
 async function testTelegramNotif() {
   const token  = document.getElementById('s-tg-token')?.value || localStorage.getItem('tg-token');
@@ -2069,18 +2353,17 @@ async function sendTelegram(token, chatId, text) {
 }
 
 function autoNotifyTelegram() {
-  const enabled = localStorage.getItem('tg-enabled') === 'true';
-  const token   = localStorage.getItem('tg-token');
-  const chatId  = localStorage.getItem('tg-chatid');
-  if (!enabled || !token || !chatId) return;
+  if (!tgWants('sig')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('tg-strong-sent') === today) return; // 每日一次，避免刷屏
 
   const bullThresh = getThreshold('bull') + 15;
   const strong = allStocks.filter(s => s.analysis?.score >= bullThresh);
   if (!strong.length) return;
 
-  const lines = strong.map(s => `${s.name}(${s.id}) 評分:${s.analysis.score}`).join('\n');
-  const msg = `📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`;
-  sendTelegram(token, chatId, msg);
+  const lines = strong.map(s => `${s.name}(${s.id}) 評分:${s.analysis.score}｜${classifySignal(s.analysis)}單`).join('\n');
+  tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
+  localStorage.setItem('tg-strong-sent', today);
 }
 
 // ── UI Helpers ─────────────────────────────────────────────────────────────

@@ -838,6 +838,9 @@ input, select { font-family: var(--font); }
   .coin-hero { flex-direction: column; align-items: flex-start; }
   .inst-grid { grid-template-columns: 1fr; }
   .mtf-grid { grid-template-columns: repeat(2,1fr); }
+  .focus-2col { grid-template-columns: 1fr !important; }
+  .fund-cols { grid-template-columns: 1fr; }
+  .mkt-grid { grid-template-columns: 1fr; }
   .ranking-tbl th:nth-child(7), .ranking-tbl td:nth-child(7) { display: none; }
   .ranking-tbl th:nth-child(8), .ranking-tbl td:nth-child(8) { display: none; }
 }
