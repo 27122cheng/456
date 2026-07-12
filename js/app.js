@@ -128,6 +128,9 @@ async function startScan() {
   // 每日 / 每週重點關注股
   renderFocusStocks();
 
+  // 價格警報檢查
+  checkAlerts();
+
   // Telegram：強勢訊號 + 數據公布預測 + 每日重點股（各每日一次）
   autoNotifyTelegram();
   notifyEventPredictions();
@@ -1305,6 +1308,7 @@ async function openStock(stockId) {
 
   // Load TV chart
   initTVChart(stockId);
+  renderAlertList();
 
   // Load data
   let s = allStocks.find(s => s.id === stockId);
@@ -2364,6 +2368,225 @@ function autoNotifyTelegram() {
   const lines = strong.map(s => `${s.name}(${s.id}) 評分:${s.analysis.score}｜${classifySignal(s.analysis)}單`).join('\n');
   tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
   localStorage.setItem('tg-strong-sent', today);
+}
+
+// ── 策略歷史回測 ────────────────────────────────────────────────────────────
+
+// 將現行 AI 規則逐棒套用到單檔歷史（回踩掛單 → 成交 → 2R停利/止損）
+function backtestStock(s) {
+  const bars = s.ohlcv;
+  if (!bars || bars.length < 80) return [];
+  const threshold = getThreshold('bull') + 10;
+  const lf = getLearnedFilters();
+  const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  const trades = [];
+  let pos = null, pend = null;
+
+  for (let i = 60; i < bars.length; i++) {
+    const b = bars[i];
+
+    if (pos) {
+      // 先檢查止損（保守：同棒觸及兩者以止損計）
+      if (b.low <= pos.stop) {
+        trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.stop, entryDate: pos.entryDate, exitDate: b.time, win: false, retPct: (pos.stop - pos.entry) / pos.entry * 100, holdDays: i - pos.entryIdx });
+        pos = null;
+      } else if (b.high >= pos.tp) {
+        trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.tp, entryDate: pos.entryDate, exitDate: b.time, win: true, retPct: (pos.tp - pos.entry) / pos.entry * 100, holdDays: i - pos.entryIdx });
+        pos = null;
+      }
+      continue;
+    }
+
+    if (pend) {
+      pend.age++;
+      if (b.low <= pend.entry) {
+        pos = { ...pend, entryDate: b.time, entryIdx: i };
+        pend = null;
+      } else if (pend.age >= 7) pend = null;
+      continue;
+    }
+
+    // 產生訊號（與 generatePendingSuggestions 相同的 5 重過濾）
+    const window = bars.slice(0, i + 1);
+    const a = calculateScore(window);
+    if (a.score < threshold) continue;
+    const volR = a.volMA ? a.lastVol / a.volMA : 1;
+    if (a.rsi != null && a.rsi > lf.rsiCap) continue;
+    if (a.adx != null && a.adx < lf.adxMin) continue;
+    if (!(a.ema50 && a.price > a.ema50)) continue;
+    if (volR > 3.5) continue;
+    if (a.boll && a.price > a.boll.upper * 1.02) continue;
+
+    let entry = a.ema20 && a.ema20 < a.price ? a.ema20 : a.price * 0.985;
+    entry = +entry.toFixed(2);
+    const stop = +(Math.min(...window.slice(-5).map(d => d.low)) * stopAdj).toFixed(2);
+    if (stop >= entry) continue;
+    if ((entry - stop) / entry * 100 > lf.maxRiskPct) continue;
+    pend = { entry, stop, tp: +(entry + (entry - stop) * 2).toFixed(2), age: 0 };
+  }
+  return trades;
+}
+
+async function runBacktest() {
+  const btn = document.getElementById('bt-run-btn');
+  const prog = document.getElementById('bt-progress');
+  const el = document.getElementById('backtest-body');
+  const valid = allStocks.filter(s => s.ohlcv?.length >= 80);
+  if (!valid.length) { showToast('請先等掃描完成再執行回測', 'error'); return; }
+
+  btn.disabled = true;
+  const all = [];
+  for (let i = 0; i < valid.length; i++) {
+    prog.textContent = `回測中 ${i + 1}/${valid.length}：${valid[i].name}...`;
+    all.push(...backtestStock(valid[i]));
+    await delay(0); // 讓出主執行緒，避免卡 UI
+  }
+  btn.disabled = false;
+  prog.textContent = '';
+
+  if (!all.length) {
+    el.innerHTML = '<p style="font-size:0.84rem;color:var(--text3)">近 6 個月無符合 5 重過濾的進場訊號 — 過濾條件嚴格是正常的，代表系統只挑高品質機會。</p>';
+    return;
+  }
+
+  // 統計
+  all.sort((a, b) => a.exitDate.localeCompare(b.exitDate));
+  const wins = all.filter(t => t.win);
+  const winRate = wins.length / all.length * 100;
+  const grossWin = all.filter(t => t.retPct > 0).reduce((s, t) => s + t.retPct, 0);
+  const grossLoss = Math.abs(all.filter(t => t.retPct < 0).reduce((s, t) => s + t.retPct, 0));
+  const pf = grossLoss ? grossWin / grossLoss : Infinity;
+  const avgHold = all.reduce((s, t) => s + t.holdDays, 0) / all.length;
+
+  // 權益曲線 + 最大回撤（以每筆報酬率累加）
+  let equity = 0, peak = 0, maxDD = 0;
+  const curve = all.map(t => {
+    equity += t.retPct;
+    peak = Math.max(peak, equity);
+    maxDD = Math.max(maxDD, peak - equity);
+    return equity;
+  });
+
+  // SVG 權益曲線
+  const W = 600, H = 120;
+  const minE = Math.min(0, ...curve), maxE = Math.max(1, ...curve);
+  const pts = curve.map((v, i) => `${(i / Math.max(curve.length - 1, 1) * W).toFixed(1)},${(H - (v - minE) / (maxE - minE || 1) * H).toFixed(1)}`).join(' ');
+  const zeroY = H - (0 - minE) / (maxE - minE || 1) * H;
+  const lastPos = equity >= 0;
+
+  // 個股績效排行
+  const byStock = {};
+  all.forEach(t => {
+    byStock[t.id] = byStock[t.id] || { id: t.id, name: t.name, n: 0, ret: 0, wins: 0 };
+    byStock[t.id].n++; byStock[t.id].ret += t.retPct; if (t.win) byStock[t.id].wins++;
+  });
+  const ranked = Object.values(byStock).sort((a, b) => b.ret - a.ret);
+  const top3 = ranked.slice(0, 3), bot3 = ranked.slice(-3).reverse();
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px" class="bt-stat-grid">
+      ${[
+        { l: '總交易數', v: all.length, c: 'var(--text1)' },
+        { l: '勝率', v: winRate.toFixed(0) + '%', c: winRate >= 50 ? 'var(--bull)' : 'var(--bear)' },
+        { l: '獲利因子', v: pf === Infinity ? '∞' : pf.toFixed(2), c: pf >= 1.5 ? 'var(--bull)' : pf >= 1 ? 'var(--yellow)' : 'var(--bear)' },
+        { l: '累計報酬', v: (equity >= 0 ? '+' : '') + equity.toFixed(1) + '%', c: equity >= 0 ? 'var(--bull)' : 'var(--bear)' },
+        { l: '最大回撤', v: '-' + maxDD.toFixed(1) + '%', c: maxDD <= 10 ? 'var(--bull)' : maxDD <= 20 ? 'var(--yellow)' : 'var(--bear)' },
+      ].map(x => `<div class="mkt-item"><div class="mkt-lbl">${x.l}</div><div class="mkt-val" style="color:${x.c}">${x.v}</div></div>`).join('')}
+    </div>
+    <div class="fund-block" style="margin-bottom:14px">
+      <div class="fund-block-ttl">權益曲線（每筆報酬率累加，平均持有 ${avgHold.toFixed(1)} 天）</div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:120px;display:block">
+        <line x1="0" y1="${zeroY}" x2="${W}" y2="${zeroY}" stroke="rgba(148,163,184,0.25)" stroke-dasharray="4 4"/>
+        <polyline points="${pts}" fill="none" stroke="${lastPos ? 'var(--bull)' : 'var(--bear)'}" stroke-width="2"/>
+      </svg>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px" class="focus-2col">
+      <div class="fund-block">
+        <div class="fund-block-ttl" style="color:var(--bull)">🏆 策略最有效的股票</div>
+        ${top3.map(r => `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0"><span style="cursor:pointer" onclick="openStock('${r.id}')">${r.name}(${r.id}) · ${r.n}筆</span><span style="font-family:var(--mono);color:var(--bull)">+${r.ret.toFixed(1)}%</span></div>`).join('')}
+      </div>
+      <div class="fund-block">
+        <div class="fund-block-ttl" style="color:var(--bear)">⚠ 策略最無效的股票</div>
+        ${bot3.map(r => `<div style="display:flex;justify-content:space-between;font-size:0.8rem;padding:4px 0"><span style="cursor:pointer" onclick="openStock('${r.id}')">${r.name}(${r.id}) · ${r.n}筆</span><span style="font-family:var(--mono);color:${r.ret >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.ret >= 0 ? '+' : ''}${r.ret.toFixed(1)}%</span></div>`).join('')}
+      </div>
+    </div>
+    <p style="font-size:0.75rem;color:var(--text3);margin-top:12px">
+      ⓘ 回測使用目前生效的學習參數（RSI≤${getLearnedFilters().rsiCap}、ADX≥${getLearnedFilters().adxMin}、風險≤${getLearnedFilters().maxRiskPct}%）。
+      「策略最無效」名單中的股票可考慮從股票池移除，或等待學習系統進一步收緊條件。歷史績效不代表未來報酬。
+    </p>`;
+  showToast(`回測完成：${all.length} 筆，勝率 ${winRate.toFixed(0)}%，最大回撤 ${maxDD.toFixed(1)}%`, 'success');
+}
+
+// ── 價格警報系統 ────────────────────────────────────────────────────────────
+
+function getAlerts() {
+  try { return JSON.parse(localStorage.getItem('price-alerts') || '[]'); } catch { return []; }
+}
+function saveAlerts(a) { localStorage.setItem('price-alerts', JSON.stringify(a)); }
+
+function addAlert() {
+  if (!currentStockId) return;
+  const above = parseFloat(document.getElementById('alert-above').value);
+  const below = parseFloat(document.getElementById('alert-below').value);
+  if (!above && !below) { showToast('請輸入至少一個提醒價', 'error'); return; }
+
+  const meta = getStockList().find(s => s.id === currentStockId) || { name: currentStockId };
+  const alerts = getAlerts();
+  if (above) alerts.push({ uid: Date.now() + '-a', id: currentStockId, name: meta.name, type: 'above', price: above });
+  if (below) alerts.push({ uid: Date.now() + '-b', id: currentStockId, name: meta.name, type: 'below', price: below });
+  saveAlerts(alerts);
+  document.getElementById('alert-above').value = '';
+  document.getElementById('alert-below').value = '';
+  renderAlertList();
+  showToast('警報已設定，觸價時將通知', 'success');
+
+  // 申請瀏覽器通知權限
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
+
+function removeAlert(uid) {
+  saveAlerts(getAlerts().filter(a => a.uid !== uid));
+  renderAlertList();
+}
+
+function renderAlertList() {
+  const el = document.getElementById('alert-list');
+  if (!el) return;
+  const alerts = getAlerts();
+  if (!alerts.length) { el.innerHTML = '<p style="font-size:0.78rem;color:var(--text3)">尚未設定任何警報</p>'; return; }
+  el.innerHTML = alerts.map(a => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:rgba(255,255,255,0.02);border-radius:8px;margin-bottom:6px">
+      <span style="font-size:0.8rem;cursor:pointer" onclick="openStock('${a.id}')">
+        ${a.name}(${a.id})
+        <span style="color:${a.type === 'above' ? 'var(--bull)' : 'var(--bear)'};font-family:var(--mono);margin-left:6px">${a.type === 'above' ? '漲破' : '跌破'} ${a.price}</span>
+      </span>
+      <button class="del-trade-btn" onclick="removeAlert('${a.uid}')" title="刪除">×</button>
+    </div>`).join('');
+}
+
+// 掃描後檢查觸價（觸發即推送並移除，一次性警報）
+function checkAlerts() {
+  const alerts = getAlerts();
+  if (!alerts.length) return;
+  const remaining = [];
+  for (const a of alerts) {
+    const s = allStocks.find(x => x.id === a.id);
+    const price = s?.analysis?.price;
+    if (price == null) { remaining.push(a); continue; }
+    const hit = (a.type === 'above' && price >= a.price) || (a.type === 'below' && price <= a.price);
+    if (!hit) { remaining.push(a); continue; }
+
+    const msg = `🔔 價格警報觸發\n${a.name}(${a.id}) 現價 ${price}\n已${a.type === 'above' ? '漲破' : '跌破'}警報價 ${a.price}`;
+    showToast(msg.replace(/\n/g, ' '), a.type === 'above' ? 'success' : 'error');
+    if (localStorage.getItem('tg-enabled') === 'true') tgPush(msg);
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification('台股雷達 價格警報', { body: `${a.name}(${a.id}) 現價 ${price}，已${a.type === 'above' ? '漲破' : '跌破'} ${a.price}` });
+    }
+  }
+  saveAlerts(remaining);
+  renderAlertList();
 }
 
 // ── UI Helpers ─────────────────────────────────────────────────────────────

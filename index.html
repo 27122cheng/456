@@ -8,6 +8,11 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="css/styles.css" />
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#080c14" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="台股雷達" />
 </head>
 <body>
 
@@ -538,6 +543,23 @@
         <div class="adv-section-body" id="ai-anal-body"><div class="adv-loading">載入中...</div></div>
       </div>
 
+      <!-- 價格警報 -->
+      <div class="adv-section" id="alert-section">
+        <div class="adv-section-hdr">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          價格警報
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">觸價即推送 Telegram + 瀏覽器通知</span>
+        </div>
+        <div class="adv-section-body">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <input id="alert-above" type="number" step="0.01" class="setting-input" placeholder="漲破提醒價" style="width:130px" />
+            <input id="alert-below" type="number" step="0.01" class="setting-input" placeholder="跌破提醒價" style="width:130px" />
+            <button class="btn-primary" onclick="addAlert()" style="padding:8px 18px">🔔 設定警報</button>
+          </div>
+          <div id="alert-list" style="margin-top:12px"></div>
+        </div>
+      </div>
+
     </section>
 
     <!-- ═══════════════════ 交易日誌頁面 ═══════════════════ -->
@@ -708,6 +730,22 @@
           <button class="tf-btn" data-period="year" onclick="switchReportPeriod('year',this)">年度</button>
         </div>
       </div>
+      <!-- 策略回測 -->
+      <div class="adv-section" style="margin-bottom:16px">
+        <div class="adv-section-hdr" style="background:rgba(0,212,255,0.08)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          策略歷史回測
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">用近 6 個月真實 K 線驗證 AI 策略的勝率與回撤</span>
+        </div>
+        <div class="adv-section-body">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+            <button class="btn-primary" id="bt-run-btn" onclick="runBacktest()">▶ 執行回測（全部股票池）</button>
+            <span id="bt-progress" style="font-size:0.78rem;color:var(--text3)"></span>
+          </div>
+          <div id="backtest-body"><p style="font-size:0.82rem;color:var(--text3)">回測會將目前生效的 AI 進場過濾、回踩進場、2R 停利與止損規則，逐棒套用到股票池中每一檔的近 6 個月歷史，統計真實會發生的勝率、獲利因子與最大回撤。掃描完成後即可執行。</p></div>
+        </div>
+      </div>
+
       <div id="report-content"><div class="adv-loading">尚無已結算交易，等待 AI 訊號成交後產生報表</div></div>
     </section>
 
@@ -857,5 +895,10 @@
   <script src="js/indicators.js"></script>
   <script src="js/api.js"></script>
   <script src="js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+  </script>
 </body>
 </html>
