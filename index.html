@@ -71,6 +71,10 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
           策略報表
         </a>
+        <a class="nav-link" data-page="lab" onclick="navigateTo('lab')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3h6M10 3v6.5L4.5 19a1.5 1.5 0 0 0 1.3 2.2h12.4a1.5 1.5 0 0 0 1.3-2.2L14 9.5V3"/><line x1="7" y1="15" x2="17" y2="15"/></svg>
+          機會實驗室
+        </a>
         <a class="nav-link" data-page="settings" onclick="navigateTo('settings')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           設定
@@ -108,6 +112,7 @@
     <a class="mob-link" onclick="navigateTo('positions');toggleMobileMenu()">持有中</a>
     <a class="mob-link" onclick="navigateTo('tradelog');toggleMobileMenu()">交易日誌</a>
     <a class="mob-link" onclick="navigateTo('report');toggleMobileMenu()">策略報表</a>
+    <a class="mob-link" onclick="navigateTo('lab');toggleMobileMenu()">機會實驗室</a>
     <a class="mob-link" onclick="navigateTo('settings');toggleMobileMenu()">設定</a>
     <div class="mob-tf">
       <span class="mob-tf-label">時間週期</span>
@@ -191,6 +196,11 @@
           </div>
           <div class="ov-glow"></div>
         </div>
+      </div>
+
+      <!-- 大盤 頂/底反轉可能性 -->
+      <div class="market-outlook-card">
+        <div id="er-dashboard-body"><div class="adv-loading">載入大盤反轉分析...</div></div>
       </div>
 
       <!-- 恐貪指數 + AI 偏向 / 財經事件倒計時 -->
@@ -472,6 +482,38 @@
           <div class="risk-bar-track"><div class="risk-bar-fill" id="risk-bar"></div></div>
           <p class="risk-desc" id="risk-desc">--</p>
         </div>
+        <!-- 10因子 AI 風險評估 -->
+        <div id="full-risk-body" style="margin-top:10px"></div>
+      </div>
+
+      <!-- 局勢重點 -->
+      <div class="adv-section" id="situation-section">
+        <div class="adv-section-hdr">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          局勢重點
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">趨勢 · 動能 · 籌碼 · 情緒 · 關鍵位</span>
+        </div>
+        <div class="adv-section-body" id="situation-body"><div class="adv-loading">載入中...</div></div>
+      </div>
+
+      <!-- 買賣壓力分析（訂單流台股版）-->
+      <div class="adv-section" id="of-section">
+        <div class="adv-section-hdr">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 7 13.5 15.5 8.5 10.5 1 17"/><polyline points="15 7 22 7 22 14"/></svg>
+          買賣壓力分析（Order Flow）
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">內外盤力道 · Delta · 買賣壓強度</span>
+        </div>
+        <div class="adv-section-body" id="of-body"><div class="adv-loading">載入中...</div></div>
+      </div>
+
+      <!-- 籌碼分佈 Volume Profile -->
+      <div class="adv-section" id="vp-section">
+        <div class="adv-section-hdr">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="4" height="20" rx="1"/><rect x="10" y="6" width="4" height="16" rx="1"/><rect x="18" y="10" width="4" height="12" rx="1"/></svg>
+          籌碼分佈（Volume Profile）
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">POC · 價值區 · 套牢/支撐密集帶</span>
+        </div>
+        <div class="adv-section-body" id="vp-body"><div class="adv-loading">載入中...</div></div>
       </div>
 
       <!-- 多週期信號 -->
@@ -749,6 +791,17 @@
       <div id="report-content"><div class="adv-loading">尚無已結算交易，等待 AI 訊號成交後產生報表</div></div>
     </section>
 
+    <!-- ═══════════════════ AI 機會實驗室 ═══════════════════ -->
+    <section class="page" id="page-lab">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">AI 機會實驗室</h1>
+          <p class="page-subtitle">從股票池即時偵測 5 種特殊交易型態機會</p>
+        </div>
+      </div>
+      <div id="lab-content"><div class="adv-loading">等待掃描完成後分析機會型態...</div></div>
+    </section>
+
     <!-- ═══════════════════ 設定頁面 ═══════════════════ -->
     <section class="page" id="page-settings">
       <div class="page-header">
@@ -813,6 +866,19 @@
 
         <div class="settings-card">
           <h3 class="settings-group-ttl">Telegram 通知</h3>
+
+          <!-- 訊號主機 -->
+          <div class="setting-row" style="margin-bottom:10px">
+            <div class="setting-info">
+              <div class="setting-name">📡 本裝置為訊號主機</div>
+              <div class="setting-desc">只有主機會建單與發送通知。多台裝置同時開啟時，只在一台開啟此選項，避免同一訊號重複建單、重複通知</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="s-master-toggle" checked />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+
           <div class="setting-row vertical" style="gap:10px">
             <div style="display:flex;justify-content:space-between;align-items:center">
               <div>
@@ -846,8 +912,39 @@
                 <input type="checkbox" id="s-tg-focus" checked /> 每日重點關注股清單（每天推送一次）
               </label>
             </div>
-            <div style="display:flex;gap:8px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn-ghost" onclick="testTelegramNotif()" style="font-size:0.82rem">📨 發送測試訊息</button>
+              <button class="btn-ghost" onclick="manualSendDailyBriefing()" style="font-size:0.82rem">📊 立即發送每日市場簡報</button>
+            </div>
+
+            <!-- 通知門檻 -->
+            <div style="display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:rgba(255,255,255,0.02);border-radius:8px">
+              <div style="font-size:0.72rem;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">通知門檻</div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+                <span style="font-size:0.82rem;color:var(--text2)">做多通知門檻（評分 ≥）</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <input type="range" class="setting-range" id="s-notif-bull-thr" min="60" max="85" value="70" oninput="document.getElementById('notif-bull-val').textContent=this.value" />
+                  <span id="notif-bull-val" style="width:28px;text-align:right;color:var(--bull);font-weight:700">70</span>
+                </div>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+                <span style="font-size:0.82rem;color:var(--text2)">做空警示門檻（評分 ≤）</span>
+                <div style="display:flex;align-items:center;gap:8px">
+                  <input type="range" class="setting-range" id="s-notif-bear-thr" min="15" max="40" value="30" oninput="document.getElementById('notif-bear-val').textContent=this.value" />
+                  <span id="notif-bear-val" style="width:28px;text-align:right;color:var(--bear);font-weight:700">30</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 設定教學 -->
+            <div style="padding:12px 14px;background:rgba(0,212,255,0.04);border:1px solid rgba(0,212,255,0.12);border-radius:8px">
+              <div style="font-size:0.78rem;font-weight:700;color:var(--blue);margin-bottom:8px">📖 Telegram 設定步驟</div>
+              <ol style="font-size:0.76rem;color:var(--text2);line-height:1.9;padding-left:18px;margin:0">
+                <li>在 Telegram 搜尋 <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px">@BotFather</code>，發送 <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px">/newbot</code> 建立 Bot，取得 <strong>Bot Token</strong></li>
+                <li>搜尋 <code style="background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px">@userinfobot</code>，發送任意訊息，取得你的 <strong>Chat ID</strong></li>
+                <li>先向你的 Bot 發送一條訊息（不然 Bot 無法主動聯繫你）</li>
+                <li>填入上方欄位後點「發送測試訊息」驗證</li>
+              </ol>
             </div>
           </div>
         </div>

@@ -67,6 +67,7 @@ async function initApp() {
   renderEvents();
   renderCapitalFlow();
   renderWeeklyNews();
+  renderTopBottomReversal();
   startRefreshCycle();
   startScan();
 }
@@ -131,6 +132,7 @@ async function startScan() {
 
   // 每日 / 每週重點關注股
   renderFocusStocks();
+  if (currentPage === 'lab') renderLab();
 
   // 價格警報檢查
   checkAlerts();
@@ -776,6 +778,8 @@ function classifySignal(a) {
 // AI 訊號 → 建立待進場單（進場價 = 回踩 EMA20）
 // v2：多重品質過濾（提高勝率）＋ 風控上限（降低回撤）＋ 學習系統回饋
 function generatePendingSuggestions() {
+  // 只有訊號主機建單，避免多裝置重複建立同一筆待進場單
+  if (!isSignalMaster()) return;
   const positions = getPositions();
   const today = new Date().toISOString().slice(0, 10);
   const threshold = getThreshold('bull') + 10;
@@ -1150,6 +1154,14 @@ async function loadInstitutionalOverview() {
   }));
   parsed.forEach(p => { foreign += p.foreign; investment += p.investment; dealer += p.dealer; total += p.total; });
 
+  // 把個股法人買賣超附加到 allStocks（供機會實驗室「主力吸貨」偵測用）
+  const instMap = {};
+  parsed.forEach(p => { if (p.id) instMap[p.id] = p; });
+  allStocks.forEach(s => {
+    const m = instMap[s.id];
+    if (m) { s.foreign = m.foreign; s.investment = m.investment; s.dealer = m.dealer; s.instTotal = m.total; }
+  });
+
   outlookData.instTotal = { foreign, investment, dealer, total };
   renderMarketOutlook();
 
@@ -1306,9 +1318,10 @@ async function openStock(stockId) {
   document.getElementById('stock-change').textContent = 'TWD';
 
   // Reset sections
-  ['inst-body','setup-body','mtf-body','fund-body','chip-body','sr-body','mkt-body','ind-body','ai-anal-body'].forEach(id => {
-    document.getElementById(id).innerHTML = '<div class="adv-loading">載入中...</div>';
+  ['inst-body','setup-body','mtf-body','fund-body','chip-body','sr-body','mkt-body','ind-body','ai-anal-body','situation-body','of-body','vp-body'].forEach(id => {
+    const e = document.getElementById(id); if (e) e.innerHTML = '<div class="adv-loading">載入中...</div>';
   });
+  const frb = document.getElementById('full-risk-body'); if (frb) frb.innerHTML = '';
 
   // Load TV chart
   initTVChart(stockId);
@@ -1333,11 +1346,17 @@ async function openStock(stockId) {
 
   renderStockDetail(s);
   renderAnalysisPanels(s, null);
+  renderSituation(s, null);
+  renderOrderFlow(s);
+  renderVolumeProfile(s);
+  renderFullRisk(s, null);
 
   // Async: institutional + MTF
   fetchInstitutional(stockId).then(inst => {
     renderInstitutional(inst);
     renderAnalysisPanels(s, inst);
+    renderSituation(s, inst);
+    renderFullRisk(s, inst);
   });
   fetchMTFSignals(stockId).then(mtf => renderMTF(mtf));
 }
@@ -1945,6 +1964,7 @@ function navigateTo(page, opts = {}) {
   if (page === 'tradelog') renderTradelog();
   if (page === 'positions') renderPositions();
   if (page === 'report') renderReport();
+  if (page === 'lab') renderLab();
 
   // Apply filter from opts
   if (opts.filter) {
@@ -2092,6 +2112,16 @@ function loadSettings() {
     const cb = document.getElementById(`s-tg-${k}`);
     if (cb) cb.checked = localStorage.getItem(`tg-${k}`) !== 'false';
   });
+  // 訊號主機（預設 true）
+  const sMaster = document.getElementById('s-master-toggle');
+  if (sMaster) sMaster.checked = localStorage.getItem('signal-master') !== 'false';
+  // 通知門檻
+  const nBull = localStorage.getItem('notif-bull-thr') || '70';
+  const nBear = localStorage.getItem('notif-bear-thr') || '30';
+  const sNB = document.getElementById('s-notif-bull-thr');
+  if (sNB) { sNB.value = nBull; const v = document.getElementById('notif-bull-val'); if (v) v.textContent = nBull; }
+  const sNBr = document.getElementById('s-notif-bear-thr');
+  if (sNBr) { sNBr.value = nBear; const v = document.getElementById('notif-bear-val'); if (v) v.textContent = nBear; }
 }
 
 function saveAllSettings() {
@@ -2114,6 +2144,12 @@ function saveAllSettings() {
     const cb = document.getElementById(`s-tg-${k}`);
     if (cb) localStorage.setItem(`tg-${k}`, cb.checked);
   });
+  const sMaster = document.getElementById('s-master-toggle');
+  if (sMaster) localStorage.setItem('signal-master', sMaster.checked);
+  const nBull = document.getElementById('s-notif-bull-thr')?.value;
+  const nBear = document.getElementById('s-notif-bear-thr')?.value;
+  if (nBull) localStorage.setItem('notif-bull-thr', nBull);
+  if (nBear) localStorage.setItem('notif-bear-thr', nBear);
 
   showToast('設定已儲存', 'success');
   startRefreshCycle();
@@ -2121,7 +2157,8 @@ function saveAllSettings() {
 
 function resetAllSettings() {
   ['timeframe','refresh-interval','bull-threshold','bear-threshold','tg-token','tg-chatid','tg-enabled',
-   'tg-sig','tg-event','tg-focus','learn-market-gate','learn-rsi-cap','learn-adx-min','learn-max-risk']
+   'tg-sig','tg-event','tg-focus','learn-market-gate','learn-rsi-cap','learn-adx-min','learn-max-risk',
+   'signal-master','notif-bull-thr','notif-bear-thr']
     .forEach(k => localStorage.removeItem(k));
   loadSettings();
   showToast('已恢復預設設定', 'info');
@@ -2306,8 +2343,14 @@ async function renderWeeklyNews() {
 
 // ── Telegram Notification ──────────────────────────────────────────────────
 
-// 檢查某類推送是否開啟（master 開關 + 分類開關 + 憑證齊全）
+// 本裝置是否為訊號主機（多裝置時只有主機發通知/建單，避免重複）
+function isSignalMaster() {
+  return localStorage.getItem('signal-master') !== 'false';
+}
+
+// 檢查某類推送是否開啟（主機 + Telegram 開關 + 分類開關 + 憑證齊全）
 function tgWants(kind) {
+  if (!isSignalMaster()) return false;
   if (localStorage.getItem('tg-enabled') !== 'true') return false;
   if (!localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) return false;
   return localStorage.getItem(`tg-${kind}`) !== 'false';
@@ -2391,6 +2434,382 @@ function autoNotifyTelegram() {
   const lines = strong.map(s => `${s.name}(${s.id}) 評分:${s.analysis.score}｜${classifySignal(s.analysis)}單`).join('\n');
   tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
   localStorage.setItem('tg-strong-sent', today);
+}
+
+// ── 大盤 頂/底反轉可能性（儀表板）───────────────────────────────────────────
+
+function calcReversalProb(ohlcv) {
+  if (!ohlcv || ohlcv.length < 40) return null;
+  const closes = ohlcv.map(d => d.close);
+  const vols = ohlcv.map(d => d.volume);
+  const price = closes[closes.length - 1];
+  const rsi = calcRSI(closes);
+  const boll = calcBollinger(closes);
+  const hi20 = Math.max(...ohlcv.slice(-20).map(d => d.high));
+  const lo20 = Math.min(...ohlcv.slice(-20).map(d => d.low));
+  const volMA = calcVolumeMA(vols, 20);
+  const volR = volMA ? vols[vols.length - 1] / volMA : 1;
+
+  // 連續漲/跌天數
+  let upStreak = 0, dnStreak = 0;
+  for (let i = closes.length - 1; i > 0; i--) {
+    if (closes[i] > closes[i - 1]) { if (dnStreak) break; upStreak++; }
+    else if (closes[i] < closes[i - 1]) { if (upStreak) break; dnStreak++; }
+    else break;
+  }
+
+  let top = 0, bottom = 0;
+  const topWhy = [], botWhy = [];
+  if (rsi >= 75) { top += 30; topWhy.push(`RSI ${rsi.toFixed(0)} 嚴重超買`); }
+  else if (rsi >= 68) { top += 18; topWhy.push(`RSI ${rsi.toFixed(0)} 偏高`); }
+  if (price >= hi20 * 0.995) { top += 20; topWhy.push('貼近 20 日高點'); }
+  if (upStreak >= 5) { top += 20; topWhy.push(`連漲 ${upStreak} 天`); }
+  else if (upStreak >= 3) { top += 10; topWhy.push(`連漲 ${upStreak} 天`); }
+  if (boll && price > boll.upper) { top += 18; topWhy.push('突破布林上軌'); }
+  if (volR > 2 && upStreak >= 2) { top += 12; topWhy.push('高檔爆量'); }
+
+  if (rsi <= 25) { bottom += 30; botWhy.push(`RSI ${rsi.toFixed(0)} 嚴重超賣`); }
+  else if (rsi <= 33) { bottom += 18; botWhy.push(`RSI ${rsi.toFixed(0)} 偏低`); }
+  if (price <= lo20 * 1.005) { bottom += 20; botWhy.push('貼近 20 日低點'); }
+  if (dnStreak >= 5) { bottom += 20; botWhy.push(`連跌 ${dnStreak} 天`); }
+  else if (dnStreak >= 3) { bottom += 10; botWhy.push(`連跌 ${dnStreak} 天`); }
+  if (boll && price < boll.lower) { bottom += 18; botWhy.push('跌破布林下軌'); }
+  if (volR > 2 && dnStreak >= 2) { bottom += 12; botWhy.push('低檔爆量（可能止跌換手）'); }
+
+  return { price, top: Math.min(top, 95), bottom: Math.min(bottom, 95), topWhy, botWhy };
+}
+
+async function renderTopBottomReversal() {
+  const el = document.getElementById('er-dashboard-body');
+  if (!el) return;
+  const targets = [
+    { sym: '^TWII', label: '加權指數 TWII' },
+    { sym: '0050.TW', label: '元大台灣50 (0050)' },
+  ];
+  const results = await Promise.all(targets.map(async t => ({ ...t, r: calcReversalProb(await fetchYahooOHLCV(t.sym, '1d', '6mo')) })));
+  const valid = results.filter(x => x.r);
+  if (!valid.length) { el.innerHTML = '<div class="adv-loading">大盤數據暫時無法取得</div>'; return; }
+
+  el.innerHTML = `
+    <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">🔄 大盤 頂/底反轉可能性</h3>
+    <span style="font-size:0.7rem;color:var(--text3)">依 RSI 極值・連漲跌天數・布林通道・量能綜合評估</span>
+    <div class="er-grid" style="margin-top:12px">
+      ${valid.map(({ label, r }) => {
+        const main = r.top >= r.bottom
+          ? { t: '見頂風險', p: r.top, c: 'var(--bear)', why: r.topWhy }
+          : { t: '見底機會', p: r.bottom, c: 'var(--bull)', why: r.botWhy };
+        const verdict = main.p >= 60 ? '高' : main.p >= 35 ? '中' : '低';
+        return `
+        <div class="er-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="font-size:0.85rem">${label}</strong>
+            <span style="font-family:var(--mono);font-size:0.8rem;color:var(--text2)">${r.price.toLocaleString()}</span>
+          </div>
+          <div style="display:flex;gap:12px;margin-bottom:8px">
+            <div style="flex:1">
+              <div style="display:flex;justify-content:space-between;font-size:0.7rem;margin-bottom:3px"><span style="color:var(--bear)">見頂 ${r.top}%</span></div>
+              <div class="er-bar-track"><div class="er-bar-fill" style="width:${r.top}%;background:var(--bear)"></div></div>
+            </div>
+            <div style="flex:1">
+              <div style="display:flex;justify-content:space-between;font-size:0.7rem;margin-bottom:3px"><span style="color:var(--bull)">見底 ${r.bottom}%</span></div>
+              <div class="er-bar-track"><div class="er-bar-fill" style="width:${r.bottom}%;background:var(--bull)"></div></div>
+            </div>
+          </div>
+          <div style="font-size:0.74rem;color:${main.c};font-weight:600">${main.t}：${verdict}${main.why.length ? '｜' + main.why.join('・') : '（無明顯極端訊號）'}</div>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+// ── AI 機會實驗室 ───────────────────────────────────────────────────────────
+
+function detectLabOpportunities() {
+  const cats = [
+    { key: 'breakout', name: '🚀 突破在即', desc: '股價貼近 20 日高點、量能增溫，突破一觸即發', items: [] },
+    { key: 'oversold', name: '💎 超賣反彈', desc: 'RSI 進入超賣區或觸及布林下軌，短線反彈機會', items: [] },
+    { key: 'momentum', name: '⚡ 動能加速', desc: 'MACD 柱狀圖擴張 + 放量，趨勢正在加速', items: [] },
+    { key: 'accumulate', name: '🏦 主力吸貨', desc: '法人買超但股價尚未大漲，籌碼默默集中', items: [] },
+    { key: 'squeeze', name: '🌀 波動壓縮', desc: '布林通道極度收窄，即將選擇方向（變盤前夕）', items: [] },
+  ];
+
+  for (const s of allStocks) {
+    const a = s.analysis;
+    if (!a || !s.ohlcv?.length) continue;
+    const closes = s.ohlcv.map(d => d.close);
+    const volR = a.volMA ? a.lastVol / a.volMA : 1;
+    const hi20 = Math.max(...s.ohlcv.slice(-20).map(d => d.high));
+    const chg5 = closes.length >= 6 ? (a.price - closes[closes.length - 6]) / closes[closes.length - 6] * 100 : 0;
+
+    if (a.price >= hi20 * 0.98 && a.price < hi20 && volR > 1.1 && a.score >= 55)
+      cats[0].items.push({ s, note: `距 20 日高點 ${((hi20 - a.price) / a.price * 100).toFixed(1)}%｜量比 ${volR.toFixed(1)}` });
+
+    if ((a.rsi != null && a.rsi < 32) || (a.boll && a.price < a.boll.lower * 1.01 && a.rsi < 42))
+      cats[1].items.push({ s, note: `RSI ${a.rsi?.toFixed(0)}${a.boll && a.price < a.boll.lower * 1.01 ? '｜觸及布林下軌' : ''}` });
+
+    if (a.macd?.hist > 0 && volR > 1.5 && a.score >= 60)
+      cats[2].items.push({ s, note: `MACD 柱 +${a.macd.hist.toFixed(2)}｜量比 ${volR.toFixed(1)}` });
+
+    if (s.foreign != null && s.foreign > 500 && Math.abs(chg5) < 2.5)
+      cats[3].items.push({ s, note: `外資 +${s.foreign.toLocaleString()} 張｜5日僅 ${chg5 >= 0 ? '+' : ''}${chg5.toFixed(1)}%` });
+
+    if (a.boll && a.boll.middle && (a.boll.upper - a.boll.lower) / a.boll.middle < 0.055)
+      cats[4].items.push({ s, note: `通道寬 ${((a.boll.upper - a.boll.lower) / a.boll.middle * 100).toFixed(1)}%（極度壓縮）` });
+  }
+  cats.forEach(c => c.items.sort((x, y) => (y.s.analysis?.score || 0) - (x.s.analysis?.score || 0)));
+  return cats;
+}
+
+function renderLab() {
+  const el = document.getElementById('lab-content');
+  if (!el) return;
+  if (!allStocks.some(s => s.analysis)) {
+    el.innerHTML = '<div class="adv-loading">等待掃描完成後分析機會型態...</div>';
+    return;
+  }
+  const cats = detectLabOpportunities();
+  const total = cats.reduce((n, c) => n + c.items.length, 0);
+
+  el.innerHTML = `
+    <div style="margin-bottom:14px;padding:12px 16px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.12);border-radius:10px;font-size:0.84rem;color:var(--text2)">
+      本輪掃描共偵測到 <strong style="color:var(--blue)">${total}</strong> 個特殊型態機會。機會型態不等於進場訊號 — 請點入個股確認 AI 綜合分析與交易建議後再行動。
+    </div>
+    ${cats.map(c => `
+      <div class="adv-section" style="margin-bottom:14px">
+        <div class="adv-section-hdr">
+          ${c.name}
+          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">${c.desc}</span>
+          <span class="tbl-badge" style="margin-left:auto;background:rgba(0,212,255,0.1);color:var(--blue)">${c.items.length}</span>
+        </div>
+        <div class="adv-section-body">
+          ${c.items.length ? `<div class="lab-grid">${c.items.slice(0, 8).map(({ s, note }) => `
+            <div class="lab-card" onclick="openStock('${s.id}')">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+                <strong style="font-size:0.85rem">${s.name} <span style="color:var(--text3);font-size:0.72rem">${s.id}</span></strong>
+                <span class="trend-badge trend-${signalClass(s.analysis.signal)}" style="font-size:0.62rem;padding:1px 7px">${s.analysis.signal}</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span style="font-size:0.73rem;color:var(--text3)">${note}</span>
+                <span style="font-family:var(--mono);font-weight:700;color:${scoreToColor(s.analysis.score)}">${s.analysis.score}</span>
+              </div>
+            </div>`).join('')}</div>`
+          : '<p style="font-size:0.8rem;color:var(--text3)">本輪未偵測到此型態</p>'}
+        </div>
+      </div>`).join('')}`;
+}
+
+// ── 局勢重點（個股頁）───────────────────────────────────────────────────────
+
+function renderSituation(s, inst) {
+  const el = document.getElementById('situation-body');
+  if (!el || !s.analysis) return;
+  const a = s.analysis;
+  const sr = calcSR(s.ohlcv);
+  const norm = outlookData.norm ?? 0;
+  const volR = a.volMA ? a.lastVol / a.volMA : 1;
+
+  const rows = [
+    { icon: '📈', name: '趨勢', txt: a.ema20 > a.ema50 && a.price > a.ema20 ? '多頭排列，價格站上均線，順勢偏多' : a.ema20 < a.ema50 && a.price < a.ema20 ? '空頭排列，價格壓在均線下，避免逆勢' : '均線糾結，方向未明，等待表態',
+      c: a.ema20 > a.ema50 && a.price > a.ema20 ? 'var(--bull)' : a.ema20 < a.ema50 && a.price < a.ema20 ? 'var(--bear)' : 'var(--yellow)' },
+    { icon: '⚡', name: '動能', txt: `RSI ${a.rsi?.toFixed(0)}・MACD ${a.macd?.macd > a.macd?.signal ? '金叉' : '死叉'}・量比 ${volR.toFixed(1)}x — ${a.rsi > 60 && a.macd?.macd > a.macd?.signal ? '動能強勁' : a.rsi < 40 ? '動能疲弱' : '動能中性'}`,
+      c: a.rsi > 60 && a.macd?.macd > a.macd?.signal ? 'var(--bull)' : a.rsi < 40 ? 'var(--bear)' : 'var(--text2)' },
+    { icon: '🏦', name: '籌碼', txt: inst ? `外資 ${inst.foreign >= 0 ? '+' : ''}${inst.foreign} 張・投信 ${inst.investment >= 0 ? '+' : ''}${inst.investment} 張 — ${inst.total >= 0 ? '法人站買方' : '法人站賣方'}` : '法人資料載入中（TWSE 收盤後更新）',
+      c: inst ? (inst.total >= 0 ? 'var(--bull)' : 'var(--bear)') : 'var(--text3)' },
+    { icon: '🌡', name: '情緒', txt: `大盤多空總覽 ${norm >= 0 ? '+' : ''}${Math.round(norm)} 分 — ${norm >= 15 ? '市場偏多，順風環境' : norm <= -15 ? '市場偏空，做多逆風' : '市場中性，個股表現分化'}`,
+      c: norm >= 15 ? 'var(--bull)' : norm <= -15 ? 'var(--bear)' : 'var(--yellow)' },
+    { icon: '🎯', name: '關鍵位', txt: `支撐 ${sr.supports[0]?.toFixed(2) ?? '--'}｜壓力 ${sr.resistances[0]?.toFixed(2) ?? '--'}｜${sr.resistances[0] ? '突破壓力看多、' : ''}${sr.supports[0] ? '跌破支撐立即避險' : ''}`,
+      c: 'var(--blue)' },
+  ];
+  el.innerHTML = rows.map(r => `
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.04)">
+      <span style="font-size:1rem">${r.icon}</span>
+      <div style="flex:1">
+        <span style="font-size:0.72rem;font-weight:700;color:var(--text3);margin-right:8px">${r.name}</span>
+        <span style="font-size:0.82rem;color:${r.c};line-height:1.6">${r.txt}</span>
+      </div>
+    </div>`).join('');
+}
+
+// ── 買賣壓力分析（訂單流台股版）─────────────────────────────────────────────
+
+function renderOrderFlow(s) {
+  const el = document.getElementById('of-body');
+  if (!el || !s.ohlcv?.length) return;
+  const bars = s.ohlcv.slice(-20);
+
+  // 每日買賣壓：收盤在當日區間的位置 × 成交量（收在高檔=買方主導）
+  let buyVol = 0, sellVol = 0;
+  const daily = bars.slice(-5).map(b => {
+    const range = b.high - b.low || 1;
+    const buyRatio = (b.close - b.low) / range;
+    return { time: b.time.slice(5), delta: Math.round(b.volume * (buyRatio * 2 - 1)), vol: b.volume };
+  });
+  for (const b of bars) {
+    const range = b.high - b.low || 1;
+    const br = (b.close - b.low) / range;
+    buyVol += b.volume * br;
+    sellVol += b.volume * (1 - br);
+  }
+  const buyPct = Math.round(buyVol / (buyVol + sellVol) * 100);
+  const cumDelta = daily.reduce((s2, d) => s2 + d.delta, 0);
+  const maxD = Math.max(...daily.map(d => Math.abs(d.delta)), 1);
+
+  const verdict = buyPct >= 58 ? { t: '🟢 買方明顯主導 — 20 日內買壓持續強於賣壓，籌碼趨於安定', c: 'var(--bull)' }
+                : buyPct <= 42 ? { t: '🔴 賣方明顯主導 — 賣壓沉重，反彈易遭調節，不宜接刀', c: 'var(--bear)' }
+                : { t: '🟡 買賣力道均衡 — 多空拉鋸，跟隨關鍵位操作', c: 'var(--yellow)' };
+
+  el.innerHTML = `
+    <div style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;font-size:0.75rem;margin-bottom:5px">
+        <span style="color:var(--bull);font-weight:700">買方 ${buyPct}%</span>
+        <span style="color:var(--bear);font-weight:700">賣方 ${100 - buyPct}%</span>
+      </div>
+      <div style="height:12px;border-radius:6px;overflow:hidden;display:flex">
+        <div style="width:${buyPct}%;background:var(--bull);opacity:0.85"></div>
+        <div style="flex:1;background:var(--bear);opacity:0.85"></div>
+      </div>
+      <div style="font-size:0.68rem;color:var(--text3);margin-top:4px">依近 20 日收盤位置 × 成交量估算內外盤力道</div>
+    </div>
+    <div class="fund-block-ttl">近 5 日 Delta（買賣壓差）</div>
+    <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px;margin-bottom:12px">
+      ${daily.map(d => `
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:0.68rem;color:var(--text3);width:38px;font-family:var(--mono)">${d.time}</span>
+          <div style="flex:1;height:8px;background:rgba(255,255,255,0.05);border-radius:4px;position:relative;overflow:hidden">
+            <div style="position:absolute;top:0;height:100%;${d.delta >= 0 ? 'left:50%' : 'right:50%'};width:${Math.abs(d.delta) / maxD * 48}%;background:${d.delta >= 0 ? 'var(--bull)' : 'var(--bear)'};border-radius:4px"></div>
+          </div>
+          <span style="font-size:0.68rem;font-family:var(--mono);width:64px;text-align:right;color:${d.delta >= 0 ? 'var(--bull)' : 'var(--bear)'}">${d.delta >= 0 ? '+' : ''}${fmtVol(Math.abs(d.delta))}</span>
+        </div>`).join('')}
+    </div>
+    <div style="padding:10px 14px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.83rem;font-weight:600;color:${verdict.c}">
+      ${verdict.t}｜5 日累計 Delta ${cumDelta >= 0 ? '+' : ''}${fmtVol(Math.abs(cumDelta))}
+    </div>`;
+}
+
+// ── 籌碼分佈 Volume Profile（個股頁）────────────────────────────────────────
+
+function renderVolumeProfile(s) {
+  const el = document.getElementById('vp-body');
+  if (!el || !s.ohlcv?.length) return;
+  const ohlcv = s.ohlcv;
+  const price = s.analysis?.price ?? ohlcv[ohlcv.length - 1].close;
+  const lo = Math.min(...ohlcv.map(d => d.low));
+  const hi = Math.max(...ohlcv.map(d => d.high));
+  const N = 12;
+  const step = (hi - lo) / N || 1;
+  const bins = Array.from({ length: N }, (_, i) => ({ lo: lo + i * step, hi: lo + (i + 1) * step, vol: 0 }));
+  for (const b of ohlcv) {
+    const mid = (b.high + b.low) / 2;
+    bins[Math.min(N - 1, Math.max(0, Math.floor((mid - lo) / step)))].vol += b.volume;
+  }
+  const maxVol = Math.max(...bins.map(b => b.vol), 1);
+  const poc = bins.reduce((best, b) => b.vol > best.vol ? b : best, bins[0]);
+  const pocMid = (poc.lo + poc.hi) / 2;
+  const analysis = price > poc.hi
+    ? { t: `股價位於 POC（${pocMid.toFixed(1)}）之上 — 下方密集成交帶轉為支撐，回踩 ${poc.hi.toFixed(1)} 附近有承接力`, c: 'var(--bull)' }
+    : price < poc.lo
+    ? { t: `股價位於 POC（${pocMid.toFixed(1)}）之下 — 上方密集帶是大量套牢區，反彈至 ${poc.lo.toFixed(1)} 附近賣壓沉重`, c: 'var(--bear)' }
+    : { t: `股價正處於 POC 密集帶內（${poc.lo.toFixed(1)}~${poc.hi.toFixed(1)}）— 多空換手激烈，突破方向將決定下一段行情`, c: 'var(--yellow)' };
+
+  el.innerHTML = `
+    <div style="display:flex;flex-direction:column-reverse;gap:3px;margin-bottom:12px">
+      ${bins.map(b => {
+        const isPoc = b === poc;
+        const inBar = price >= b.lo && price < b.hi;
+        return `
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:0.65rem;font-family:var(--mono);color:${inBar ? 'var(--blue)' : 'var(--text3)'};width:56px;text-align:right;${inBar ? 'font-weight:700' : ''}">${b.lo.toFixed(1)}${inBar ? ' ◀' : ''}</span>
+          <div style="flex:1;height:12px;background:rgba(255,255,255,0.03);border-radius:3px;overflow:hidden">
+            <div style="height:100%;width:${(b.vol / maxVol * 100).toFixed(0)}%;background:${isPoc ? 'var(--blue)' : 'rgba(0,212,255,0.3)'};border-radius:3px"></div>
+          </div>
+          <span style="font-size:0.62rem;color:var(--text3);width:52px">${isPoc ? 'POC ★' : fmtVol(b.vol)}</span>
+        </div>`;
+      }).join('')}
+    </div>
+    <div style="padding:10px 14px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.82rem;font-weight:600;color:${analysis.c};line-height:1.6">${analysis.t}</div>`;
+}
+
+// ── 10 因子 AI 風險評估（個股頁）────────────────────────────────────────────
+
+function renderFullRisk(s, inst) {
+  const el = document.getElementById('full-risk-body');
+  if (!el || !s.analysis) return;
+  const a = s.analysis;
+  const closes = s.ohlcv.map(d => d.close);
+  const volR = a.volMA ? a.lastVol / a.volMA : 1;
+  const norm = outlookData.norm ?? 0;
+  // ATR%（14日平均振幅）
+  const tr14 = s.ohlcv.slice(-14).map(d => (d.high - d.low) / d.close * 100);
+  const atrPct = tr14.reduce((x, y) => x + y, 0) / tr14.length;
+  const dev20 = a.ema20 ? Math.abs(a.price - a.ema20) / a.ema20 * 100 : 0;
+  const hi60 = Math.max(...s.ohlcv.slice(-60).map(d => d.high));
+  const lo60 = Math.min(...s.ohlcv.slice(-60).map(d => d.low));
+  const posIn60 = (a.price - lo60) / (hi60 - lo60 || 1);
+  const turnover = a.price * a.lastVol;
+
+  const factors = [
+    { n: '趨勢方向', r: a.ema20 > a.ema50 && a.price > a.ema20 ? 2 : a.ema20 < a.ema50 && a.price < a.ema20 ? 8 : 5, note: a.ema20 > a.ema50 ? '多頭排列' : '均線壓制' },
+    { n: 'RSI 位置', r: a.rsi >= 50 && a.rsi < 68 ? 2 : a.rsi >= 78 || a.rsi < 25 ? 9 : a.rsi >= 68 || a.rsi < 35 ? 6 : 4, note: `RSI ${a.rsi?.toFixed(0)}` },
+    { n: '波動率', r: atrPct < 2 ? 2 : atrPct < 3.5 ? 5 : 8, note: `日均振幅 ${atrPct.toFixed(1)}%` },
+    { n: '量能異常', r: volR > 3 ? 8 : volR > 1.5 ? 4 : volR < 0.5 ? 6 : 3, note: `量比 ${volR.toFixed(1)}x` },
+    { n: '均線乖離', r: dev20 < 3 ? 2 : dev20 < 6 ? 5 : 8, note: `距 EMA20 ${dev20.toFixed(1)}%` },
+    { n: '大盤環境', r: norm >= 15 ? 2 : norm >= -15 ? 5 : 9, note: `多空總覽 ${Math.round(norm)}` },
+    { n: '法人動向', r: inst ? (inst.total > 0 ? 3 : 7) : 5, note: inst ? (inst.total > 0 ? '法人買超' : '法人賣超') : '待更新' },
+    { n: '流動性', r: turnover > 1e9 ? 2 : turnover > 2e8 ? 4 : 7, note: `日成交值 ${fmtVol(turnover)}` },
+    { n: '位置風險', r: posIn60 > 0.9 ? 7 : posIn60 < 0.15 ? 6 : posIn60 > 0.6 ? 4 : 3, note: `60日區間 ${(posIn60 * 100).toFixed(0)}% 位置` },
+    { n: '訊號一致性', r: a.score >= 70 || a.score <= 30 ? 3 : 6, note: a.score >= 70 || a.score <= 30 ? '指標方向一致' : '指標分歧' },
+  ];
+  const avg = factors.reduce((x, f) => x + f.r, 0) / factors.length;
+  const overall = avg <= 3.5 ? { t: '整體風險：低', c: 'var(--bull)' } : avg <= 5.5 ? { t: '整體風險：中', c: 'var(--yellow)' } : { t: '整體風險：高', c: 'var(--bear)' };
+
+  el.innerHTML = `
+    <div class="adv-section">
+      <div class="adv-section-hdr">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        10 因子 AI 風險評估
+        <span style="margin-left:auto;font-size:0.78rem;font-weight:700;color:${overall.c}">${overall.t}（${avg.toFixed(1)}/10）</span>
+      </div>
+      <div class="adv-section-body">
+        <div class="risk10-grid">
+          ${factors.map(f => {
+            const c = f.r <= 3 ? 'var(--bull)' : f.r <= 5 ? 'var(--yellow)' : 'var(--bear)';
+            return `
+            <div class="risk10-item">
+              <div style="display:flex;justify-content:space-between;font-size:0.73rem;margin-bottom:4px">
+                <span style="color:var(--text2)">${f.n}</span>
+                <span style="color:${c};font-family:var(--mono);font-weight:700">${f.r}/10</span>
+              </div>
+              <div style="height:5px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden">
+                <div style="height:100%;width:${f.r * 10}%;background:${c};border-radius:3px"></div>
+              </div>
+              <div style="font-size:0.66rem;color:var(--text3);margin-top:3px">${f.note}</div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+// ── 每日市場簡報（手動觸發 Telegram）────────────────────────────────────────
+
+function manualSendDailyBriefing() {
+  if (localStorage.getItem('tg-enabled') !== 'true' || !localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) {
+    showToast('請先啟用並設定 Telegram Bot', 'error'); return;
+  }
+  if (!allStocks.some(s => s.analysis)) { showToast('請先等掃描完成', 'error'); return; }
+
+  const norm = outlookData.norm ?? 0;
+  const mkt = norm >= 15 ? '📈 偏多' : norm <= -15 ? '📉 偏空' : '➡️ 中性';
+  const { daily } = computeFocusStocks();
+  const dLines = daily.slice(0, 5).map((f, i) => `${i + 1}. ${f.s.name}(${f.s.id}) ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
+  const now = new Date();
+  const events = getUpcomingEvents().slice(0, 3).map(e => {
+    const days = Math.ceil((e.date - now) / 86400000);
+    return `・${e.name}（${days <= 0 ? '今日' : days + '天後'}）`;
+  }).join('\n');
+  const bulls = allStocks.filter(s => s.analysis?.score >= getThreshold('bull')).length;
+  const bears = allStocks.filter(s => s.analysis && s.analysis.score <= getThreshold('bear')).length;
+
+  tgPush(`📊 台股雷達 每日市場簡報\n${now.toLocaleDateString('zh-TW')}\n\n🌡 大盤環境：${mkt}（多空總覽 ${Math.round(norm)} 分）\n市場寬度：多頭 ${bulls} 檔 / 空頭 ${bears} 檔\n\n⭐ 今日重點關注\n${dLines}\n\n🗓 即將公布\n${events}\n\n⚠ 僅供參考，非投資建議`);
 }
 
 // ── 策略歷史回測 ────────────────────────────────────────────────────────────
