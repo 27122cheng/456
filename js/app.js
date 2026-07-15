@@ -118,6 +118,27 @@ async function startScan() {
   }
   await Promise.all(Array.from({ length: 5 }, scanWorker));
 
+  // 第一輪失敗的個股再重試一次（免費 proxy 偶發逾時很常見，重試通常就會成功）
+  const failed = allStocks.filter(s => !s.ohlcv?.length);
+  if (failed.length) {
+    setScanProgress(99, `重試 ${failed.length} 檔載入失敗個股...`);
+    for (const s of failed) {
+      try {
+        const ohlcv = await fetchStockOHLCV(s.id, currentTF, currentTF === '1d' ? '6mo' : '2y');
+        s.ohlcv = ohlcv;
+        if (ohlcv.length >= 20) {
+          s.analysis = calculateScore(ohlcv);
+          s.reversal = detectReversal(ohlcv, s.analysis);
+        }
+      } catch {}
+    }
+    renderDashboard();
+    const still = allStocks.filter(s => !s.ohlcv?.length);
+    if (still.length) {
+      showToast(`⚠ ${still.length} 檔資料載入失敗：${still.slice(0, 5).map(x => x.name).join('、')}${still.length > 5 ? '…' : ''}（下輪自動重試）`, 'error');
+    }
+  }
+
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
   document.getElementById('last-updated').textContent = new Date().toLocaleTimeString('zh-TW');
@@ -1412,6 +1433,20 @@ async function loadInstitutionalOverview() {
     if (m) { s.foreign = m.foreign; s.investment = m.investment; s.dealer = m.dealer; s.instTotal = m.total; }
   });
 
+  // 逐日累積個股法人真實歷史（個股頁 5 日籌碼趨勢用真實數據取代模擬）
+  try {
+    const hist = JSON.parse(localStorage.getItem('inst-hist') || '{}');
+    const dataDate = localStorage.getItem('t86-last-date') || new Date().toISOString().slice(0, 10);
+    allStocks.forEach(s => {
+      const m = instMap[s.id];
+      if (!m) return;
+      const arr = hist[s.id] = hist[s.id] || [];
+      if (!arr.some(r => r.d === dataDate)) arr.push({ d: dataDate, f: m.foreign, i: m.investment, dl: m.dealer });
+      if (arr.length > 10) hist[s.id] = arr.slice(-10);
+    });
+    localStorage.setItem('inst-hist', JSON.stringify(hist));
+  } catch {}
+
   outlookData.instTotal = { foreign, investment, dealer, total };
   renderMarketOutlook();
 
@@ -1591,6 +1626,9 @@ async function openStock(stockId) {
 
   if (!s.analysis) {
     document.getElementById('stock-price').textContent = '無法載入';
+    const aab = document.getElementById('ai-anal-body');
+    if (aab) aab.innerHTML = `<div class="adv-loading">個股資料載入失敗（資料來源逾時，或代號不存在/已下市）<br>
+      <button class="btn-ghost" style="margin-top:10px;padding:6px 16px" onclick="openStock('${stockId}')">🔄 重新載入</button></div>`;
     return;
   }
 
@@ -1705,7 +1743,7 @@ function renderStockDetail(s) {
         <div class="setup-item">
           <div class="setup-lbl">止損</div>
           <div class="setup-val" style="color:var(--bear)">${setup.stopLoss.toFixed(2)}</div>
-          <div class="setup-note">近5日低點 -1%</div>
+          <div class="setup-note">近5日低點 ×${setup.stopAdj}（風控學習自動調整）</div>
         </div>
         <div class="setup-item">
           <div class="setup-lbl">目標一 (2R)</div>
@@ -1718,6 +1756,15 @@ function renderStockDetail(s) {
           <div class="setup-note">延伸目標</div>
         </div>
       </div>
+      ${setup.atr ? (() => {
+        const atrRatio = setup.risk / setup.atr;
+        const diag = atrRatio < 1 ? { t: '偏緊 — 日常波動就可能掃到止損', c: 'var(--yellow)' }
+                   : atrRatio > 3 ? { t: '偏寬 — 單筆虧損風險較大，留意倉位', c: 'var(--yellow)' }
+                   : { t: '鬆緊適中', c: 'var(--bull)' };
+        return `<div style="margin-top:10px;padding:8px 12px;background:rgba(255,255,255,0.02);border-radius:8px;font-size:0.76rem;color:var(--text3)">
+          波動參考：ATR(14) ≈ ${setup.atr.toFixed(2)}（每日約 ${(setup.atr / setup.entry * 100).toFixed(1)}%）｜止損距離 ${(setup.risk / setup.entry * 100).toFixed(1)}% ≈ <strong style="color:${diag.c}">${atrRatio.toFixed(1)}×ATR（${diag.t}）</strong>
+        </div>`;
+      })() : ''}
       <p style="font-size:0.78rem;color:var(--text3);margin-top:12px">⚠ 以上為技術分析參考，非投資建議。投資涉及風險，請自行判斷。</p>`;
   } else {
     document.getElementById('setup-body').innerHTML = '<p style="color:var(--text3);font-size:0.85rem">數據不足，無法生成交易建議</p>';
@@ -1892,33 +1939,40 @@ async function renderAnalysisPanels(s, inst) {
   const sector = meta.sector || '其他';
   const rng = srng(idSeed(s.id));
 
-  // Try Yahoo quoteSummary for real fundamentals（memo：同一檔不重複抓）
-  let fd = null;
-  if (s._fd !== undefined) {
+  // 真實基本面：v7 quote（優先）→ quoteSummary（備援）→ 模擬估算（明確標示）
+  let fd = s._fd;
+  if (fd === undefined) {
+    fd = await fetchQuoteInfo(s.id).catch(() => null);
+    if (!fd) {
+      try {
+        const suffix = localStorage.getItem(`sym-suffix:${s.id}`) === 'TWO' ? 'TWO' : 'TW';
+        const raw = await proxyFetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${s.id}.${suffix}?modules=defaultKeyStatistics,summaryDetail`, 8000);
+        const r0 = raw?.quoteSummary?.result?.[0];
+        if (r0) fd = {
+          pe: r0.summaryDetail?.trailingPE?.raw ?? r0.defaultKeyStatistics?.forwardPE?.raw ?? null,
+          pb: r0.defaultKeyStatistics?.priceToBook?.raw ?? null,
+          divYield: r0.summaryDetail?.dividendYield?.raw ?? null,
+          eps: r0.defaultKeyStatistics?.trailingEps?.raw ?? null,
+          marketCap: r0.summaryDetail?.marketCap?.raw ?? null,
+          high52: r0.summaryDetail?.fiftyTwoWeekHigh?.raw ?? null,
+          low52: r0.summaryDetail?.fiftyTwoWeekLow?.raw ?? null,
+        };
+      } catch {}
+    }
+    s._fd = fd || null;
     fd = s._fd;
-  } else {
-    try {
-      const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${s.id}.TW?modules=defaultKeyStatistics,summaryDetail`;
-      const raw = await proxyFetch(url, 8000);
-      fd = raw?.quoteSummary?.result?.[0] || null;
-    } catch {}
-    s._fd = fd;
   }
+  const isRealFd = !!(fd && (fd.pe != null || fd.pb != null || fd.divYield != null));
 
-  const pe = fd?.defaultKeyStatistics?.forwardPE?.raw ?? fd?.summaryDetail?.trailingPE?.raw ?? +(8 + rng()*22).toFixed(1);
-  const pb = fd?.defaultKeyStatistics?.priceToBook?.raw ?? +(0.8 + rng()*3.5).toFixed(2);
-  const divYield = fd?.summaryDetail?.dividendYield?.raw ?? +(0.025 + rng()*0.055).toFixed(4);
+  const pe = fd?.pe ?? +(8 + rng()*22).toFixed(1);
+  const pb = fd?.pb ?? +(0.8 + rng()*3.5).toFixed(2);
+  const divYield = fd?.divYield ?? +(0.025 + rng()*0.055).toFixed(4);
 
-  const qLabels = ['Q1/25','Q2/25','Q3/25','Q4/25'];
-  const baseRev = 5000 + rng() * 45000;
-  const q4 = qLabels.map(() => ({
-    rev: Math.round(baseRev * (0.85 + rng()*0.3)),
-    gm: +(22 + rng()*28).toFixed(1),
-    eps: +(0.3 + rng()*5).toFixed(2),
-  }));
-
-  const moatScore = Math.round(1 + rng()*4);
-  const mgmtScore = Math.round(2 + rng()*3);
+  // 護城河改以真實市值分級（市值 = 規模 + 產業地位的粗略代理），無市值才用估算
+  const capB = fd?.marketCap ? fd.marketCap / 1e8 : null; // 億元
+  const moatScore = capB != null
+    ? (capB >= 10000 ? 5 : capB >= 3000 ? 4 : capB >= 1000 ? 3 : capB >= 300 ? 2 : 1)
+    : Math.round(1 + rng()*4);
   const yieldPct = (divYield * 100).toFixed(2);
   const annualIncome = Math.round(100000 * divYield);
   const peN = +pe, pbN = +pb;
@@ -1926,22 +1980,55 @@ async function renderAnalysisPanels(s, inst) {
   const pbColor  = pbN<1.5 ? 'var(--bull)' : pbN<3 ? 'var(--blue)' : 'var(--bear)';
   const yldColor = divYield>0.05 ? 'var(--bull)' : divYield>0.03 ? 'var(--blue)' : 'var(--text2)';
   const moatDescs = ['護城河薄弱','競爭優勢有限','具一定品牌優勢','強健技術/品牌壁壘','行業主導者'];
-  const mgmtDescs = ['治理存疑','管理層普通','管理層良好','優秀資本配置','頂級長期導向'];
+  const fdBadge = isRealFd
+    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 即時數據 Yahoo</span>'
+    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（真實數據暫時無法取得）</span>';
 
-  document.getElementById('fund-body').innerHTML = `
-    <div class="fund-cols">
+  // 52 週價格位置（真實數據才顯示）
+  let range52Html = '';
+  if (fd?.high52 && fd?.low52 && fd.high52 > fd.low52) {
+    const pos52 = Math.max(0, Math.min(100, (a.price - fd.low52) / (fd.high52 - fd.low52) * 100));
+    range52Html = `
+      <div class="fund-block" style="margin-top:10px">
+        <div class="fund-block-ttl">52 週價格區間</div>
+        <div style="display:flex;justify-content:space-between;font-size:0.72rem;font-family:var(--mono);margin:6px 0 4px"><span style="color:var(--bull)">${fd.low52.toFixed(2)}</span><span style="color:var(--text2)">現價 ${a.price.toFixed(2)}（${pos52.toFixed(0)}%）</span><span style="color:var(--bear)">${fd.high52.toFixed(2)}</span></div>
+        <div style="height:6px;border-radius:3px;background:linear-gradient(90deg,var(--bull),var(--yellow),var(--bear));position:relative">
+          <div style="position:absolute;top:-3px;left:${pos52}%;width:3px;height:12px;background:var(--text1);border-radius:2px;transform:translateX(-50%)"></div>
+        </div>
+      </div>`;
+  }
+
+  const keyStatsHtml = isRealFd ? `
       <div class="fund-block">
-        <div class="fund-block-ttl">近四季財務數據</div>
+        <div class="fund-block-ttl">關鍵財務數據</div>
+        <table class="qt-table">
+          <tbody>
+            <tr><td style="color:var(--text3)">近四季 EPS (TTM)</td><td class="${fd.eps > 0 ? 'qt-pos' : 'qt-neg'}">${fd.eps != null ? fd.eps.toFixed(2) + ' 元' : '--'}</td></tr>
+            <tr><td style="color:var(--text3)">市值</td><td>${capB != null ? (capB >= 10000 ? (capB/10000).toFixed(2) + ' 兆' : capB.toFixed(0) + ' 億') : '--'}</td></tr>
+            <tr><td style="color:var(--text3)">EPS 回推年獲利力</td><td>${fd.eps != null && fd.eps > 0 ? '每股 ' + fd.eps.toFixed(2) + ' 元／P/E ' + peN.toFixed(1) + 'x' : '--'}</td></tr>
+          </tbody>
+        </table>
+        ${range52Html}
+      </div>` : `
+      <div class="fund-block">
+        <div class="fund-block-ttl">近四季財務數據 <span style="font-size:0.6rem;color:var(--yellow)">模擬示意</span></div>
         <table class="qt-table">
           <thead><tr><th>季度</th><th>營收(百萬)</th><th>毛利率</th><th>EPS</th></tr></thead>
-          <tbody>${q4.map((q,i) => `<tr>
-            <td style="color:var(--text3)">${qLabels[i]}</td>
-            <td>${(q.rev/1000).toFixed(0)}M</td>
-            <td class="${q.gm>30?'qt-pos':q.gm<20?'qt-neg':''}">${q.gm}%</td>
-            <td class="${q.eps>1?'qt-pos':'qt-neg'}">${q.eps}</td>
-          </tr>`).join('')}</tbody>
+          <tbody>${['Q1/25','Q2/25','Q3/25','Q4/25'].map(qL => {
+            const gm = +(22 + rng()*28).toFixed(1), eps = +(0.3 + rng()*5).toFixed(2);
+            return `<tr>
+            <td style="color:var(--text3)">${qL}</td>
+            <td>${((5000 + rng()*45000)/1000).toFixed(0)}M</td>
+            <td class="${gm>30?'qt-pos':gm<20?'qt-neg':''}">${gm}%</td>
+            <td class="${eps>1?'qt-pos':'qt-neg'}">${eps}</td>
+          </tr>`;}).join('')}</tbody>
         </table>
-      </div>
+      </div>`;
+
+  document.getElementById('fund-body').innerHTML = `
+    <div style="margin-bottom:8px">${fdBadge}</div>
+    <div class="fund-cols">
+      ${keyStatsHtml}
       <div>
         <div class="fund-block" style="margin-bottom:10px">
           <div class="fund-block-ttl">估值指標</div>
@@ -1952,13 +2039,12 @@ async function renderAnalysisPanels(s, inst) {
           </div>
         </div>
         <div class="moat-grid">
-          <div class="moat-item"><div class="moat-lbl">護城河評估</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
-          <div class="moat-item"><div class="moat-lbl">管理層素質</div><div class="moat-stars">${'★'.repeat(mgmtScore)+'☆'.repeat(5-mgmtScore)}</div><div class="moat-desc">${mgmtDescs[mgmtScore-1]}</div></div>
+          <div class="moat-item"><div class="moat-lbl">護城河評估${capB != null ? '（依市值規模）' : ''}</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
         </div>
       </div>
     </div>
     <div style="margin-top:12px">
-      <div class="fund-block-ttl">配息試算（投入 10 萬元）</div>
+      <div class="fund-block-ttl">配息試算（投入 10 萬元${isRealFd ? '，依實際年化殖利率' : ''}）</div>
       <div class="div-calc">
         <div class="div-calc-row"><span>年殖利率</span><span style="font-family:var(--mono);color:${yldColor}">${yieldPct}%</span></div>
         <div class="div-calc-row"><span>預估年配息</span><div><span class="div-calc-big">+${annualIncome.toLocaleString()}</span><span style="font-size:0.78rem;color:var(--text3)"> 元</span></div></div>
@@ -1967,13 +2053,26 @@ async function renderAnalysisPanels(s, inst) {
     </div>`;
 
   // ── Render 籌碼面 ──────────────────────────────────────────────
-  const inst5 = Array.from({length:5}, (_, i) => ({
-    label: `D-${4-i}`,
-    foreign: Math.round((500+rng()*5000) * (rng()>0.4?1:-1)),
-    invest:  Math.round((100+rng()*2000) * (rng()>0.5?1:-1)),
-    dealer:  Math.round((50+rng()*800)   * (rng()>0.5?1:-1)),
-  }));
-  if (inst) { inst5[4].foreign = inst.foreign; inst5[4].invest = inst.investment; inst5[4].dealer = inst.dealer; }
+  // 優先用逐日累積的真實法人歷史（inst-hist），不足 5 天的舊日子以模擬示意補齊
+  let instHist = [];
+  try { instHist = (JSON.parse(localStorage.getItem('inst-hist') || '{}')[s.id] || []).slice(-5); } catch {}
+  const realDays = instHist.length;
+  const inst5 = [];
+  for (let i = 0; i < 5 - realDays; i++) {
+    inst5.push({
+      label: `D-${4 - i}`,
+      foreign: Math.round((500+rng()*5000) * (rng()>0.4?1:-1)),
+      invest:  Math.round((100+rng()*2000) * (rng()>0.5?1:-1)),
+      dealer:  Math.round((50+rng()*800)   * (rng()>0.5?1:-1)),
+    });
+  }
+  instHist.forEach(r => inst5.push({ label: r.d.slice(5), foreign: r.f, invest: r.i, dealer: r.dl }));
+  if (inst && !realDays) { inst5[4].foreign = inst.foreign; inst5[4].invest = inst.investment; inst5[4].dealer = inst.dealer; }
+  const chipBadge = realDays >= 5
+    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 真實數據 TWSE</span>'
+    : realDays > 0
+      ? `<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(0,212,255,0.1);color:var(--blue)">累積真實數據中 ${realDays}/5 日（其餘為模擬示意）</span>`
+      : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬示意（真實歷史自今日起逐日累積）</span>';
 
   const maxFlow = Math.max(...inst5.flatMap(d => [Math.abs(d.foreign),Math.abs(d.invest),Math.abs(d.dealer)]), 1);
   function chipBarHtml(val) {
@@ -1986,7 +2085,7 @@ async function renderAnalysisPanels(s, inst) {
 
   document.getElementById('chip-body').innerHTML = `
     <div>
-      <div class="fund-block-ttl">5日三大法人買賣超趨勢</div>
+      <div class="fund-block-ttl">5日三大法人買賣超趨勢 ${chipBadge}</div>
       <div style="display:grid;grid-template-columns:36px 1fr 1fr 1fr;gap:5px;align-items:center;margin-top:8px">
         <div></div>
         <div style="text-align:center;font-size:0.68rem;color:var(--text3)">外資</div>
@@ -2060,15 +2159,46 @@ async function renderAnalysisPanels(s, inst) {
   // ── Render 市場面 ──────────────────────────────────────────────
   const closes = ohlcv.map(d => d.close);
   const ret20 = ohlcv.length>=21 ? ((closes[closes.length-1]-closes[closes.length-21])/closes[closes.length-21]*100).toFixed(1) : '0.0';
-  const beta = +(0.6 + rng()*1.0).toFixed(2);
-  const corr = +(0.4 + rng()*0.5).toFixed(2);
-  const mktRet = +(rng()*8-3).toFixed(1);
+
+  // 真實 Beta / 相關性 / 大盤報酬：與加權指數近 60 日日報酬計算（TWII 有快取，成本低）
+  let beta = null, corr = null, mktRet20 = null;
+  try {
+    const twiiBars = await fetchYahooOHLCV('^TWII', '1d', '6mo');
+    if (twiiBars?.length >= 30 && ohlcv.length >= 30) {
+      const idxMap = new Map(twiiBars.map(b => [b.time, b.close]));
+      const pairs = [];
+      for (let i = 1; i < ohlcv.length; i++) {
+        const m0 = idxMap.get(ohlcv[i-1].time), m1 = idxMap.get(ohlcv[i].time);
+        if (m0 && m1) pairs.push([ohlcv[i].close / ohlcv[i-1].close - 1, m1 / m0 - 1]);
+      }
+      const p = pairs.slice(-60);
+      if (p.length >= 20) {
+        const mean = arr => arr.reduce((x, y) => x + y, 0) / arr.length;
+        const sm = mean(p.map(x => x[0])), mm = mean(p.map(x => x[1]));
+        let cov = 0, vs = 0, vm = 0;
+        for (const [rStk, rMkt] of p) { cov += (rStk-sm)*(rMkt-mm); vs += (rStk-sm)**2; vm += (rMkt-mm)**2; }
+        if (vm > 0) beta = +(cov / vm).toFixed(2);
+        if (vs > 0 && vm > 0) corr = +(cov / Math.sqrt(vs * vm)).toFixed(2);
+      }
+      const tc = twiiBars.map(b => b.close);
+      if (tc.length >= 21) mktRet20 = +((tc[tc.length-1] - tc[tc.length-21]) / tc[tc.length-21] * 100).toFixed(1);
+    }
+  } catch {}
+  const isRealMkt = beta != null;
+  if (beta == null) beta = +(0.6 + rng()*1.0).toFixed(2);
+  if (corr == null) corr = +(0.4 + rng()*0.5).toFixed(2);
+  const mktRet = mktRet20 ?? +(rng()*8-3).toFixed(1);
+
   const rs = (+ret20 - +mktRet).toFixed(1);
   const rsN = +rs;
   const rsColor = rsN>3 ? 'var(--bull)' : rsN<-3 ? 'var(--bear)' : 'var(--text2)';
   const rsLabel = rsN>5?'顯著強於大盤':rsN>1?'優於大盤':rsN<-5?'顯著弱於大盤':rsN<-1?'弱於大盤':'與大盤持平';
+  const mktBadge = isRealMkt
+    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 實測（近60日 vs 加權指數）</span>'
+    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（大盤數據暫時無法取得）</span>';
 
   document.getElementById('mkt-body').innerHTML = `
+    <div style="margin-bottom:8px">${mktBadge}</div>
     <div class="mkt-grid">
       <div class="mkt-item">
         <div class="mkt-lbl">20日相對強弱</div>
@@ -2128,7 +2258,12 @@ async function renderAnalysisPanels(s, inst) {
     { txt:`評分 ${a.score}/100`, cls: a.score>=65?'bull':a.score<=40?'bear':'neutral' },
     { txt:`P/E ${peN.toFixed(1)}x ${peN<15?'低估值':peN>25?'偏貴':'合理'}`, cls: peN<15?'bull':peN>25?'bear':'neutral' },
     { txt:`殖利率 ${yieldPct}%`, cls: divYield>0.05?'bull':divYield>0.03?'neutral':'neutral' },
-    { txt:`法人5日 ${gTotal>=0?'淨買超':'淨賣超'}`, cls: gTotal>=0?'bull':'bear' },
+    (() => {
+      // 只用真實法人數據判多空：有累積歷史用累積、否則用今日、都沒有標中性
+      const realFlow = realDays ? instHist.reduce((sum, r) => sum + r.f + r.i + r.dl, 0) : (inst ? inst.total : null);
+      if (realFlow == null) return { txt: '法人動向 資料累積中', cls: 'neutral' };
+      return { txt: `法人${realDays > 1 ? realDays + '日' : '今日'} ${realFlow >= 0 ? '淨買超' : '淨賣超'}`, cls: realFlow >= 0 ? 'bull' : 'bear' };
+    })(),
     { txt:`相對強弱 ${rsN>0?'+':''}${rs}%`, cls: rsN>2?'bull':rsN<-2?'bear':'neutral' },
   ];
   const bullN2 = factors.filter(f=>f.cls==='bull').length;
@@ -2168,13 +2303,15 @@ async function renderAnalysisPanels(s, inst) {
 function initTVChart(stockId, interval = 'D') {
   const container = document.getElementById('tv-chart-container');
   container.innerHTML = '';
+  // 上櫃股票在 TradingView 是 TPEX: 交易所代碼，用 TWSE: 會顯示「找不到商品」
+  const tvSymbol = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? `TPEX:${stockId}` : `TWSE:${stockId}`;
   if (typeof TradingView === 'undefined') {
     // Fallback: use embed script approach
     const script = document.createElement('script');
     script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
     script.async = true;
     script.textContent = JSON.stringify({
-      symbol: `TWSE:${stockId}`, interval, theme: 'dark', style: '1',
+      symbol: tvSymbol, interval, theme: 'dark', style: '1',
       locale: 'zh_TW', width: '100%', height: '450',
       hide_side_toolbar: true, save_image: false,
     });
@@ -2183,7 +2320,7 @@ function initTVChart(stockId, interval = 'D') {
   }
   tvChart = new TradingView.widget({
     container_id: 'tv-chart-container',
-    symbol: `TWSE:${stockId}`,
+    symbol: tvSymbol,
     interval,
     theme: 'dark',
     style: '1',

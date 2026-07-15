@@ -154,14 +154,6 @@ async function fetchIndexQuote(sym) {
 
 // ── TWSE Institutional T86（全表快取：每日只抓一次）─────────────────────────
 
-function getLastTradingDateStr(from = new Date()) {
-  const d = new Date(from);
-  const dow = d.getDay();
-  if (dow === 0) d.setDate(d.getDate() - 2);
-  else if (dow === 6) d.setDate(d.getDate() - 1);
-  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-}
-
 function parseK(s) {
   return Math.round((parseInt(String(s).replace(/,/g, ''), 10) || 0) / 1000);
 }
@@ -170,16 +162,30 @@ let _t86Memo = null; // in-memory：同一個頁面生命週期共用
 
 async function fetchT86All() {
   if (_t86Memo) return _t86Memo;
-  const dateStr = getLastTradingDateStr();
-  const key = `cache:t86:${dateStr}`;
-  const cached = cacheGet(key, 60 * 60 * 1000); // T86 每日更新一次，快取 1 小時
-  if (cached) { _t86Memo = cached; return cached; }
-  try {
-    const url = `https://www.twse.com.tw/rwd/zh/fund/T86?date=${dateStr}&selectType=ALL&response=json`;
-    const data = await proxyFetch(url, 12000);
-    if (data?.data) { _t86Memo = data.data; cacheSet(key, data.data); return data.data; }
-    return null;
-  } catch { return null; }
+  // 週末只是最常見情況 — 國定假日、颱風假 TWSE 也沒資料，往回最多找 6 天抓最近交易日
+  const base = new Date();
+  for (let back = 0; back <= 6; back++) {
+    const d = new Date(base);
+    d.setDate(d.getDate() - back);
+    const dow = d.getDay();
+    if (dow === 0 || dow === 6) continue;
+    const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+    const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const key = `cache:t86:${ymd}`;
+    const cached = cacheGet(key, 60 * 60 * 1000); // T86 每日更新一次，快取 1 小時
+    if (cached) { _t86Memo = cached; localStorage.setItem('t86-last-date', iso); return cached; }
+    try {
+      const url = `https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALL&response=json`;
+      const data = await proxyFetch(url, 12000);
+      if (data?.data?.length) {
+        _t86Memo = data.data;
+        cacheSet(key, data.data);
+        localStorage.setItem('t86-last-date', iso);
+        return data.data;
+      }
+    } catch {}
+  }
+  return null;
 }
 
 // 單檔法人：直接查快取的全表，不再重複下載整份 T86
@@ -194,6 +200,30 @@ async function fetchInstitutional(stockId) {
     dealer:     parseK(row[10]),
     total:      parseK(row[11]),
   };
+}
+
+// ── Yahoo 即時報價基本面（v7 quote 不需 crumb，比 quoteSummary 穩定）────────
+
+async function fetchQuoteInfo(stockId) {
+  const key = `cache:quote:${stockId}`;
+  const cached = cacheGet(key, 60 * 60 * 1000); // 基本面變動慢，快取 1 小時
+  if (cached) return cached;
+  const suffix = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? 'TWO' : 'TW';
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${stockId}.${suffix}`;
+  const data = await proxyFetch(url, 8000);
+  const q = data?.quoteResponse?.result?.[0];
+  if (!q) return null;
+  const info = {
+    pe: q.trailingPE ?? q.forwardPE ?? null,
+    pb: q.priceToBook ?? null,
+    divYield: q.trailingAnnualDividendYield ?? null, // 小數，如 0.045
+    eps: q.epsTrailingTwelveMonths ?? null,
+    marketCap: q.marketCap ?? null,
+    high52: q.fiftyTwoWeekHigh ?? null,
+    low52: q.fiftyTwoWeekLow ?? null,
+  };
+  cacheSet(key, info);
+  return info;
 }
 
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────

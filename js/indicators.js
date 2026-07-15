@@ -118,6 +118,7 @@ function calculateScore(ohlcv) {
   const adx   = calcADX(highs, lows, closes);
   const volMA = calcVolumeMA(volumes, 20);
   const boll  = calcBollinger(closes);
+  const stoch = calcStoch(highs, lows, closes);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -172,6 +173,21 @@ function calculateScore(ohlcv) {
     else if (price > boll.middle) { score += 3; }
   }
 
+  // Stochastic %K：多方動能確認 / 高低檔警示
+  if (stoch !== null) {
+    if (stoch > 85) { score -= 4; reasons.push(`KD %K ${stoch.toFixed(0)} 高檔鈍化`); }
+    else if (stoch >= 50) { score += 3; reasons.push(`KD %K ${stoch.toFixed(0)} 多方`); }
+    else if (stoch < 20) { score -= 3; }
+  }
+
+  // 20 日動能：中期趨勢延續性
+  if (closes.length >= 21) {
+    const ret20 = (price - closes[closes.length - 21]) / closes[closes.length - 21] * 100;
+    if (ret20 > 8) { score += 4; reasons.push(`20日漲幅 +${ret20.toFixed(1)}% 動能強勁`); }
+    else if (ret20 > 3) { score += 2; }
+    else if (ret20 < -8) { score -= 4; }
+  }
+
   score = Math.max(0, Math.min(100, Math.round(score)));
 
   let signal;
@@ -183,7 +199,7 @@ function calculateScore(ohlcv) {
   else if (score <= bear) signal = '空頭';
   else signal = '中性';
 
-  return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, price, prevClose, lastVol };
+  return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────
@@ -205,6 +221,20 @@ function generateSetup(ohlcv, analysis) {
   const tp2 = price + risk * (rr + 1);
   const resistance = Math.max(...highs.slice(-20));
 
+  // ATR(14)：衡量止損距離是否符合正常波動（太緊易被洗、太鬆虧損放大）
+  let atr = null;
+  if (ohlcv.length >= 15) {
+    const trs = [];
+    for (let i = ohlcv.length - 14; i < ohlcv.length; i++) {
+      trs.push(Math.max(
+        ohlcv[i].high - ohlcv[i].low,
+        Math.abs(ohlcv[i].high - ohlcv[i - 1].close),
+        Math.abs(ohlcv[i].low - ohlcv[i - 1].close),
+      ));
+    }
+    atr = trs.reduce((a, b) => a + b, 0) / trs.length;
+  }
+
   return {
     entry: price,
     stopLoss,
@@ -213,6 +243,8 @@ function generateSetup(ohlcv, analysis) {
     risk,
     rr,
     resistance,
+    atr,
+    stopAdj,
   };
 }
 
