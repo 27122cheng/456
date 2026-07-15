@@ -69,6 +69,7 @@ async function initApp() {
   renderWeeklyNews();
   renderTopBottomReversal();
   startRefreshCycle();
+  startDailyBriefingCheck();
   startScan();
 }
 
@@ -739,9 +740,71 @@ function renderRiskLearning(trades) {
         </div>`).join('')}
     </div>` : '';
 
+  // ── 止損鬆緊診斷面板（止損後 5 日觀察是否反轉觸及止盈）──────────
+  const slt = computeSLTightnessStats();
+  let sltHtml = '';
+  if (slt.n >= 3) {
+    const c = slt.pct >= 55 ? 'var(--bear)' : slt.pct >= 40 ? 'var(--yellow)' : 'var(--bull)';
+    const rec = slt.pct >= 55
+      ? '⚠️ 過半止損單其實會反轉獲利 → 止損明顯設太緊，系統將自動放寬止損參數，或等回踩更靠近支撐再進場。'
+      : slt.pct >= 40
+      ? '止損偏緊，約四成止損單事後反轉。可觀察是否放寬止損或提高進場精準度。'
+      : '✅ 止損鬆緊合理，多數止損單為真實走弱，維持現有止損設定。';
+    // 止損太緊比例 ≥ 55% → 自動放寬 stop-adj
+    if (slt.pct >= 55 && stopAdj > 0.975) {
+      localStorage.setItem('stop-adj', '0.975');
+    }
+    sltHtml = `
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:6px">🔍 止損鬆緊診斷（止損後 5 日觀察是否反轉觸及止盈）</div>
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:6px">
+        <span style="font-size:1.6rem;font-weight:800;color:${c}">${slt.pct.toFixed(0)}%</span>
+        <span style="font-size:0.8rem;color:var(--text2)">的止損單反轉觸及止盈（止損太緊）</span>
+        <span style="font-size:0.7rem;color:var(--text3);margin-left:auto">${slt.tooTight}/${slt.n} 筆已判定${slt.watching ? `　${slt.watching} 觀察中` : ''}</span>
+      </div>
+      <div style="font-size:0.78rem;color:var(--text2);line-height:1.7;background:${c}11;border-left:3px solid ${c};padding:8px 12px;border-radius:0 6px 6px 0">${rec}</div>
+    </div>`;
+  } else if (slt.watching > 0) {
+    sltHtml = `<div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3)">🔍 止損鬆緊診斷：${slt.watching} 筆止損單觀察中（累計 3 筆判定後顯示統計）</div>`;
+  }
+
+  // ── 分組勝率統計（依訊號類型 / SQ 等級，驗證各類訊號實際表現）──────
+  const seg = (name, arr) => {
+    const wins = arr.filter(t => t.pnl > 0).length;
+    const netPnl = arr.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    return { name, n: arr.length, wr: arr.length ? wins / arr.length * 100 : 0, netPnl };
+  };
+  const segGroups = [
+    seg('⚡ 當沖單', trades.filter(t => t.sigType === '當沖')),
+    seg('🏦 長線單', trades.filter(t => t.sigType === '長線')),
+    seg('🌊 波段單', trades.filter(t => !t.sigType || t.sigType === '波段')),
+    seg('SQ S級以上', trades.filter(t => ['SS','S'].includes(t.sqGrade))),
+    seg('SQ A級', trades.filter(t => t.sqGrade === 'A')),
+    seg('SQ B級以下/無', trades.filter(t => !t.sqGrade || !['SS','S','A'].includes(t.sqGrade))),
+  ].filter(g => g.n > 0);
+  const wrColor = wr => wr >= 55 ? 'var(--bull)' : wr >= 45 ? 'var(--yellow)' : 'var(--bear)';
+  const breakdownHtml = segGroups.length >= 2 ? `
+    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+      <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:8px">📊 分組勝率分析（回饋閉環：驗證哪類訊號真的賺錢）</div>
+      <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.76rem">
+        <thead><tr style="color:var(--text3);font-size:0.68rem;text-align:left">
+          <th style="padding:3px 6px">組別</th><th style="padding:3px 6px;text-align:right">筆數</th>
+          <th style="padding:3px 6px;text-align:right">勝率</th><th style="padding:3px 6px;text-align:right">累計損益</th>
+        </tr></thead>
+        <tbody>${segGroups.map(g => `<tr>
+          <td style="padding:3px 6px">${g.name}</td>
+          <td style="padding:3px 6px;text-align:right;color:var(--text3)">${g.n}</td>
+          <td style="padding:3px 6px;text-align:right;font-weight:700;color:${wrColor(g.wr)}">${g.wr.toFixed(0)}%</td>
+          <td style="padding:3px 6px;text-align:right;font-weight:600;font-family:var(--mono);color:${g.netPnl >= 0 ? 'var(--bull)' : 'var(--bear)'}">${g.netPnl >= 0 ? '+' : ''}${g.netPnl.toLocaleString()}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>` : '';
+
   el.innerHTML = `
     ${insights.map(i => `<div class="learn-item"><span class="learn-icon">${i.icon}</span><span>${i.txt}</span></div>`).join('')}
     ${failHtml}
+    ${sltHtml}
+    ${breakdownHtml}
     <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-size:0.75rem;color:var(--text3);line-height:1.7">
       目前生效的 AI 過濾參數：止損 = 5日低點 × ${stopAdj}｜RSI 上限 ${lf.rsiCap}｜ADX 下限 ${lf.adxMin}｜單筆風險上限 ${lf.maxRiskPct}%｜大盤空頭閘門 ${lf.marketGate ? '開啟' : '關閉'}<br>
       新的待進場訊號都會套用以上規則 — 每次虧損系統都在學習，規則會越調越嚴。
@@ -775,8 +838,85 @@ function classifySignal(a) {
   return '波段';
 }
 
+// ── 取消冷卻（被自動取消的股票 2 小時內不重複建單，避免建了又取消的循環）──
+function getCancelCooldowns() {
+  try { return JSON.parse(localStorage.getItem('cancel-cooldowns') || '[]'); } catch { return []; }
+}
+function addCancelCooldown(p, reason) {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  const all = getCancelCooldowns().filter(c => c.at > cutoff);
+  all.unshift({ id: p.id, name: p.name, at: Date.now(), reason, entry: p.entry });
+  localStorage.setItem('cancel-cooldowns', JSON.stringify(all));
+}
+function inCancelCooldown(stockId) {
+  return getCancelCooldowns().some(c => c.id === stockId && Date.now() - c.at < 2 * 60 * 60 * 1000);
+}
+
+// ── SQ 訊號品質評分（台股 12 因子，等級 SS≥11 / S≥9 / A≥6 / B≥4 / C≥2 / D<2）──
+// 未達 A 級（6分）不建單；掛單期間每次掃描重評，跌破 B 級自動取消
+function computeSQ(s) {
+  const a = s.analysis;
+  if (!a) return { sq: 0, grade: 'D', gradeLabel: '無數據', factors: [] };
+  let sq = 0;
+  const factors = [];
+  const volR = a.volMA ? a.lastVol / a.volMA : 1;
+
+  // ① EMA 均線結構
+  if (a.ema20 > a.ema50 && a.price > a.ema20) { sq += 2; factors.push('✅ EMA 多頭排列且站上 EMA20 +2'); }
+  else if (a.price > a.ema20) { sq += 1; factors.push('✅ 站上 EMA20 +1'); }
+  else { sq -= 1; factors.push('❌ 均線結構偏弱 -1'); }
+  // ② 長線結構 EMA200
+  if (a.ema200 && a.price > a.ema200) { sq += 1; factors.push('✅ EMA200 上方（長多結構）+1'); }
+  else if (a.ema200 && a.price < a.ema200) { sq -= 1; factors.push('❌ EMA200 下方 -1'); }
+  // ③ RSI 健康多頭區
+  if (a.rsi != null && a.rsi >= 50 && a.rsi < 68) { sq += 1; factors.push(`✅ RSI ${a.rsi.toFixed(0)} 健康多頭區 +1`); }
+  else if (a.rsi != null && a.rsi >= 72) { sq -= 1; factors.push(`❌ RSI ${a.rsi.toFixed(0)} 過熱 -1`); }
+  // ④ MACD
+  if (a.macd?.macd > a.macd?.signal && a.macd?.hist > 0) { sq += 1; factors.push('✅ MACD 金叉且柱體擴張 +1'); }
+  else if (a.macd?.macd < a.macd?.signal) { sq -= 1; factors.push('❌ MACD 死叉 -1'); }
+  // ⑤ ADX 趨勢強度
+  if (a.adx >= 30) { sq += 1; factors.push(`✅ ADX ${a.adx.toFixed(0)} 趨勢強勁 +1`); }
+  else if (a.adx != null && a.adx < 20) { sq -= 1; factors.push(`❌ ADX ${a.adx.toFixed(0)} 過弱 -1`); }
+  // ⑥ 量能（溫和放量最佳，爆量或萎縮扣分）
+  if (volR >= 1.3 && volR <= 3) { sq += 1; factors.push(`✅ 溫和放量 ${volR.toFixed(1)}x +1`); }
+  else if (volR < 0.6) { sq -= 1; factors.push(`❌ 量能萎縮 ${volR.toFixed(1)}x -1`); }
+  // ⑦ 綜合評分強度
+  if (a.score >= 80) { sq += 2; factors.push(`✅ 綜合評分 ${a.score} 極強 +2`); }
+  else if (a.score >= 72) { sq += 1; factors.push(`✅ 綜合評分 ${a.score} +1`); }
+  // ⑧ 大盤環境
+  const norm = outlookData.norm ?? 0;
+  if (norm >= 15) { sq += 1; factors.push(`✅ 大盤偏多（${Math.round(norm)}）+1`); }
+  else if (norm <= -15) { sq -= 2; factors.push(`❌ 大盤偏空（${Math.round(norm)}）-2`); }
+  // ⑨ 法人籌碼（loadInstitutionalOverview 附掛的外資買賣超）
+  if (s.foreign != null) {
+    if (s.foreign > 1000) { sq += 1; factors.push(`✅ 外資買超 ${s.foreign.toLocaleString()} 張 +1`); }
+    else if (s.foreign < -1000) { sq -= 1; factors.push(`❌ 外資賣超 ${Math.abs(s.foreign).toLocaleString()} 張 -1`); }
+  }
+  // ⑩ 布林位置（中軌與上軌之間 = 多頭有序推進）
+  if (a.boll && a.price > a.boll.middle && a.price < a.boll.upper) { sq += 1; factors.push('✅ 布林中上軌區間推進 +1'); }
+  // ⑪ 20 日動能
+  const closes = s.ohlcv.map(d => d.close);
+  if (closes.length >= 21) {
+    const ret20 = (a.price - closes[closes.length - 21]) / closes[closes.length - 21] * 100;
+    if (ret20 > 5) { sq += 1; factors.push(`✅ 20日動能 +${ret20.toFixed(1)}% +1`); }
+    else if (ret20 < -5) { sq -= 1; factors.push(`❌ 20日動能 ${ret20.toFixed(1)}% -1`); }
+  }
+  // ⑫ 突破結構（貼近 20 日高點）
+  const hi20 = Math.max(...s.ohlcv.slice(-20).map(d => d.high));
+  if (a.price >= hi20 * 0.99) { sq += 1; factors.push('✅ 貼近 20 日高點（突破結構）+1'); }
+
+  sq = Math.max(0, sq);
+  const grade = sq >= 11 ? 'SS' : sq >= 9 ? 'S' : sq >= 6 ? 'A' : sq >= 4 ? 'B' : sq >= 2 ? 'C' : 'D';
+  const gradeLabel = { SS: '完美訊號', S: '頂級訊號', A: '優質訊號', B: '良好訊號', C: '一般訊號', D: '訊號偏弱' }[grade];
+  return { sq, grade, gradeLabel, factors };
+}
+
+function sqGradeColor(grade) {
+  return { SS: '#ff6ef7', S: '#f0c040', A: '#22c55e', B: '#60a5fa', C: '#f59e0b', D: '#ef4444' }[grade] || '#9ca3af';
+}
+
 // AI 訊號 → 建立待進場單（進場價 = 回踩 EMA20）
-// v2：多重品質過濾（提高勝率）＋ 風控上限（降低回撤）＋ 學習系統回饋
+// v3：5 重品質過濾 + SQ 12因子分級（需 A 級以上）＋ 取消冷卻 ＋ 風控上限
 function generatePendingSuggestions() {
   // 只有訊號主機建單，避免多裝置重複建立同一筆待進場單
   if (!isSignalMaster()) return;
@@ -811,6 +951,7 @@ function generatePendingSuggestions() {
     if (!a || a.score < threshold) continue;
     if (positions.find(p => p.id === s.id && (p.status === 'pending' || p.status === 'open'))) continue;
     if (positions.filter(p => p.status === 'pending' || p.status === 'open').length + newOnes.length >= 6) break;
+    if (inCancelCooldown(s.id)) { rejected.push(`${s.id} 取消冷卻中`); continue; } // 剛被取消，2小時內不重建
 
     // ── 品質過濾（每一項都是歷史虧損常見原因）───────────────
     const volR = a.volMA ? a.lastVol / a.volMA : 1;
@@ -819,6 +960,10 @@ function generatePendingSuggestions() {
     if (!(a.ema50 && a.price > a.ema50))    { rejected.push(`${s.id} 未站上EMA50`); continue; } // 中期趨勢確認
     if (volR > 3.5)                         { rejected.push(`${s.id} 爆量過度`); continue; }   // 避免出貨量
     if (a.boll && a.price > a.boll.upper * 1.02) { rejected.push(`${s.id} 乖離過大`); continue; } // 不買在布林外
+
+    // ── SQ 訊號品質評分：需 A 級（6分）以上才建單 ──
+    const sqRes = computeSQ(s);
+    if (sqRes.sq < 6) { rejected.push(`${s.id} SQ ${sqRes.grade}級（${sqRes.sq}分）不足`); continue; }
 
     const lows = s.ohlcv.map(d => d.low);
     let entry = a.ema20 && a.ema20 < a.price ? a.ema20 : a.price * 0.985;
@@ -834,10 +979,11 @@ function generatePendingSuggestions() {
       uid: Date.now() + '-' + s.id,
       id: s.id, name: s.name, dir: 'long', sigType,
       score: a.score, suggestedAt: today,
-      entry, stopLoss: stop,
+      entry, stopLoss: stop, baseStop: stop, tp1Hit: false,
       tp1: +(entry + r * 2).toFixed(2),
       tp2: +(entry + r * 3).toFixed(2),
       qty: 1000, status: 'pending', lastPrice: a.price,
+      sqGrade: sqRes.grade, sqScore: sqRes.sq, sqGradeLabel: sqRes.gradeLabel, sqFactors: sqRes.factors,
       // 進場時空快照（供失敗學習系統歸因）
       ctx: {
         rsi: a.rsi != null ? +a.rsi.toFixed(1) : null,
@@ -854,21 +1000,34 @@ function generatePendingSuggestions() {
 
   if (newOnes.length) {
     savePositions(positions);
-    showToast(`AI 新增 ${newOnes.length} 筆待進場建議（已通過 5 重品質過濾）`, 'info');
-    // Telegram 推送（長線單 / 當沖單分類標示）
+    showToast(`AI 新增 ${newOnes.length} 筆待進場建議（5重過濾 + SQ ≥ A 級）`, 'info');
+    // Telegram 推送（長線單 / 當沖單分類 + SQ 等級標示）
     if (tgWants('sig')) {
       const typeIcon = { '當沖': '⚡當沖單', '長線': '🏦長線單', '波段': '🌊波段單' };
+      const gradeIcon = { SS: '💎', S: '🏆', A: '🥇' };
       const lines = newOnes.map(p =>
         `${typeIcon[p.sigType] || p.sigType} ${p.name}(${p.id}) 評分${p.score}\n` +
+        `${gradeIcon[p.sqGrade] || '📊'} 訊號品質 ${p.sqGrade} 級（${p.sqGradeLabel}，${p.sqScore} 分）\n` +
         `回踩進場 ${p.entry}｜止損 ${p.stopLoss}（-${((p.entry-p.stopLoss)/p.entry*100).toFixed(1)}%）\n` +
-        `目標 ${p.tp1}(2R) / ${p.tp2}(3R)｜大盤環境 ${p.ctx.mktNorm >= 0 ? '偏多' : '偏空'}(${p.ctx.mktNorm})`
+        `目標一 ${p.tp1}(2R 觸及後止損移至成本) / 最終 ${p.tp2}(3R)\n` +
+        `大盤環境 ${p.ctx.mktNorm >= 0 ? '偏多' : '偏空'}(${p.ctx.mktNorm})`
       ).join('\n\n');
       tgPush(`📡 台股雷達 AI 交易建議（待回踩進場）\n${today}\n\n${lines}\n\n⚠ 僅供參考，非投資建議`);
     }
   }
 }
 
-// 每次掃描後：檢查回踩成交、止損、停利
+// 掛單自動取消：標記取消 + 冷卻 + Telegram 通知
+function cancelPendingAuto(p, reason) {
+  p.status = 'cancelled';
+  addCancelCooldown(p, reason);
+  showToast(`🚫 ${p.name}(${p.id}) 掛單取消：${reason}`, 'error');
+  if (tgWants('sig')) {
+    tgPush(`🚫 台股雷達 交易建議已取消\n\n${p.name}(${p.id}) ${p.sigType || ''}單\n原掛單進場 ${p.entry}｜止損 ${p.stopLoss}\n\n📋 取消原因：${reason}\n\n2 小時冷卻後重新評估新機會`);
+  }
+}
+
+// 每次掃描後：掛單有效性監控 → 回踩成交 → 保本/止損/停利
 function processPositions() {
   const positions = getPositions();
   const now = new Date();
@@ -881,23 +1040,66 @@ function processPositions() {
     p.lastPrice = bars[bars.length - 1].close;
 
     if (p.status === 'pending') {
-      // 7 天未成交 → 過期
+      // ① 7 天未成交 → 過期
       if ((now - new Date(p.suggestedAt)) / 86400000 > 7) {
         p.status = 'expired'; changed = true; continue;
       }
-      // 回踩成交：建議日之後任一根 K 棒低點觸及進場價
+      // ② 進場前已跌破止損位 → 取消（風控執行）
+      if (p.lastPrice <= p.stopLoss) {
+        cancelPendingAuto(p, `進場前價格已跌破止損位 ${p.stopLoss}（現價 ${p.lastPrice}）`);
+        changed = true; continue;
+      }
+      // ③ 未回踩直接飛越止盈一 → 機會已過，取消
+      if (p.lastPrice >= p.tp1) {
+        cancelPendingAuto(p, `價格未回踩進場直接飛越止盈一（${p.tp1}），機會已過`);
+        changed = true; continue;
+      }
+      // ④ 訊號失效監控：趨勢反轉或 SQ 品質跌破 B 級 → 取消
+      if (s.analysis) {
+        const nowScore = s.analysis.score;
+        if (nowScore < 45 || s.analysis.signal.includes('空頭')) {
+          cancelPendingAuto(p, `訊號失效：評分跌至 ${nowScore}（${s.analysis.signal}）`);
+          changed = true; continue;
+        }
+        const sqNow = computeSQ(s);
+        if (sqNow.sq < 4) {
+          cancelPendingAuto(p, `訊號品質降至 ${sqNow.grade} 級（${sqNow.sq} 分），低於 B 級門檻`);
+          changed = true; continue;
+        }
+        p.sqGrade = sqNow.grade; p.sqScore = sqNow.sq; // 持續更新品質顯示
+      }
+      // ⑤ 回踩成交：建議日之後任一根 K 棒低點觸及進場價
       const fill = bars.find(b => b.time > p.suggestedAt && b.low <= p.entry);
       if (fill) { p.status = 'open'; p.entryDate = fill.time; changed = true; }
+
     } else if (p.status === 'open') {
+      if (p.baseStop == null) p.baseStop = p.stopLoss; // 舊資料相容
       const after = bars.filter(b => b.time > p.entryDate);
       for (const b of after) {
-        if (b.low <= p.stopLoss) { settlePosition(p, p.stopLoss, b.time, '跌破止損'); changed = true; break; }
-        if (b.high >= p.tp1)     { settlePosition(p, p.tp1, b.time, '達標停利');  changed = true; break; }
+        // 止盈一觸及 → 止損自動移至成本價（保本），續抱等止盈二
+        if (!p.tp1Hit && b.high >= p.tp1) {
+          p.tp1Hit = true;
+          p.stopLoss = p.entry;
+          changed = true;
+          showToast(`🎯 ${p.name}(${p.id}) 觸及止盈一，止損已移至成本價（保本）`, 'success');
+          if (tgWants('sig')) {
+            tgPush(`🎯 止盈一已觸及！止損自動保本\n\n${p.name}(${p.id})\n✅ 止盈一 ${p.tp1}｜進場 ${p.entry}\n🔒 止損已移至成本價 ${p.entry}，續抱等止盈二 ${p.tp2}`);
+          }
+          continue; // 同一根 K 棒不再檢查止損（日線無法判斷先後，保守處理）
+        }
+        // 止盈一之後：達標止盈二全出，或回落成本保本出場
+        if (p.tp1Hit) {
+          if (b.high >= p.tp2)      { settlePosition(p, p.tp2, b.time, '達標止盈二'); changed = true; break; }
+          if (b.low <= p.stopLoss)  { settlePosition(p, p.entry, b.time, '保本出場'); changed = true; break; }
+        } else {
+          if (b.low <= p.stopLoss)  { settlePosition(p, p.stopLoss, b.time, '跌破止損'); changed = true; break; }
+        }
       }
     }
   }
 
   savePositions(positions.filter(p => p.status === 'pending' || p.status === 'open'));
+  updateSLTightnessWatch(); // 止損鬆緊診斷（觀察止損單是否反轉觸及止盈）
   if (changed && currentPage === 'positions') renderPositions();
 }
 
@@ -920,14 +1122,53 @@ function settlePosition(p, exitPrice, exitDate, reason) {
   }
 
   const trades = getTrades();
-  trades.push({
+  const rec = {
     id: p.id, name: p.name, dir: p.dir, sigType: p.sigType || '波段',
+    sqGrade: p.sqGrade || null, sqScore: p.sqScore ?? null,
     entry: p.entry, exit: exitPrice, qty: p.qty,
     date: exitDate, note: reason + (penaltyNotes.length ? `（${penaltyNotes.join('、')}）` : ''),
     pnl, retPct, penalty, ctx,
-  });
+  };
+  // 止損鬆緊診斷：止損單觀察後續 5 天是否反轉觸及原止盈一
+  if (reason === '跌破止損') {
+    rec.slWatch = { tp1: p.tp1, exitDate, result: null };
+  }
+  trades.push(rec);
   saveTrades(trades);
   showToast(`${p.name}(${p.id}) ${reason}：${pnl > 0 ? '+' : ''}${pnl.toLocaleString()} 元`, pnl >= 0 ? 'success' : 'error');
+  if (tgWants('sig')) {
+    const icon = pnl > 0 ? '✅' : reason === '保本出場' ? '➡️' : '❌';
+    tgPush(`${icon} 台股雷達 交易結算\n\n${p.name}(${p.id}) ${reason}\n進場 ${p.entry} → 出場 ${exitPrice}\n損益 ${pnl > 0 ? '+' : ''}${pnl.toLocaleString()} 元（${retPct > 0 ? '+' : ''}${retPct}%）`);
+  }
+}
+
+// ── 止損鬆緊診斷：止損後觀察 5 個交易日內是否反轉觸及原止盈一 ──────────
+// 反轉觸及 = 止損設太緊（本可獲利）；未反轉 = 止損正確（真實走弱）
+function updateSLTightnessWatch() {
+  const trades = getTrades();
+  let changed = false;
+  for (const t of trades) {
+    if (!t.slWatch || t.slWatch.result !== null) continue;
+    const s = allStocks.find(x => x.id === t.id);
+    if (!s?.ohlcv?.length) continue;
+    const after = s.ohlcv.filter(b => b.time > t.slWatch.exitDate);
+    const window = after.slice(0, 5); // 止損後 5 個交易日
+    if (window.some(b => b.high >= t.slWatch.tp1)) {
+      t.slWatch.result = true;  // 反轉觸及止盈 → 止損太緊
+      changed = true;
+    } else if (after.length >= 5) {
+      t.slWatch.result = false; // 觀察期滿未反轉 → 止損正確
+      changed = true;
+    }
+  }
+  if (changed) saveTrades(trades);
+}
+
+function computeSLTightnessStats() {
+  const resolved = getTrades().filter(t => t.slWatch && t.slWatch.result !== null);
+  const tooTight = resolved.filter(t => t.slWatch.result === true).length;
+  const watching = getTrades().filter(t => t.slWatch && t.slWatch.result === null).length;
+  return { n: resolved.length, tooTight, pct: resolved.length ? tooTight / resolved.length * 100 : 0, watching };
 }
 
 function cancelPending(uid) {
@@ -971,7 +1212,7 @@ function renderPositions() {
   document.getElementById('pending-tbody').innerHTML = pending.length ? pending.map(p => {
     const dist = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(1) : null;
     return `<tr>
-      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.sigType ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.1);color:var(--blue)">${p.sigType}</span>` : ''}</td>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.sigType ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.1);color:var(--blue)">${p.sigType}</span>` : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;border:1px solid ${sqGradeColor(p.sqGrade)}55;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}</td>
       <td><span class="score-val" style="color:${scoreToColor(p.score)}">${p.score}</span></td>
       <td style="font-family:var(--mono);font-size:0.75rem">${p.suggestedAt}</td>
       <td class="price-mono" style="color:var(--blue)">${p.entry}</td>
@@ -991,7 +1232,7 @@ function renderPositions() {
     const ret = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(2) : null;
     const cls = pnl > 0 ? 'change-up' : pnl < 0 ? 'change-dn' : '';
     return `<tr>
-      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span></td>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.tp1Hit ? ' <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700">🔒 已保本</span>' : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}</td>
       <td style="font-family:var(--mono);font-size:0.75rem">${p.entryDate}</td>
       <td class="price-mono">${p.entry}</td>
       <td class="price-mono">${p.lastPrice ?? '--'}</td>
@@ -2791,11 +3032,15 @@ function renderFullRisk(s, inst) {
 
 // ── 每日市場簡報（手動觸發 Telegram）────────────────────────────────────────
 
-function manualSendDailyBriefing() {
+function manualSendDailyBriefing(silent = false) {
   if (localStorage.getItem('tg-enabled') !== 'true' || !localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) {
-    showToast('請先啟用並設定 Telegram Bot', 'error'); return;
+    if (!silent) showToast('請先啟用並設定 Telegram Bot', 'error');
+    return false;
   }
-  if (!allStocks.some(s => s.analysis)) { showToast('請先等掃描完成', 'error'); return; }
+  if (!allStocks.some(s => s.analysis)) {
+    if (!silent) showToast('請先等掃描完成', 'error');
+    return false;
+  }
 
   const norm = outlookData.norm ?? 0;
   const mkt = norm >= 15 ? '📈 偏多' : norm <= -15 ? '📉 偏空' : '➡️ 中性';
@@ -2810,6 +3055,23 @@ function manualSendDailyBriefing() {
   const bears = allStocks.filter(s => s.analysis && s.analysis.score <= getThreshold('bear')).length;
 
   tgPush(`📊 台股雷達 每日市場簡報\n${now.toLocaleDateString('zh-TW')}\n\n🌡 大盤環境：${mkt}（多空總覽 ${Math.round(norm)} 分）\n市場寬度：多頭 ${bulls} 檔 / 空頭 ${bears} 檔\n\n⭐ 今日重點關注\n${dLines}\n\n🗓 即將公布\n${events}\n\n⚠ 僅供參考，非投資建議`);
+  return true;
+}
+
+// ── 每日簡報自動發送（每天 9:00，開啟網頁時若已過 9 點且未發送則補發）──
+function startDailyBriefingCheck() {
+  const tryDailyBrief = () => {
+    const now = new Date();
+    if (now.getHours() < 9) return;
+    const today = now.toDateString();
+    if (localStorage.getItem('daily-brief-sent') === today) return;
+    if (manualSendDailyBriefing(true)) {
+      localStorage.setItem('daily-brief-sent', today);
+    }
+  };
+  // 掃描完成後補發一次 + 之後每分鐘檢查（準時 9 點觸發）
+  setTimeout(tryDailyBrief, 60 * 1000);
+  setInterval(tryDailyBrief, 60 * 1000);
 }
 
 // ── 策略歷史回測 ────────────────────────────────────────────────────────────
@@ -2828,12 +3090,22 @@ function backtestStock(s) {
     const b = bars[i];
 
     if (pos) {
-      // 先檢查止損（保守：同棒觸及兩者以止損計）
-      if (b.low <= pos.stop) {
+      // 與實盤一致：TP1 觸及 → 止損移至成本（保本）→ TP2 全出或保本出場
+      if (!pos.tp1Hit && b.high >= pos.tp1) {
+        pos.tp1Hit = true;
+        pos.stop = pos.entry;
+        continue; // 同棒不再檢查止損（日線無法判斷先後，保守處理）
+      }
+      if (pos.tp1Hit) {
+        if (b.high >= pos.tp2) {
+          trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.tp2, entryDate: pos.entryDate, exitDate: b.time, win: true, retPct: (pos.tp2 - pos.entry) / pos.entry * 100, holdDays: i - pos.entryIdx });
+          pos = null;
+        } else if (b.low <= pos.stop) {
+          trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.entry, entryDate: pos.entryDate, exitDate: b.time, win: false, be: true, retPct: 0, holdDays: i - pos.entryIdx });
+          pos = null;
+        }
+      } else if (b.low <= pos.stop) {
         trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.stop, entryDate: pos.entryDate, exitDate: b.time, win: false, retPct: (pos.stop - pos.entry) / pos.entry * 100, holdDays: i - pos.entryIdx });
-        pos = null;
-      } else if (b.high >= pos.tp) {
-        trades.push({ id: s.id, name: s.name, entry: pos.entry, exit: pos.tp, entryDate: pos.entryDate, exitDate: b.time, win: true, retPct: (pos.tp - pos.entry) / pos.entry * 100, holdDays: i - pos.entryIdx });
         pos = null;
       }
       continue;
@@ -2841,8 +3113,10 @@ function backtestStock(s) {
 
     if (pend) {
       pend.age++;
+      // 與實盤一致：進場前跌破止損或飛越止盈一 → 掛單取消
+      if (b.close <= pend.stop || b.close >= pend.tp1) { pend = null; continue; }
       if (b.low <= pend.entry) {
-        pos = { ...pend, entryDate: b.time, entryIdx: i };
+        pos = { ...pend, tp1Hit: false, entryDate: b.time, entryIdx: i };
         pend = null;
       } else if (pend.age >= 7) pend = null;
       continue;
@@ -2864,7 +3138,16 @@ function backtestStock(s) {
     const stop = +(Math.min(...window.slice(-5).map(d => d.low)) * stopAdj).toFixed(2);
     if (stop >= entry) continue;
     if ((entry - stop) / entry * 100 > lf.maxRiskPct) continue;
-    pend = { entry, stop, tp: +(entry + (entry - stop) * 2).toFixed(2), age: 0 };
+    // SQ 品質門檻（與實盤一致：A 級以上才建單）
+    const sqBt = computeSQ({ analysis: a, ohlcv: window, foreign: s.foreign });
+    if (sqBt.sq < 6) continue;
+
+    pend = {
+      entry, stop,
+      tp1: +(entry + (entry - stop) * 2).toFixed(2),
+      tp2: +(entry + (entry - stop) * 3).toFixed(2),
+      age: 0,
+    };
   }
   return trades;
 }

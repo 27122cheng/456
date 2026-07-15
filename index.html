@@ -784,7 +784,7 @@
             <button class="btn-primary" id="bt-run-btn" onclick="runBacktest()">▶ 執行回測（全部股票池）</button>
             <span id="bt-progress" style="font-size:0.78rem;color:var(--text3)"></span>
           </div>
-          <div id="backtest-body"><p style="font-size:0.82rem;color:var(--text3)">回測會將目前生效的 AI 進場過濾、回踩進場、2R 停利與止損規則，逐棒套用到股票池中每一檔的近 6 個月歷史，統計真實會發生的勝率、獲利因子與最大回撤。掃描完成後即可執行。</p></div>
+          <div id="backtest-body"><p style="font-size:0.82rem;color:var(--text3)">回測會將目前生效的 AI 規則（5重過濾 + SQ品質分級 + 回踩進場 + 2R觸及保本 + 3R止盈）逐棒套用到股票池近 6 個月歷史，統計真實會發生的勝率、獲利因子與最大回撤。掃描完成後即可執行。</p></div>
         </div>
       </div>
 
