@@ -129,6 +129,12 @@ async function startScan() {
   // AI 自動交易：結算既有部位 → 產生新建議
   processPositions();
   generatePendingSuggestions();
+
+  // 機會實驗室：結算舊紙上追蹤 → 收錄本輪新機會 → 驗證策略晉升建正式單
+  updateLabTracks();
+  recordLabOpportunities();
+  generateProvenStrategyOrders();
+
   if (currentPage === 'positions') renderPositions();
 
   // 每日 / 每週重點關注股
@@ -781,6 +787,7 @@ function renderRiskLearning(trades) {
     seg('SQ S級以上', trades.filter(t => ['SS','S'].includes(t.sqGrade))),
     seg('SQ A級', trades.filter(t => t.sqGrade === 'A')),
     seg('SQ B級以下/無', trades.filter(t => !t.sqGrade || !['SS','S','A'].includes(t.sqGrade))),
+    seg('🎓 驗證策略單', trades.filter(t => t.proven)),
   ].filter(g => g.n > 0);
   const wrColor = wr => wr >= 55 ? 'var(--bull)' : wr >= 45 ? 'var(--yellow)' : 'var(--bear)';
   const breakdownHtml = segGroups.length >= 2 ? `
@@ -1055,14 +1062,15 @@ function processPositions() {
         changed = true; continue;
       }
       // ④ 訊號失效監控：趨勢反轉或 SQ 品質跌破 B 級 → 取消
+      // （驗證策略單建立時就免評分/SQ 門檻，僅監控趨勢反轉，不因 SQ 降級取消）
       if (s.analysis) {
         const nowScore = s.analysis.score;
-        if (nowScore < 45 || s.analysis.signal.includes('空頭')) {
+        if (s.analysis.signal.includes('空頭') || (!p.proven && nowScore < 45)) {
           cancelPendingAuto(p, `訊號失效：評分跌至 ${nowScore}（${s.analysis.signal}）`);
           changed = true; continue;
         }
         const sqNow = computeSQ(s);
-        if (sqNow.sq < 4) {
+        if (!p.proven && sqNow.sq < 4) {
           cancelPendingAuto(p, `訊號品質降至 ${sqNow.grade} 級（${sqNow.sq} 分），低於 B 級門檻`);
           changed = true; continue;
         }
@@ -1125,6 +1133,7 @@ function settlePosition(p, exitPrice, exitDate, reason) {
   const rec = {
     id: p.id, name: p.name, dir: p.dir, sigType: p.sigType || '波段',
     sqGrade: p.sqGrade || null, sqScore: p.sqScore ?? null,
+    proven: !!p.proven,
     entry: p.entry, exit: exitPrice, qty: p.qty,
     date: exitDate, note: reason + (penaltyNotes.length ? `（${penaltyNotes.join('、')}）` : ''),
     pnl, retPct, penalty, ctx,
@@ -1212,7 +1221,7 @@ function renderPositions() {
   document.getElementById('pending-tbody').innerHTML = pending.length ? pending.map(p => {
     const dist = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(1) : null;
     return `<tr>
-      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.sigType ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.1);color:var(--blue)">${p.sigType}</span>` : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;border:1px solid ${sqGradeColor(p.sqGrade)}55;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}</td>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.sigType ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.1);color:var(--blue)">${p.sigType}</span>` : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;border:1px solid ${sqGradeColor(p.sqGrade)}55;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}${p.proven ? ' <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700" title="策略標籤已通過紙上實戰驗證">🎓 驗證策略</span>' : ''}</td>
       <td><span class="score-val" style="color:${scoreToColor(p.score)}">${p.score}</span></td>
       <td style="font-family:var(--mono);font-size:0.75rem">${p.suggestedAt}</td>
       <td class="price-mono" style="color:var(--blue)">${p.entry}</td>
@@ -1232,7 +1241,7 @@ function renderPositions() {
     const ret = p.lastPrice ? ((p.lastPrice - p.entry) / p.entry * 100).toFixed(2) : null;
     const cls = pnl > 0 ? 'change-up' : pnl < 0 ? 'change-dn' : '';
     return `<tr>
-      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.tp1Hit ? ' <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700">🔒 已保本</span>' : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}</td>
+      <td onclick="openStock('${p.id}')" style="cursor:pointer"><span class="stock-cell-id">${p.id}</span> <span style="font-size:0.72rem;color:var(--text3)">${p.name}</span>${p.tp1Hit ? ' <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700">🔒 已保本</span>' : ''}${p.sqGrade ? ` <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:${sqGradeColor(p.sqGrade)}22;color:${sqGradeColor(p.sqGrade)};font-weight:700">SQ ${p.sqGrade}</span>` : ''}${p.proven ? ' <span style="font-size:0.6rem;padding:1px 6px;border-radius:8px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700">🎓</span>' : ''}</td>
       <td style="font-family:var(--mono);font-size:0.75rem">${p.entryDate}</td>
       <td class="price-mono">${p.entry}</td>
       <td class="price-mono">${p.lastPrice ?? '--'}</td>
@@ -2810,10 +2819,63 @@ function renderLab() {
   const cats = detectLabOpportunities();
   const total = cats.reduce((n, c) => n + c.items.length, 0);
 
+  // ── 紙上追蹤統計面板 ──
+  const tracks = getLabTracks();
+  const tracking = tracks.filter(t => !t.outcome).length;
+  const closed = tracks.filter(t => t.outcome);
+  const closedWins = closed.filter(t => t.outcome === 'win').length;
+  const tagStats = computeLabTagStats();
+  const proven = getProvenLabTags();
+  const provenSet = new Set(proven.map(p => p.tag));
+  const wrColor = wr => wr >= 60 ? 'var(--bull)' : wr >= 45 ? 'var(--yellow)' : 'var(--bear)';
+
+  const trackHtml = `
+    <div class="adv-section" style="margin-bottom:14px">
+      <div class="adv-section-hdr">🧪 紙上追蹤驗證
+        <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">每個機會自動追蹤至 -1R 止損 / +2R 止盈，累積各策略標籤實戰勝率</span>
+      </div>
+      <div class="adv-section-body">
+        <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:${tagStats.length ? '12px' : '0'};font-size:0.8rem">
+          <span>追蹤中 <strong style="color:var(--blue)">${tracking}</strong> 筆</span>
+          <span>已結案 <strong>${closed.length}</strong> 筆</span>
+          ${closed.length ? `<span>整體勝率 <strong style="color:${wrColor(closedWins / closed.length * 100)}">${(closedWins / closed.length * 100).toFixed(0)}%</strong></span>` : ''}
+          <span>🎓 驗證策略 <strong style="color:${proven.length ? 'var(--bull)' : 'var(--text3)'}">${proven.length}</strong> 個</span>
+        </div>
+        ${proven.length ? `
+          <div style="margin-bottom:12px;padding:10px 14px;background:rgba(34,197,94,0.07);border:1px solid rgba(34,197,94,0.25);border-radius:8px;font-size:0.8rem">
+            🎓 <strong style="color:var(--bull)">已晉升驗證策略</strong>（樣本 ≥${LAB_PROMOTE_MIN_N} 筆且勝率 ≥${LAB_PROMOTE_MIN_WR}%，出現同標籤機會將直接建立正式掛單）：
+            ${proven.map(m => `<span style="display:inline-block;margin:3px 4px 0 0;padding:2px 9px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull);font-weight:700;font-size:0.74rem">${m.tag} ${m.wr.toFixed(0)}%（${m.n}筆）</span>`).join('')}
+          </div>` : ''}
+        ${tagStats.length ? `
+          <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.76rem">
+            <thead><tr style="color:var(--text3);font-size:0.68rem;text-align:left">
+              <th style="padding:3px 6px">策略標籤</th><th style="padding:3px 6px;text-align:right">樣本</th>
+              <th style="padding:3px 6px;text-align:right">勝率</th><th style="padding:3px 6px;text-align:right">累計R</th>
+              <th style="padding:3px 6px;text-align:right">晉升進度</th>
+            </tr></thead>
+            <tbody>${tagStats.slice(0, 14).map(m => {
+              const prog = Math.min(100, m.n / LAB_PROMOTE_MIN_N * 100);
+              const isProven = provenSet.has(m.tag);
+              return `<tr>
+                <td style="padding:3px 6px">${isProven ? '🎓 ' : ''}${m.tag}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--text3)">${m.n}</td>
+                <td style="padding:3px 6px;text-align:right;font-weight:700;color:${wrColor(m.wr)}">${m.wr.toFixed(0)}%</td>
+                <td style="padding:3px 6px;text-align:right;font-family:var(--mono);color:${m.cumR >= 0 ? 'var(--bull)' : 'var(--bear)'}">${m.cumR >= 0 ? '+' : ''}${m.cumR.toFixed(1)}R</td>
+                <td style="padding:3px 6px;text-align:right">${isProven
+                  ? '<span style="color:var(--bull);font-weight:700">已晉升</span>'
+                  : `<span style="color:var(--text3)">${m.n}/${LAB_PROMOTE_MIN_N} 筆${m.wr >= LAB_PROMOTE_MIN_WR ? '' : `｜勝率差 ${(LAB_PROMOTE_MIN_WR - m.wr).toFixed(0)}%`}</span>
+                     <span style="display:inline-block;width:44px;height:4px;border-radius:2px;background:var(--border);vertical-align:middle;margin-left:5px"><span style="display:block;width:${prog}%;height:100%;border-radius:2px;background:${m.wr >= LAB_PROMOTE_MIN_WR ? 'var(--bull)' : 'var(--blue)'}"></span></span>`}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table></div>` : '<p style="font-size:0.78rem;color:var(--text3)">尚無已結案的追蹤樣本 — 機會收錄後需數個交易日走到止損/止盈才會結案，統計將逐步累積。</p>'}
+      </div>
+    </div>`;
+
   el.innerHTML = `
     <div style="margin-bottom:14px;padding:12px 16px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.12);border-radius:10px;font-size:0.84rem;color:var(--text2)">
-      本輪掃描共偵測到 <strong style="color:var(--blue)">${total}</strong> 個特殊型態機會。機會型態不等於進場訊號 — 請點入個股確認 AI 綜合分析與交易建議後再行動。
+      本輪掃描共偵測到 <strong style="color:var(--blue)">${total}</strong> 個特殊型態機會，全部自動收錄紙上追蹤驗證。機會型態不等於進場訊號 — 請點入個股確認 AI 綜合分析與交易建議後再行動。
     </div>
+    ${trackHtml}
     ${cats.map(c => `
       <div class="adv-section" style="margin-bottom:14px">
         <div class="adv-section-hdr">
@@ -2836,6 +2898,196 @@ function renderLab() {
           : '<p style="font-size:0.8rem;color:var(--text3)">本輪未偵測到此型態</p>'}
         </div>
       </div>`).join('')}`;
+}
+
+// ── 機會實驗室紙上追蹤 + 驗證策略晉升 ─────────────────────────────────────
+// 每輪掃描把偵測到的機會「紙上收錄」（不動用正式部位），追蹤後續走勢到
+// 止損(-1R)/止盈(+2R) 自動結案，累積每個策略標籤的實戰勝率。
+// 樣本 ≥100 筆且勝率 ≥80% 的標籤晉升為「驗證策略」→ 之後出現同標籤機會
+// 直接建立正式掛單，免評分 / SQ 門檻（已用大量實戰數據證明有效）。
+
+const LAB_TRACK_KEY = 'lab-tracks';
+const LAB_PROMOTE_MIN_N = 100;  // 晉升門檻：至少 100 筆已結樣本
+const LAB_PROMOTE_MIN_WR = 80;  // 晉升門檻：勝率 ≥ 80%
+
+function getLabTracks() {
+  try { return JSON.parse(localStorage.getItem(LAB_TRACK_KEY) || '[]'); } catch { return []; }
+}
+
+function saveLabTracks(tracks) {
+  // 已結案例只保留最近 600 筆，避免 localStorage 無限膨脹
+  const open = tracks.filter(t => !t.outcome);
+  const closed = tracks.filter(t => t.outcome).slice(-600);
+  localStorage.setItem(LAB_TRACK_KEY, JSON.stringify([...open, ...closed]));
+}
+
+// 從個股分析萃取「策略標籤」— 每個標籤是一個可獨立統計勝率的技術特徵
+function computeLabTags(s, catKey) {
+  const a = s.analysis;
+  if (!a) return [];
+  const tags = [];
+  const catNames = { breakout: '🚀突破在即', oversold: '💎超賣反彈', momentum: '⚡動能加速', accumulate: '🏦主力吸貨', squeeze: '🌀波動壓縮' };
+  if (catNames[catKey]) tags.push(catNames[catKey]);
+  const volR = a.volMA ? a.lastVol / a.volMA : 1;
+  if (a.ema20 > a.ema50 && a.price > a.ema20) tags.push('EMA多頭排列');
+  if (a.ema200 && a.price > a.ema200) tags.push('站上EMA200');
+  if (a.macd?.macd > a.macd?.signal && a.macd?.hist > 0) tags.push('MACD金叉');
+  if (a.rsi != null && a.rsi >= 50 && a.rsi < 68) tags.push('RSI健康區');
+  if (a.rsi != null && a.rsi < 32) tags.push('RSI超賣');
+  if (a.adx >= 30) tags.push('ADX強趨勢');
+  if (volR >= 1.3 && volR <= 3) tags.push('量能溫和放大');
+  if (s.foreign != null && s.foreign > 1000) tags.push('外資大買');
+  if ((outlookData.norm ?? 0) >= 15) tags.push('大盤偏多');
+  if (a.score >= 80) tags.push('評分80+');
+  if (s.ohlcv?.length >= 20 && a.price >= Math.max(...s.ohlcv.slice(-20).map(d => d.high)) * 0.99) tags.push('近20日高點');
+  return tags;
+}
+
+// 掃描後：把本輪偵測到的機會收錄為紙上追蹤
+function recordLabOpportunities() {
+  const cats = detectLabOpportunities();
+  const tracks = getLabTracks();
+  const today = new Date().toISOString().slice(0, 10);
+  const fiveDaysAgo = new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10);
+  const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  let added = 0;
+
+  for (const c of cats) {
+    for (const { s } of c.items.slice(0, 8)) {
+      const a = s.analysis;
+      if (!a || !s.ohlcv?.length) continue;
+      // 同一檔 + 同型態：有未結追蹤、或 5 日內收錄過 → 不重複收錄
+      if (tracks.some(t => t.id === s.id && t.cat === c.key && (!t.outcome || t.date >= fiveDaysAgo))) continue;
+
+      const entry = a.price;
+      const stop = +(Math.min(...s.ohlcv.slice(-5).map(d => d.low)) * stopAdj).toFixed(2);
+      if (stop >= entry) continue;
+      const r = entry - stop;
+      tracks.push({
+        uid: `${today}-${s.id}-${c.key}`,
+        id: s.id, name: s.name, cat: c.key, date: today,
+        entry, stop, tp: +(entry + r * 2).toFixed(2),
+        tags: computeLabTags(s, c.key),
+        outcome: null, // 'win' | 'loss' | null = 追蹤中
+      });
+      added++;
+    }
+  }
+  if (added) saveLabTracks(tracks);
+}
+
+// 追蹤未結案例：後續 K 棒觸及止損 → 敗、觸及 2R 止盈 → 勝；15 個交易日到期以收盤價論
+function updateLabTracks() {
+  const tracks = getLabTracks();
+  let changed = false;
+  for (const t of tracks) {
+    if (t.outcome) continue;
+    const s = allStocks.find(x => x.id === t.id);
+    if (!s?.ohlcv?.length) continue;
+    const after = s.ohlcv.filter(b => b.time > t.date);
+    for (const b of after) {
+      // 同一根日 K 同時觸及止損與止盈 → 保守判敗（與正式交易規則一致）
+      if (b.low <= t.stop) { t.outcome = 'loss'; t.retR = -1; t.closedAt = b.time; changed = true; break; }
+      if (b.high >= t.tp)  { t.outcome = 'win';  t.retR = 2;  t.closedAt = b.time; changed = true; break; }
+    }
+    if (!t.outcome && after.length >= 15) {
+      const r = t.entry - t.stop;
+      t.retR = +((after[14].close - t.entry) / r).toFixed(2);
+      t.outcome = t.retR > 0 ? 'win' : 'loss';
+      t.closedAt = after[14].time;
+      changed = true;
+    }
+  }
+  if (changed) saveLabTracks(tracks);
+}
+
+// 各標籤實戰統計（只計已結案例）
+function computeLabTagStats() {
+  const closed = getLabTracks().filter(t => t.outcome);
+  const map = {};
+  for (const t of closed) {
+    for (const tag of t.tags || []) {
+      const m = map[tag] = map[tag] || { tag, n: 0, wins: 0, cumR: 0 };
+      m.n++;
+      if (t.outcome === 'win') m.wins++;
+      m.cumR += t.retR ?? 0;
+    }
+  }
+  return Object.values(map).map(m => ({ ...m, wr: m.n ? m.wins / m.n * 100 : 0 }))
+    .sort((x, y) => y.n - x.n);
+}
+
+// 驗證策略清單：樣本 ≥100 且勝率 ≥80% 的標籤
+function getProvenLabTags() {
+  return computeLabTagStats().filter(m => m.n >= LAB_PROMOTE_MIN_N && m.wr >= LAB_PROMOTE_MIN_WR);
+}
+
+// 驗證策略晉升：本輪收錄的機會若帶驗證標籤 → 直接建立正式掛單（免評分/SQ門檻）
+function generateProvenStrategyOrders() {
+  if (!isSignalMaster()) return;
+  const proven = getProvenLabTags();
+  if (!proven.length) return;
+  const provenSet = new Set(proven.map(p => p.tag));
+
+  const positions = getPositions();
+  const today = new Date().toISOString().slice(0, 10);
+  const stopAdj = parseFloat(localStorage.getItem('stop-adj') || '0.99');
+  const newOnes = [];
+
+  for (const t of getLabTracks()) {
+    if (t.outcome || t.date !== today) continue; // 只看本日新收錄且未結的機會
+    const hitTags = (t.tags || []).filter(tag => provenSet.has(tag));
+    if (!hitTags.length) continue;
+    const s = allStocks.find(x => x.id === t.id);
+    const a = s?.analysis;
+    if (!a) continue;
+    if (positions.find(p => p.id === t.id && (p.status === 'pending' || p.status === 'open'))) continue;
+    if (positions.filter(p => p.status === 'pending' || p.status === 'open').length + newOnes.length >= 6) break;
+    if (inCancelCooldown(t.id)) continue;
+
+    let entry = a.ema20 && a.ema20 < a.price ? a.ema20 : a.price * 0.985;
+    entry = +entry.toFixed(2);
+    const stop = +(Math.min(...s.ohlcv.slice(-5).map(d => d.low)) * stopAdj).toFixed(2);
+    if (stop >= entry) continue;
+    const r = entry - stop;
+
+    const volR = a.volMA ? a.lastVol / a.volMA : 1;
+    const sqRes = computeSQ(s);
+    const pos = {
+      uid: Date.now() + '-' + t.id,
+      id: t.id, name: t.name, dir: 'long', sigType: classifySignal(a),
+      score: a.score, suggestedAt: today,
+      entry, stopLoss: stop, baseStop: stop, tp1Hit: false,
+      tp1: +(entry + r * 2).toFixed(2),
+      tp2: +(entry + r * 3).toFixed(2),
+      qty: 1000, status: 'pending', lastPrice: a.price,
+      sqGrade: sqRes.grade, sqScore: sqRes.sq, sqGradeLabel: sqRes.gradeLabel, sqFactors: sqRes.factors,
+      proven: true, provenTags: hitTags,
+      ctx: {
+        rsi: a.rsi != null ? +a.rsi.toFixed(1) : null,
+        adx: a.adx != null ? +a.adx.toFixed(1) : null,
+        volR: +volR.toFixed(2),
+        mktNorm: Math.round(outlookData.norm ?? 0),
+      },
+    };
+    positions.push(pos);
+    newOnes.push(pos);
+  }
+
+  if (newOnes.length) {
+    savePositions(positions);
+    showToast(`🎓 驗證策略晉升：新增 ${newOnes.length} 筆正式掛單（實戰勝率 ≥${LAB_PROMOTE_MIN_WR}% 標籤）`, 'success');
+    if (tgWants('sig')) {
+      const lines = newOnes.map(p => {
+        const stats = p.provenTags.map(tag => {
+          const m = proven.find(x => x.tag === tag);
+          return `${tag}（${m.n} 筆勝率 ${m.wr.toFixed(0)}%）`;
+        }).join('、');
+        return `${p.name}(${p.id}) 評分${p.score}\n🎓 驗證標籤：${stats}\n回踩進場 ${p.entry}｜止損 ${p.stopLoss}（-${((p.entry - p.stopLoss) / p.entry * 100).toFixed(1)}%）\n目標一 ${p.tp1}(2R 觸及後止損移至成本) / 最終 ${p.tp2}(3R)`;
+      }).join('\n\n');
+      tgPush(`🎓 台股雷達 驗證策略晉升建單\n${today}\n\n以下訊號的策略標籤已通過 ≥${LAB_PROMOTE_MIN_N} 筆紙上實戰、勝率 ≥${LAB_PROMOTE_MIN_WR}% 驗證，直接建立正式掛單：\n\n${lines}\n\n⚠ 僅供參考，非投資建議`);
+    }
+  }
 }
 
 // ── 局勢重點（個股頁）───────────────────────────────────────────────────────
