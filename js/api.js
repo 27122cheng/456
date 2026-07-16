@@ -13,32 +13,51 @@ async function fetchWithTimeout(url, timeout) {
   }
 }
 
-// 3-layer proxy fallback with adaptive ordering:
+// Multi-proxy fallback with adaptive ordering:
 // 上次成功的 proxy 記在 localStorage 優先使用 → 不必每個請求都先等失敗的 proxy 超時
 const PROXIES = [
   { name: 'ao-raw',    wrap: e => `https://api.allorigins.win/raw?url=${e}`,  json: r => r.json(), text: r => r.text() },
   { name: 'corsproxy', wrap: e => `https://corsproxy.io/?url=${e}`,           json: r => r.json(), text: r => r.text() },
+  { name: 'codetabs',  wrap: e => `https://api.codetabs.com/v1/proxy?quest=${e}`, json: r => r.json(), text: r => r.text() },
   { name: 'ao-get',    wrap: e => `https://api.allorigins.win/get?url=${e}`,
     json: async r => { const j = await r.json(); return j?.contents ? JSON.parse(j.contents) : null; },
     text: async r => (await r.json())?.contents ?? null },
 ];
 
+// 熔斷器：連續失敗 3 次的 proxy（被限流/掛掉）冷卻 90 秒，
+// 避免之後每個請求都先白等它逾時，也讓負載自動轉移到其他家
+const _proxyFail = {};
+function _proxyUsable(p) {
+  const f = _proxyFail[p.name];
+  return !f || f.n < 3 || Date.now() > f.until;
+}
+function _proxyMark(p, ok) {
+  if (ok) { delete _proxyFail[p.name]; return; }
+  const f = _proxyFail[p.name] || { n: 0, until: 0 };
+  f.n++;
+  if (f.n >= 3) { f.until = Date.now() + 90 * 1000; }
+  _proxyFail[p.name] = f;
+}
+
 function proxyOrder() {
+  const usable = PROXIES.filter(_proxyUsable);
+  const arr = usable.length ? [...usable] : [...PROXIES]; // 全部熔斷時仍然全試
   const pref = localStorage.getItem('proxy-pref');
-  const idx = PROXIES.findIndex(p => p.name === pref);
-  if (idx > 0) { const arr = [...PROXIES]; arr.unshift(arr.splice(idx, 1)[0]); return arr; }
-  return PROXIES;
+  const idx = arr.findIndex(p => p.name === pref);
+  if (idx > 0) arr.unshift(arr.splice(idx, 1)[0]);
+  return arr;
 }
 
 async function proxyFetch(url, timeout = 8000) {
   const enc = encodeURIComponent(url);
   for (const p of proxyOrder()) {
     const res = await fetchWithTimeout(p.wrap(enc), timeout);
-    if (!res) continue;
+    if (!res) { _proxyMark(p, false); continue; }
     try {
       const data = await p.json(res);
-      if (data) { localStorage.setItem('proxy-pref', p.name); return data; }
+      if (data) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return data; }
     } catch {}
+    _proxyMark(p, false);
   }
   return null;
 }
@@ -48,11 +67,12 @@ async function proxyFetchText(url, timeout = 8000) {
   const enc = encodeURIComponent(url);
   for (const p of proxyOrder()) {
     const res = await fetchWithTimeout(p.wrap(enc), timeout);
-    if (!res) continue;
+    if (!res) { _proxyMark(p, false); continue; }
     try {
       const txt = await p.text(res);
-      if (txt && txt.length > 50) { localStorage.setItem('proxy-pref', p.name); return txt; }
+      if (txt && txt.length > 50) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return txt; }
     } catch {}
+    _proxyMark(p, false);
   }
   return null;
 }
@@ -67,6 +87,17 @@ function cacheGet(key, ttl = CACHE_TTL) {
     if (!raw) return null;
     const { t, data } = JSON.parse(raw);
     if (Date.now() - t > ttl) return null;
+    return data;
+  } catch { return null; }
+}
+
+// 陳舊備援：正常 TTL 已過期，但資料還在 24 小時內 → 拿舊資料頂著（總比整頁空白好）
+function cacheGetStale(key, maxAge = 24 * 60 * 60 * 1000) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const { t, data } = JSON.parse(raw);
+    if (Date.now() - t > maxAge) return null;
     return data;
   } catch { return null; }
 }
@@ -92,13 +123,14 @@ function tsToDate(ts) {
 
 async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const key = `cache:ohlcv:${symbol}:${interval}:${range}`;
-  const cached = cacheGet(key);
+  // 日線盤中只有最後一根 K 會變，10 分鐘快取即可 — 大幅減少 proxy 請求量（避免被限流）
+  const cached = cacheGet(key, interval === '1d' || interval === '1wk' ? 10 * 60 * 1000 : CACHE_TTL);
   if (cached) return cached;
 
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
   const data = await proxyFetch(url);
   const result = data?.chart?.result?.[0];
-  if (!result) return [];
+  if (!result) return cacheGetStale(key) || []; // 全 proxy 失敗 → 用 24h 內舊資料頂著
   const { timestamp, indicators } = result;
   const q = indicators.quote[0];
   const ohlcv = timestamp.map((ts, i) => ({

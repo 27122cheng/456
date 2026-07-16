@@ -828,14 +828,13 @@
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-name">自動刷新間隔</div>
-              <div class="setting-desc">自動刷新市場數據的頻率</div>
+              <div class="setting-desc">自動重掃全部股票的頻率（免費資料源有流量限制，過於頻繁會觸發限流導致大量檢測失敗；日線資料盤中僅最後一根 K 棒變動，5 分鐘已足夠）</div>
             </div>
             <select class="setting-select" id="s-refresh">
-              <option value="30">30 秒</option>
-              <option value="60" selected>60 秒</option>
-              <option value="120">2 分鐘</option>
-              <option value="300">5 分鐘</option>
-              <option value="0">停用</option>
+              <option value="300" selected>5 分鐘（建議）</option>
+              <option value="600">10 分鐘</option>
+              <option value="1800">30 分鐘</option>
+              <option value="0">停用（手動刷新）</option>
             </select>
           </div>
         </div>

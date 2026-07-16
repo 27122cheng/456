@@ -114,9 +114,11 @@ async function startScan() {
         renderDashboard();
         if (currentPage === 'ranking') renderRanking();
       }
+      // 請求間加入抖動，平滑突發流量（免費 proxy 對瞬間大量請求最敏感）
+      await delay(120 + Math.random() * 180);
     }
   }
-  await Promise.all(Array.from({ length: 5 }, scanWorker));
+  await Promise.all(Array.from({ length: 4 }, scanWorker));
 
   // 第一輪失敗的個股再重試一次（免費 proxy 偶發逾時很常見，重試通常就會成功）
   const failed = allStocks.filter(s => !s.ohlcv?.length);
@@ -1940,6 +1942,8 @@ async function renderAnalysisPanels(s, inst) {
   const rng = srng(idSeed(s.id));
 
   // 真實基本面：v7 quote（優先）→ quoteSummary（備援）→ 模擬估算（明確標示）
+  // 非同步 IIFE：網路慢/proxy 被限流時不阻塞下方籌碼、支撐壓力、產業面板的渲染
+  const fundP = (async () => {
   let fd = s._fd;
   if (fd === undefined) {
     fd = await fetchQuoteInfo(s.id).catch(() => null);
@@ -2025,6 +2029,7 @@ async function renderAnalysisPanels(s, inst) {
         </table>
       </div>`;
 
+  if (currentStockId !== s.id) return { peN, divYield, yieldPct }; // 已切換個股，別蓋掉新頁面
   document.getElementById('fund-body').innerHTML = `
     <div style="margin-bottom:8px">${fdBadge}</div>
     <div class="fund-cols">
@@ -2051,6 +2056,8 @@ async function renderAnalysisPanels(s, inst) {
         <div class="div-calc-row" style="margin-bottom:0"><span style="color:var(--text3)">每季估計</span><span style="font-family:var(--mono);color:var(--text3)">+${Math.round(annualIncome/4).toLocaleString()} 元</span></div>
       </div>
     </div>`;
+  return { peN, divYield, yieldPct };
+  })();
 
   // ── Render 籌碼面 ──────────────────────────────────────────────
   // 優先用逐日累積的真實法人歷史（inst-hist），不足 5 天的舊日子以模擬示意補齊
@@ -2161,6 +2168,8 @@ async function renderAnalysisPanels(s, inst) {
   const ret20 = ohlcv.length>=21 ? ((closes[closes.length-1]-closes[closes.length-21])/closes[closes.length-21]*100).toFixed(1) : '0.0';
 
   // 真實 Beta / 相關性 / 大盤報酬：與加權指數近 60 日日報酬計算（TWII 有快取，成本低）
+  // 非同步 IIFE：與基本面並行抓取，互不等待，也不擋住產業/AI 面板
+  const mktP = (async () => {
   let beta = null, corr = null, mktRet20 = null;
   try {
     const twiiBars = await fetchYahooOHLCV('^TWII', '1d', '6mo');
@@ -2197,6 +2206,7 @@ async function renderAnalysisPanels(s, inst) {
     ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 實測（近60日 vs 加權指數）</span>'
     : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（大盤數據暫時無法取得）</span>';
 
+  if (currentStockId !== s.id) return { rs, rsN }; // 已切換個股，別蓋掉新頁面
   document.getElementById('mkt-body').innerHTML = `
     <div style="margin-bottom:8px">${mktBadge}</div>
     <div class="mkt-grid">
@@ -2221,6 +2231,8 @@ async function renderAnalysisPanels(s, inst) {
       超額報酬 <span style="font-family:var(--mono);color:${rsColor}">${rsN>0?'+':''}${rs}%</span>。
       Beta ${beta}，${corr>0.6?'與指數連動性高，受大盤情緒影響明顯':'與指數連動性低，可作分散持倉選項'}。
     </div>`;
+  return { rs, rsN };
+  })();
 
   // ── Render 產業面 ──────────────────────────────────────────────
   const sectorTrend = a.score>=60 ? {l:'上升趨勢',c:'ind-bull'} : a.score>=45 ? {l:'盤整觀望',c:'ind-neutral'} : {l:'下行壓力',c:'ind-bear'};
@@ -2249,7 +2261,11 @@ async function renderAnalysisPanels(s, inst) {
     if (live?.length && currentStockId === s.id) renderIndBody(live, true);
   });
 
-  // ── Render AI 綜合分析 ─────────────────────────────────────────
+  // ── Render AI 綜合分析（等基本面與市場面就緒；其一失敗用中性預設值，不讓面板卡死）──
+  const [fundRes, mktRes] = await Promise.all([fundP.catch(() => null), mktP.catch(() => null)]);
+  const { peN = 15, divYield = 0.03, yieldPct = '3.00' } = fundRes || {};
+  const { rs = '0.0', rsN = 0 } = mktRes || {};
+  if (currentStockId !== s.id) return; // 使用者已切換到別檔，不要蓋掉新頁面
   const macdBull = a.macd?.macd > a.macd?.signal;
   const factors = [
     { txt:`RSI ${a.rsi?.toFixed(1)} ${a.rsi>60?'多頭':a.rsi<40?'弱勢':'中性'}`, cls: a.rsi>60?'bull':a.rsi<40?'bear':'neutral' },
@@ -2453,17 +2469,18 @@ function manualRefresh() {
 }
 
 function startRefreshCycle() {
-  const sec = parseInt(localStorage.getItem('refresh-interval') || '60');
+  const sec = parseInt(localStorage.getItem('refresh-interval') || '300');
   if (sec === 0) return;
   refreshSec = sec;
   let remaining = refreshSec;
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
     remaining--;
-    document.getElementById('refresh-countdown').textContent = remaining + '秒';
+    document.getElementById('refresh-countdown').textContent = remaining >= 60 ? `${Math.floor(remaining / 60)}分${remaining % 60}秒` : remaining + '秒';
     if (remaining <= 0) {
       remaining = refreshSec;
-      if (!scanning) startScan();
+      // 分頁在背景時不重掃（省流量也避免無人看時把免費資料源的額度打光）
+      if (!scanning && !document.hidden) startScan();
     }
   }, 1000);
 }
@@ -2473,7 +2490,13 @@ function startRefreshCycle() {
 function loadSettings() {
   const tf = localStorage.getItem('timeframe') || '1d';
   currentTF = tf;
-  const refreshVal = localStorage.getItem('refresh-interval') || '60';
+  // 一次性遷移：舊版預設 60 秒全池重掃對免費資料源太頻繁（觸發限流 → 大量檢測失敗），下限改 5 分鐘
+  let refreshVal = localStorage.getItem('refresh-interval') || '300';
+  if (+refreshVal > 0 && +refreshVal < 300 && !localStorage.getItem('refresh-migrated')) {
+    refreshVal = '300';
+    localStorage.setItem('refresh-interval', '300');
+    localStorage.setItem('refresh-migrated', '1');
+  }
   const bull = localStorage.getItem('bull-threshold') || '60';
   const bear = localStorage.getItem('bear-threshold') || '40';
 
