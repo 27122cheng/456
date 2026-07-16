@@ -88,7 +88,9 @@ async function startScan() {
   fetchTWII().then(renderMarketIndex).catch(() => {});
   loadMarketOutlook();
   loadInstitutionalOverview();
-  fetchTWDayAll().catch(() => {}); // 預熱官方全市場行情（不走 proxy，供全部個股合併最新價）
+  fetchTWDayAll().catch(() => {});   // 預熱官方全市場行情（不走 proxy，供全部個股合併最新價）
+  fetchTWFundAll().catch(() => {});  // 預熱官方估值資料（個股頁基本面秒開）
+  fetchYahooOHLCV('^TWII', '1d', '6mo').catch(() => {}); // 預熱大盤 6 個月（個股頁市場面 Beta 計算秒開）
 
   // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
   const queue = [...allStocks];
@@ -1964,25 +1966,10 @@ async function renderAnalysisPanels(s, inst) {
   // 真實基本面：v7 quote（優先）→ quoteSummary（備援）→ 模擬估算（明確標示）
   // 非同步 IIFE：網路慢/proxy 被限流時不阻塞下方籌碼、支撐壓力、產業面板的渲染
   const fundP = (async () => {
+  // 官方估值資料（TWSE BWIBBU_ALL / TPEx）：全市場一次抓有快取，快且不依賴 Yahoo
   let fd = s._fd;
   if (fd === undefined) {
-    fd = await fetchQuoteInfo(s.id).catch(() => null);
-    if (!fd) {
-      try {
-        const suffix = localStorage.getItem(`sym-suffix:${s.id}`) === 'TWO' ? 'TWO' : 'TW';
-        const raw = await proxyFetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${s.id}.${suffix}?modules=defaultKeyStatistics,summaryDetail`, 8000);
-        const r0 = raw?.quoteSummary?.result?.[0];
-        if (r0) fd = {
-          pe: r0.summaryDetail?.trailingPE?.raw ?? r0.defaultKeyStatistics?.forwardPE?.raw ?? null,
-          pb: r0.defaultKeyStatistics?.priceToBook?.raw ?? null,
-          divYield: r0.summaryDetail?.dividendYield?.raw ?? null,
-          eps: r0.defaultKeyStatistics?.trailingEps?.raw ?? null,
-          marketCap: r0.summaryDetail?.marketCap?.raw ?? null,
-          high52: r0.summaryDetail?.fiftyTwoWeekHigh?.raw ?? null,
-          low52: r0.summaryDetail?.fiftyTwoWeekLow?.raw ?? null,
-        };
-      } catch {}
-    }
+    fd = await fetchTWFundamentals(s.id).catch(() => null);
     s._fd = fd || null;
     fd = s._fd;
   }
@@ -1992,10 +1979,14 @@ async function renderAnalysisPanels(s, inst) {
   const pb = fd?.pb ?? +(0.8 + rng()*3.5).toFixed(2);
   const divYield = fd?.divYield ?? +(0.025 + rng()*0.055).toFixed(4);
 
-  // 護城河改以真實市值分級（市值 = 規模 + 產業地位的粗略代理），無市值才用估算
-  const capB = fd?.marketCap ? fd.marketCap / 1e8 : null; // 億元
-  const moatScore = capB != null
-    ? (capB >= 10000 ? 5 : capB >= 3000 ? 4 : capB >= 1000 ? 3 : capB >= 300 ? 2 : 1)
+  // 由官方 P/E、P/B 回推每股數據（官方只給比率，價格已知 → 可還原絕對值）
+  const epsTTM   = isRealFd && fd.pe > 0 ? a.price / fd.pe : null; // 近四季 EPS
+  const bookVal  = isRealFd && fd.pb > 0 ? a.price / fd.pb : null; // 每股淨值
+  const divPerSh = isRealFd && fd.divYield != null ? a.price * fd.divYield : null; // 每股年股利
+
+  // 護城河：官方數據時以「獲利穩定度」粗估（有配息 + 淨值溢價），否則估算
+  const moatScore = isRealFd
+    ? Math.min(5, Math.max(1, (fd.divYield > 0 ? 2 : 1) + (fd.pb >= 1.5 ? 1 : 0) + (fd.pe != null && fd.pe > 0 && fd.pe < 25 ? 1 : 0) + (fd.divYield > 0.04 ? 1 : 0)))
     : Math.round(1 + rng()*4);
   const yieldPct = (divYield * 100).toFixed(2);
   const annualIncome = Math.round(100000 * divYield);
@@ -2005,34 +1996,36 @@ async function renderAnalysisPanels(s, inst) {
   const yldColor = divYield>0.05 ? 'var(--bull)' : divYield>0.03 ? 'var(--blue)' : 'var(--text2)';
   const moatDescs = ['護城河薄弱','競爭優勢有限','具一定品牌優勢','強健技術/品牌壁壘','行業主導者'];
   const fdBadge = isRealFd
-    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 即時數據 Yahoo</span>'
-    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（真實數據暫時無法取得）</span>';
+    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方數據 TWSE/TPEx</span>'
+    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（此代號無官方估值資料，如 ETF）</span>';
 
-  // 52 週價格位置（真實數據才顯示）
-  let range52Html = '';
-  if (fd?.high52 && fd?.low52 && fd.high52 > fd.low52) {
-    const pos52 = Math.max(0, Math.min(100, (a.price - fd.low52) / (fd.high52 - fd.low52) * 100));
-    range52Html = `
+  // 近半年價格位置（用已抓到的真實 K 線計算）
+  let rangeHtml = '';
+  const hi6 = ohlcv.length ? Math.max(...ohlcv.map(b => b.high)) : null;
+  const lo6 = ohlcv.length ? Math.min(...ohlcv.map(b => b.low)) : null;
+  if (hi6 != null && lo6 != null && hi6 > lo6) {
+    const pos6 = Math.max(0, Math.min(100, (a.price - lo6) / (hi6 - lo6) * 100));
+    rangeHtml = `
       <div class="fund-block" style="margin-top:10px">
-        <div class="fund-block-ttl">52 週價格區間</div>
-        <div style="display:flex;justify-content:space-between;font-size:0.72rem;font-family:var(--mono);margin:6px 0 4px"><span style="color:var(--bull)">${fd.low52.toFixed(2)}</span><span style="color:var(--text2)">現價 ${a.price.toFixed(2)}（${pos52.toFixed(0)}%）</span><span style="color:var(--bear)">${fd.high52.toFixed(2)}</span></div>
+        <div class="fund-block-ttl">近半年價格區間</div>
+        <div style="display:flex;justify-content:space-between;font-size:0.72rem;font-family:var(--mono);margin:6px 0 4px"><span style="color:var(--bull)">${lo6.toFixed(2)}</span><span style="color:var(--text2)">現價 ${a.price.toFixed(2)}（${pos6.toFixed(0)}%）</span><span style="color:var(--bear)">${hi6.toFixed(2)}</span></div>
         <div style="height:6px;border-radius:3px;background:linear-gradient(90deg,var(--bull),var(--yellow),var(--bear));position:relative">
-          <div style="position:absolute;top:-3px;left:${pos52}%;width:3px;height:12px;background:var(--text1);border-radius:2px;transform:translateX(-50%)"></div>
+          <div style="position:absolute;top:-3px;left:${pos6}%;width:3px;height:12px;background:var(--text1);border-radius:2px;transform:translateX(-50%)"></div>
         </div>
       </div>`;
   }
 
   const keyStatsHtml = isRealFd ? `
       <div class="fund-block">
-        <div class="fund-block-ttl">關鍵財務數據</div>
+        <div class="fund-block-ttl">關鍵財務數據（由官方比率回推）</div>
         <table class="qt-table">
           <tbody>
-            <tr><td style="color:var(--text3)">近四季 EPS (TTM)</td><td class="${fd.eps > 0 ? 'qt-pos' : 'qt-neg'}">${fd.eps != null ? fd.eps.toFixed(2) + ' 元' : '--'}</td></tr>
-            <tr><td style="color:var(--text3)">市值</td><td>${capB != null ? (capB >= 10000 ? (capB/10000).toFixed(2) + ' 兆' : capB.toFixed(0) + ' 億') : '--'}</td></tr>
-            <tr><td style="color:var(--text3)">EPS 回推年獲利力</td><td>${fd.eps != null && fd.eps > 0 ? '每股 ' + fd.eps.toFixed(2) + ' 元／P/E ' + peN.toFixed(1) + 'x' : '--'}</td></tr>
+            <tr><td style="color:var(--text3)">近四季 EPS</td><td class="${epsTTM > 0 ? 'qt-pos' : ''}">${epsTTM != null ? epsTTM.toFixed(2) + ' 元' : '--（虧損或無盈餘資料）'}</td></tr>
+            <tr><td style="color:var(--text3)">每股淨值</td><td>${bookVal != null ? bookVal.toFixed(2) + ' 元' : '--'}</td></tr>
+            <tr><td style="color:var(--text3)">每股年股利</td><td class="${divPerSh > 0 ? 'qt-pos' : ''}">${divPerSh != null ? divPerSh.toFixed(2) + ' 元' : '--'}</td></tr>
           </tbody>
         </table>
-        ${range52Html}
+        ${rangeHtml}
       </div>` : `
       <div class="fund-block">
         <div class="fund-block-ttl">近四季財務數據 <span style="font-size:0.6rem;color:var(--yellow)">模擬示意</span></div>
@@ -2064,7 +2057,7 @@ async function renderAnalysisPanels(s, inst) {
           </div>
         </div>
         <div class="moat-grid">
-          <div class="moat-item"><div class="moat-lbl">護城河評估${capB != null ? '（依市值規模）' : ''}</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
+          <div class="moat-item"><div class="moat-lbl">護城河評估${isRealFd ? '（依獲利體質）' : ''}</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
         </div>
       </div>
     </div>
