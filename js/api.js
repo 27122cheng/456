@@ -130,7 +130,7 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
   const data = await proxyFetch(url);
   const result = data?.chart?.result?.[0];
-  if (!result) return cacheGetStale(key) || []; // 全 proxy 失敗 → 用 24h 內舊資料頂著
+  if (!result) return cacheGetStale(key, 72 * 60 * 60 * 1000) || []; // 全 proxy 失敗 → 72h 內舊資料頂著（官方源會補最新一根）
   const { timestamp, indicators } = result;
   const q = indicators.quote[0];
   const ohlcv = timestamp.map((ts, i) => ({
@@ -145,6 +145,89 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   return ohlcv;
 }
 
+// ── TWSE / TPEx 官方全市場當日行情 ─────────────────────────────────────────
+// 官方 Open API 支援 CORS（不需要 proxy！），一個請求涵蓋整個市場的當日 OHLCV。
+// 這是最可靠的價格來源 — Yahoo/proxy 全掛時，價格顯示仍然正常。
+
+let _dayAllPromise = null;
+
+async function fetchTWDayAll() {
+  if (_dayAllPromise) return _dayAllPromise; // in-flight 去重：掃描 worker 並行時只抓一次
+  _dayAllPromise = (async () => {
+    const key = 'cache:dayall';
+    const cached = cacheGet(key, 10 * 60 * 1000);
+    if (cached) return cached;
+
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const map = {};
+
+    // 直接抓（有 CORS）→ 失敗才退回 proxy
+    const getJSON = async url => {
+      const res = await fetchWithTimeout(url, 10000);
+      if (res) { try { return await res.json(); } catch {} }
+      return proxyFetch(url, 10000);
+    };
+
+    // 上市（TWSE）
+    try {
+      const rows = await getJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
+      for (const r of rows || []) {
+        const close = num(r.ClosingPrice);
+        if (!r.Code || close == null) continue;
+        map[r.Code] = {
+          open: num(r.OpeningPrice) ?? close, high: num(r.HighestPrice) ?? close,
+          low: num(r.LowestPrice) ?? close, close,
+          volume: num(r.TradeVolume) ?? 0, chg: num(r.Change),
+        };
+      }
+    } catch {}
+
+    // 上櫃（TPEx）
+    try {
+      const rows = await getJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes');
+      for (const r of rows || []) {
+        const close = num(r.Close);
+        if (!r.SecuritiesCompanyCode || close == null) continue;
+        map[r.SecuritiesCompanyCode] = {
+          open: num(r.Open) ?? close, high: num(r.High) ?? close,
+          low: num(r.Low) ?? close, close,
+          volume: num(r.TradingShares) ?? 0, chg: num(r.Change),
+        };
+      }
+    } catch {}
+
+    if (Object.keys(map).length) { cacheSet(key, map); return map; }
+    return cacheGetStale(key, 72 * 60 * 60 * 1000); // 全失敗 → 舊資料頂著
+  })();
+  const result = await _dayAllPromise;
+  if (!result) _dayAllPromise = null; // 失敗不要黏住，下次重試
+  return result;
+}
+
+// 台北時間（使用者可能在其他時區開網頁）
+function twNow() {
+  try { return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' })); }
+  catch { return new Date(); }
+}
+
+// 把官方當日行情合併進 Yahoo 歷史：更新今日 bar 或補上缺的今日 bar
+// → 就算 Yahoo 快取是 10 分鐘前甚至昨天的，最後一根 K 棒仍是最新官方數據
+function mergeOfficialBar(ohlcv, q) {
+  if (!q?.close || !ohlcv?.length) return ohlcv;
+  const tw = twNow();
+  const dow = tw.getDay();
+  if (dow === 0 || dow === 6 || tw.getHours() < 9) return ohlcv; // 週末/開盤前不合併
+  const todayStr = `${tw.getFullYear()}-${String(tw.getMonth()+1).padStart(2,'0')}-${String(tw.getDate()).padStart(2,'0')}`;
+  const last = ohlcv[ohlcv.length - 1];
+  if (last.time === todayStr) {
+    Object.assign(last, { open: q.open, high: q.high, low: q.low, close: q.close, volume: q.volume });
+  } else if (last.time < todayStr && !(q.close === last.close && q.volume === last.volume)) {
+    // close+volume 與前一根完全相同 = 官方資料還是昨天的（今日休市），不要重複補
+    ohlcv.push({ time: todayStr, open: q.open, high: q.high, low: q.low, close: q.close, volume: q.volume });
+  }
+  return ohlcv;
+}
+
 // Taiwan stock — append ".TW" (TWSE listed) or ".TWO" (TPEx/OTC)
 function yahooSymbol(stockId) {
   return `${stockId}.TW`;
@@ -154,15 +237,26 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
   // 記住哪些股票是上櫃（.TWO），下次直接抓對的，不用先等 .TW 失敗
   const suffixKey = `sym-suffix:${stockId}`;
   const knownSuffix = localStorage.getItem(suffixKey);
+  let ohlcv = [];
   if (knownSuffix === 'TWO') {
-    const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
-    if (two.length) return two;
+    ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
   }
-  const ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range);
-  if (ohlcv.length > 0) return ohlcv;
-  const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
-  if (two.length) localStorage.setItem(suffixKey, 'TWO');
-  return two;
+  if (!ohlcv.length) {
+    ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range);
+    if (!ohlcv.length) {
+      const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
+      if (two.length) localStorage.setItem(suffixKey, 'TWO');
+      ohlcv = two;
+    }
+  }
+  // 日線：用官方當日行情刷新最後一根 K 棒（官方源不走 proxy，最可靠）
+  if (interval === '1d' && ohlcv.length) {
+    try {
+      const dayAll = await fetchTWDayAll();
+      mergeOfficialBar(ohlcv, dayAll?.[stockId]);
+    } catch {}
+  }
+  return ohlcv;
 }
 
 // Fetch TWII (加權指數) for market overview

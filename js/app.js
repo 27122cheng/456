@@ -50,7 +50,6 @@ let refreshInterval = null;
 let refreshSec = 60;
 let refreshTimer = null;
 let currentStockId = null;
-let tvChart = null;
 let rankingFilter = 'all';
 let rankingSort = { col: 'score', dir: -1 };
 let scanning = false;
@@ -89,6 +88,7 @@ async function startScan() {
   fetchTWII().then(renderMarketIndex).catch(() => {});
   loadMarketOutlook();
   loadInstitutionalOverview();
+  fetchTWDayAll().catch(() => {}); // 預熱官方全市場行情（不走 proxy，供全部個股合併最新價）
 
   // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
   const queue = [...allStocks];
@@ -137,7 +137,12 @@ async function startScan() {
     renderDashboard();
     const still = allStocks.filter(s => !s.ohlcv?.length);
     if (still.length) {
-      showToast(`⚠ ${still.length} 檔資料載入失敗：${still.slice(0, 5).map(x => x.name).join('、')}${still.length > 5 ? '…' : ''}（下輪自動重試）`, 'error');
+      // 歷史 K 線抓不到 → 至少掛上官方當日行情，個股頁還能看到價格
+      try {
+        const dayAll = await fetchTWDayAll();
+        still.forEach(s => { if (dayAll?.[s.id]) s.official = dayAll[s.id]; });
+      } catch {}
+      showToast(`⚠ ${still.length} 檔歷史資料載入失敗：${still.slice(0, 5).map(x => x.name).join('、')}${still.length > 5 ? '…' : ''}（價格改用官方行情，下輪自動重試）`, 'error');
     }
   }
 
@@ -1627,9 +1632,24 @@ async function openStock(stockId) {
   }
 
   if (!s.analysis) {
-    document.getElementById('stock-price').textContent = '無法載入';
+    // 歷史 K 線抓不到 → 用官方當日行情至少把價格顯示出來
+    let q = s.official;
+    if (!q) { try { q = (await fetchTWDayAll())?.[stockId]; } catch {} }
+    if (q?.close) {
+      document.getElementById('stock-price').textContent = q.close.toFixed(2);
+      const chgEl = document.getElementById('stock-change');
+      if (q.chg != null) {
+        const chgPct = q.close - q.chg > 0 ? (q.chg / (q.close - q.chg) * 100) : 0;
+        chgEl.style.color = q.chg >= 0 ? 'var(--bull)' : 'var(--bear)';
+        chgEl.textContent = `${q.chg >= 0 ? '+' : ''}${q.chg.toFixed(2)} (${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}%)`;
+      }
+    } else {
+      document.getElementById('stock-price').textContent = '無法載入';
+    }
     const aab = document.getElementById('ai-anal-body');
-    if (aab) aab.innerHTML = `<div class="adv-loading">個股資料載入失敗（資料來源逾時，或代號不存在/已下市）<br>
+    if (aab) aab.innerHTML = `<div class="adv-loading">${q?.close
+      ? '價格為官方當日行情（TWSE/TPEx）。歷史 K 線暫時無法取得，技術分析與圖表稍後重試。'
+      : '個股資料載入失敗（資料來源逾時，或代號不存在/已下市）'}<br>
       <button class="btn-ghost" style="margin-top:10px;padding:6px 16px" onclick="openStock('${stockId}')">🔄 重新載入</button></div>`;
     return;
   }
@@ -2316,39 +2336,163 @@ async function renderAnalysisPanels(s, inst) {
 
 // ── TradingView Chart ─────────────────────────────────────────────────────
 
-function initTVChart(stockId, interval = 'D') {
+// 自繪 Canvas K 線圖：用已抓到的真實 OHLCV 繪製，不依賴 TradingView
+// （TradingView 免費小工具對台股代碼常顯示「無法顯示」並跳去預設的 AAPL）
+const CHART_TF = {
+  'D':  { tf: '1d',  range: '6mo', label: '日線' },
+  'W':  { tf: '1wk', range: '2y',  label: '週線' },
+  'M':  { tf: '1mo', range: '5y',  label: '月線' },
+  '60': { tf: '60m', range: '1mo', label: '60分' },
+};
+let _chartToken = 0;
+
+async function initTVChart(stockId, interval = 'D') {
   const container = document.getElementById('tv-chart-container');
-  container.innerHTML = '';
-  // 上櫃股票在 TradingView 是 TPEX: 交易所代碼，用 TWSE: 會顯示「找不到商品」
-  const tvSymbol = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? `TPEX:${stockId}` : `TWSE:${stockId}`;
-  if (typeof TradingView === 'undefined') {
-    // Fallback: use embed script approach
-    const script = document.createElement('script');
-    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-    script.async = true;
-    script.textContent = JSON.stringify({
-      symbol: tvSymbol, interval, theme: 'dark', style: '1',
-      locale: 'zh_TW', width: '100%', height: '450',
-      hide_side_toolbar: true, save_image: false,
-    });
-    container.appendChild(script);
+  if (!container) return;
+  const token = ++_chartToken;
+  const cfg = CHART_TF[interval] || CHART_TF.D;
+  container.innerHTML = '<div class="adv-loading" style="padding-top:200px;text-align:center">載入 K 線資料...</div>';
+
+  // 日線優先用掃描時已抓的資料（零額外請求）
+  let bars = null;
+  if (cfg.tf === '1d') bars = allStocks.find(x => x.id === stockId)?.ohlcv;
+  if (!bars?.length) bars = await fetchStockOHLCV(stockId, cfg.tf, cfg.range);
+  if (token !== _chartToken || currentStockId !== stockId) return; // 已切換股票/週期
+
+  if (!bars?.length) {
+    container.innerHTML = `<div class="adv-loading" style="padding-top:190px;text-align:center">K 線資料載入失敗（資料源逾時）<br>
+      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button></div>`;
     return;
   }
-  tvChart = new TradingView.widget({
-    container_id: 'tv-chart-container',
-    symbol: tvSymbol,
-    interval,
-    theme: 'dark',
-    style: '1',
-    locale: 'zh_TW',
-    width: '100%',
-    height: 450,
-    toolbar_bg: '#0d1220',
-    hide_side_toolbar: true,
-    allow_symbol_change: false,
-    save_image: false,
-    studies: ['RSI@tv-basicstudies', 'MASimple@tv-basicstudies'],
-  });
+  drawCandleChart(container, bars, cfg.label, stockId);
+}
+
+function drawCandleChart(container, allBars, tfLabel, stockId) {
+  const bars = allBars.slice(-120);
+  const off = allBars.length - bars.length;
+  const closesAll = allBars.map(b => b.close);
+  const ema20All = calcEMA(closesAll, 20);
+  const ema50All = calcEMA(closesAll, 50);
+
+  container.innerHTML = '';
+  container.style.position = 'relative';
+  const W = container.clientWidth || 800;
+  const H = container.clientHeight || 450;
+  const dpr = window.devicePixelRatio || 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.cssText = `width:${W}px;height:${H}px;display:block`;
+  container.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const BULL = '#22c55e', BEAR = '#ef4444', BLUE = '#00d4ff', YELLOW = '#f59e0b',
+        GRID = 'rgba(255,255,255,0.05)', TXT = '#64748b';
+  const padL = 8, padR = 58, padT = 26, padB = 20;
+  const plotH = H - padT - padB;
+  const priceH = plotH * 0.72, volH = plotH * 0.19, volTop = padT + priceH + plotH * 0.09 - volH * 0.35;
+
+  const hi = Math.max(...bars.map(b => b.high));
+  const lo = Math.min(...bars.map(b => b.low));
+  const range = (hi - lo) || 1;
+  const y = v => padT + (hi - v) / range * priceH;
+  const n = bars.length;
+  const slotW = (W - padL - padR) / n;
+  const bw = Math.max(1, Math.min(slotW * 0.66, 13));
+  const x = i => padL + i * slotW + slotW / 2;
+  const maxVol = Math.max(...bars.map(b => b.volume || 0), 1);
+
+  // 水平網格 + 價格刻度
+  ctx.font = '10px monospace';
+  for (let g = 0; g <= 4; g++) {
+    const v = hi - range * g / 4;
+    const gy = y(v);
+    ctx.strokeStyle = GRID; ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();
+    ctx.fillStyle = TXT; ctx.textAlign = 'left';
+    ctx.fillText(v >= 1000 ? v.toFixed(0) : v.toFixed(2), W - padR + 6, gy + 3);
+  }
+  // 日期刻度（約 6 個）
+  const step = Math.max(1, Math.floor(n / 6));
+  ctx.textAlign = 'center';
+  for (let i = 0; i < n; i += step) {
+    const t = bars[i].time || '';
+    ctx.fillStyle = TXT;
+    ctx.fillText(t.slice(5), x(i), H - 6);
+  }
+
+  // 成交量
+  for (let i = 0; i < n; i++) {
+    const b = bars[i];
+    ctx.fillStyle = (b.close >= b.open ? BULL : BEAR) + '55';
+    const vh = (b.volume || 0) / maxVol * volH;
+    ctx.fillRect(x(i) - bw / 2, volTop + volH - vh, bw, vh);
+  }
+
+  // K 棒
+  for (let i = 0; i < n; i++) {
+    const b = bars[i];
+    const c = b.close >= b.open ? BULL : BEAR;
+    ctx.strokeStyle = c; ctx.fillStyle = c;
+    ctx.beginPath(); ctx.moveTo(x(i), y(b.high)); ctx.lineTo(x(i), y(b.low)); ctx.stroke();
+    const top = y(Math.max(b.open, b.close));
+    const hgt = Math.max(1, Math.abs(y(b.open) - y(b.close)));
+    ctx.fillRect(x(i) - bw / 2, top, bw, hgt);
+  }
+
+  // EMA20 / EMA50
+  const drawEMA = (arr, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      const v = arr[off + i];
+      if (v == null) continue;
+      if (!started) { ctx.moveTo(x(i), y(v)); started = true; } else ctx.lineTo(x(i), y(v));
+    }
+    ctx.stroke(); ctx.lineWidth = 1;
+  };
+  drawEMA(ema20All, BLUE);
+  drawEMA(ema50All, YELLOW);
+
+  // 最新收盤虛線 + 標籤
+  const last = bars[n - 1];
+  const lc = last.close, lcy = y(lc);
+  ctx.strokeStyle = last.close >= last.open ? BULL : BEAR;
+  ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(padL, lcy); ctx.lineTo(W - padR, lcy); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = last.close >= last.open ? BULL : BEAR;
+  ctx.fillRect(W - padR + 2, lcy - 8, padR - 4, 16);
+  ctx.fillStyle = '#04070d'; ctx.textAlign = 'left'; ctx.font = 'bold 10px monospace';
+  ctx.fillText(lc >= 1000 ? lc.toFixed(0) : lc.toFixed(2), W - padR + 6, lcy + 3.5);
+
+  // 圖例
+  ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+  ctx.fillStyle = TXT; ctx.fillText(`${stockId} · ${tfLabel} · ${n} 根`, padL + 2, 14);
+  ctx.fillStyle = BLUE; ctx.fillText('— EMA20', padL + 150, 14);
+  ctx.fillStyle = YELLOW; ctx.fillText('— EMA50', padL + 210, 14);
+
+  // 十字游標 + OHLC 提示框（DOM 覆蓋層，不重繪 canvas）
+  const cross = document.createElement('div');
+  cross.style.cssText = `position:absolute;top:${padT}px;width:1px;height:${priceH}px;background:rgba(255,255,255,0.25);pointer-events:none;display:none`;
+  const tip = document.createElement('div');
+  tip.style.cssText = 'position:absolute;top:24px;padding:6px 10px;background:rgba(10,15,26,0.94);border:1px solid rgba(255,255,255,0.12);border-radius:6px;font-size:11px;font-family:monospace;color:#cbd5e1;pointer-events:none;display:none;z-index:5;line-height:1.6;white-space:nowrap';
+  container.appendChild(cross); container.appendChild(tip);
+
+  const onMove = clientX => {
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const i = Math.round((px - padL - slotW / 2) / slotW);
+    if (i < 0 || i >= n) { cross.style.display = tip.style.display = 'none'; return; }
+    const b = bars[i];
+    const chg = i > 0 ? ((b.close - bars[i - 1].close) / bars[i - 1].close * 100) : 0;
+    cross.style.left = x(i) + 'px'; cross.style.display = 'block';
+    tip.innerHTML = `<strong style="color:#e2e8f0">${b.time}</strong>　<span style="color:${chg >= 0 ? BULL : BEAR}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span><br>` +
+      `開 ${b.open}　高 <span style="color:${BULL}">${b.high}</span>　低 <span style="color:${BEAR}">${b.low}</span>　收 <strong>${b.close}</strong><br>量 ${fmtVol(b.volume)}`;
+    tip.style.display = 'block';
+    tip.style.left = Math.min(Math.max(4, x(i) + 12), W - 250) + 'px';
+  };
+  canvas.addEventListener('mousemove', e => onMove(e.clientX));
+  canvas.addEventListener('mouseleave', () => { cross.style.display = tip.style.display = 'none'; });
+  canvas.addEventListener('touchmove', e => { if (e.touches[0]) onMove(e.touches[0].clientX); }, { passive: true });
+  canvas.addEventListener('touchend', () => { cross.style.display = tip.style.display = 'none'; });
 }
 
 // ── Navigation ─────────────────────────────────────────────────────────────
