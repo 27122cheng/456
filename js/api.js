@@ -14,8 +14,10 @@ async function fetchWithTimeout(url, timeout) {
 }
 
 // Multi-proxy fallback with adaptive ordering:
-// 上次成功的 proxy 記在 localStorage 優先使用 → 不必每個請求都先等失敗的 proxy 超時
+// 第一優先 = 自家 Vercel Serverless 代理（/api/proxy，穩定無限流）；
+// 第三方免費 proxy 只作為備援。上次成功的 proxy 記在 localStorage 優先使用。
 const PROXIES = [
+  { name: 'self',      wrap: e => `/api/proxy?url=${e}`,                      json: r => r.json(), text: r => r.text() },
   { name: 'ao-raw',    wrap: e => `https://api.allorigins.win/raw?url=${e}`,  json: r => r.json(), text: r => r.text() },
   { name: 'corsproxy', wrap: e => `https://corsproxy.io/?url=${e}`,           json: r => r.json(), text: r => r.text() },
   { name: 'codetabs',  wrap: e => `https://api.codetabs.com/v1/proxy?quest=${e}`, json: r => r.json(), text: r => r.text() },
@@ -42,9 +44,17 @@ function _proxyMark(p, ok) {
 function proxyOrder() {
   const usable = PROXIES.filter(_proxyUsable);
   const arr = usable.length ? [...usable] : [...PROXIES]; // 全部熔斷時仍然全試
+  // 自家代理永遠最優先（熔斷時自動退位，例如本機 file:// 開發沒有 /api）
+  const selfIdx = arr.findIndex(p => p.name === 'self');
+  if (selfIdx > 0) arr.unshift(arr.splice(selfIdx, 1)[0]);
+  // 其餘按上次成功者排序
   const pref = localStorage.getItem('proxy-pref');
   const idx = arr.findIndex(p => p.name === pref);
-  if (idx > 0) arr.unshift(arr.splice(idx, 1)[0]);
+  if (idx > 0 && arr[idx].name !== 'self' && arr[0].name === 'self') {
+    const [p] = arr.splice(idx, 1); arr.splice(1, 0, p);
+  } else if (idx > 0 && arr[0].name !== 'self') {
+    arr.unshift(arr.splice(idx, 1)[0]);
+  }
   return arr;
 }
 
