@@ -338,28 +338,59 @@ async function fetchInstitutional(stockId) {
   };
 }
 
-// ── Yahoo 即時報價基本面（v7 quote 不需 crumb，比 quoteSummary 穩定）────────
+// ── TWSE / TPEx 官方估值資料（本益比 / 殖利率 / 股價淨值比）─────────────────
+// Yahoo v7/v10 報價 API 已改為需要 crumb 憑證（匿名請求一律 401，走任何 proxy 都一樣），
+// 改用證交所 BWIBBU_ALL + 櫃買中心 peratio_analysis：全市場一次抓、官方數據、支援 CORS。
 
-async function fetchQuoteInfo(stockId) {
-  const key = `cache:quote:${stockId}`;
-  const cached = cacheGet(key, 60 * 60 * 1000); // 基本面變動慢，快取 1 小時
-  if (cached) return cached;
-  const suffix = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? 'TWO' : 'TW';
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${stockId}.${suffix}`;
-  const data = await proxyFetch(url, 8000);
-  const q = data?.quoteResponse?.result?.[0];
-  if (!q) return null;
-  const info = {
-    pe: q.trailingPE ?? q.forwardPE ?? null,
-    pb: q.priceToBook ?? null,
-    divYield: q.trailingAnnualDividendYield ?? null, // 小數，如 0.045
-    eps: q.epsTrailingTwelveMonths ?? null,
-    marketCap: q.marketCap ?? null,
-    high52: q.fiftyTwoWeekHigh ?? null,
-    low52: q.fiftyTwoWeekLow ?? null,
-  };
-  cacheSet(key, info);
-  return info;
+let _fundAllPromise = null;
+
+async function fetchTWFundAll() {
+  if (_fundAllPromise) return _fundAllPromise;
+  _fundAllPromise = (async () => {
+    const key = 'cache:fundall';
+    const cached = cacheGet(key, 60 * 60 * 1000); // 每日更新一次，快取 1 小時
+    if (cached) return cached;
+
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const getJSON = async url => {
+      const res = await fetchWithTimeout(url, 10000);
+      if (res) { try { return await res.json(); } catch {} }
+      return proxyFetch(url, 10000);
+    };
+    const map = {};
+
+    // 上市（TWSE BWIBBU_ALL：Code / PEratio / DividendYield(%) / PBratio）
+    try {
+      const rows = await getJSON('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL');
+      for (const r of rows || []) {
+        if (!r.Code) continue;
+        const dy = num(r.DividendYield);
+        map[r.Code] = { pe: num(r.PEratio), pb: num(r.PBratio), divYield: dy != null ? dy / 100 : null };
+      }
+    } catch {}
+
+    // 上櫃（TPEx peratio_analysis：SecuritiesCompanyCode / PriceEarningRatio / YieldRatio(%) / PriceBookRatio）
+    try {
+      const rows = await getJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis');
+      for (const r of rows || []) {
+        const id = r.SecuritiesCompanyCode;
+        if (!id) continue;
+        const dy = num(r.YieldRatio);
+        map[id] = { pe: num(r.PriceEarningRatio), pb: num(r.PriceBookRatio), divYield: dy != null ? dy / 100 : null };
+      }
+    } catch {}
+
+    if (Object.keys(map).length) { cacheSet(key, map); return map; }
+    return cacheGetStale(key, 72 * 60 * 60 * 1000);
+  })();
+  const result = await _fundAllPromise;
+  if (!result) _fundAllPromise = null; // 失敗不要黏住，下次重試
+  return result;
+}
+
+async function fetchTWFundamentals(stockId) {
+  const all = await fetchTWFundAll();
+  return all?.[stockId] || null;
 }
 
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────
