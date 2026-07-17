@@ -393,6 +393,70 @@ async function fetchTWFundamentals(stockId) {
   return all?.[stockId] || null;
 }
 
+// ── TWSE 融資融券餘額（台股版未平倉 O.I：融資=槓桿多單、融券=空單未平倉）────
+
+let _marginMemo = null;
+let _marginPromise = null;
+
+async function fetchMarginAll() {
+  if (_marginMemo) return _marginMemo;
+  if (_marginPromise) return _marginPromise;
+  _marginPromise = (async () => {
+    const base = new Date();
+    for (let back = 0; back <= 6; back++) {
+      const d = new Date(base);
+      d.setDate(d.getDate() - back);
+      const dow = d.getDay();
+      if (dow === 0 || dow === 6) continue;
+      const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+      const key = `cache:margin:${ymd}`;
+      const cached = cacheGet(key, 60 * 60 * 1000);
+      if (cached) { _marginMemo = cached; return cached; }
+      try {
+        const url = `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=${ymd}&selectType=ALL&response=json`;
+        const json = await proxyFetch(url, 12000);
+        // rwd 回應可能是 {data} 或 {tables:[...]}：取欄位數最多的那張明細表
+        let rows = json?.data;
+        if (!rows && Array.isArray(json?.tables)) {
+          const t = json.tables.filter(t => Array.isArray(t.data) && t.data.length)
+            .sort((a, b) => (b.fields?.length || 0) - (a.fields?.length || 0))[0];
+          rows = t?.data;
+        }
+        if (rows?.length) {
+          const num = v => parseInt(String(v ?? '').replace(/,/g, ''), 10) || 0;
+          const map = {};
+          for (const r of rows) {
+            const id = String(r[0] ?? '').trim();
+            if (!/^\d{4,6}$/.test(id)) continue;
+            // 欄位：[2..7]融資(買進,賣出,現金償還,前日餘額,今日餘額,限額) [8..13]融券(同序)
+            map[id] = {
+              finPrev: num(r[5]), finBal: num(r[6]),
+              shortPrev: num(r[11]), shortBal: num(r[12]),
+            };
+          }
+          if (Object.keys(map).length) { _marginMemo = map; cacheSet(key, map); return map; }
+        }
+      } catch {}
+    }
+    return cacheGetStale('cache:margin-any', 0) || null; // 無資料
+  })();
+  const result = await _marginPromise;
+  if (!result) _marginPromise = null;
+  return result;
+}
+
+async function fetchMargin(stockId) {
+  const all = await fetchMarginAll();
+  const m = all?.[stockId];
+  if (!m) return null;
+  return {
+    ...m,
+    dFin: m.finBal - m.finPrev,     // 融資日增減（張）
+    dShort: m.shortBal - m.shortPrev, // 融券日增減（張）
+    shortFinRatio: m.finBal > 0 ? m.shortBal / m.finBal * 100 : 0, // 券資比 %
+  };
+}
+
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────
 
 async function fetchMTFSignals(stockId) {

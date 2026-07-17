@@ -19,7 +19,7 @@ export default async function handler(req, res) {
     return;
   }
   try {
-    const upstream = await fetch(url, {
+    const doFetch = () => fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/xml, text/html, */*',
@@ -28,6 +28,12 @@ export default async function handler(req, res) {
       redirect: 'follow',
       signal: AbortSignal.timeout(9000),
     });
+    let upstream = await doFetch();
+    // 上游限流/暫時錯誤 → 等 400ms 重試一次（Yahoo 對雲端 IP 偶發 429）
+    if (upstream.status === 429 || upstream.status >= 500) {
+      await new Promise(r => setTimeout(r, 400));
+      upstream = await doFetch();
+    }
     const body = Buffer.from(await upstream.arrayBuffer());
     // CDN 快取 2 分鐘 + 過期後 10 分鐘內先回舊值背景更新：多人同時使用也只回源一次
     res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=600');
