@@ -1485,7 +1485,7 @@ async function loadInstitutionalOverview() {
   // Sum market-wide totals (張) — 欄位以名稱定位，避免索引錯位
   let foreign = 0, investment = 0, dealer = 0, total = 0;
   const idx = t86ColIdx();
-  const parsed = rows.map(r => parseT86Row(r, idx)).filter(p => /^\d{4,6}$/.test(p.id));
+  const parsed = rows.map(r => parseT86Row(r, idx)).filter(p => isRealStockId(p.id));
   parsed.forEach(p => { foreign += p.foreign; investment += p.investment; dealer += p.dealer; total += p.total; });
 
   // 把個股法人買賣超附加到 allStocks（供機會實驗室「主力吸貨」偵測用）
@@ -3049,10 +3049,24 @@ async function runDiagnostics() {
   if (!el) return;
   const tests = [
     { name: '自家代理 (/api/proxy)', run: async () => {
-        const r = await fetchWithTimeout(`/api/proxy?url=${encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?range=5d&interval=1d')}`, 10000);
-        if (!r) return { ok: false, msg: '無回應（本機 file:// 開啟時正常，須部署到 Vercel）' };
-        const j = await r.json().catch(() => null);
-        return j?.chart?.result?.[0] ? { ok: true, msg: '正常，台積電 K 線可取得' } : { ok: false, msg: `HTTP ${r.status}，回應非預期` };
+        let res;
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 12000);
+        try {
+          res = await fetch(`/api/proxy?url=${encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?range=5d&interval=1d')}`,
+            { signal: ctrl.signal });
+        } catch { return { ok: false, msg: '連線失敗（本機 file:// 開啟時正常，須部署後測試）' }; }
+        finally { clearTimeout(timer); }
+        const txt = await res.text().catch(() => '');
+        if (/^\s*<(!doctype|html)/i.test(txt))
+          return { ok: false, msg: '回傳網頁而非資料 — vercel.json 的 rewrites 未排除 /api/' };
+        if (!res.ok) return { ok: false, msg: `HTTP ${res.status}｜${txt.slice(0, 80)}` };
+        try {
+          const j = JSON.parse(txt);
+          return j?.chart?.result?.[0]
+            ? { ok: true, msg: '正常，台積電 K 線可取得' }
+            : { ok: false, msg: `回應格式非預期：${txt.slice(0, 80)}` };
+        } catch { return { ok: false, msg: `無法解析：${txt.slice(0, 80)}` }; }
       } },
     { name: '證交所當日行情 (STOCK_DAY_ALL)', run: async () => {
         const m = await fetchTWDayAll();
@@ -3092,7 +3106,15 @@ async function runDiagnostics() {
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` } : { ok: false, msg: '無資料' };
       } },
   ];
-  el.innerHTML = '<div style="margin:10px 0;padding:12px;background:rgba(255,255,255,0.02);border-radius:8px;font-size:0.82rem;color:var(--text3)">🩺 診斷中，請稍候...</div>';
+  // 先清除熔斷與記憶體快取，否則測到的是「先前失敗的紀錄」而非資料源真實狀態
+  try {
+    localStorage.removeItem('src-dead');
+    localStorage.removeItem('proxy-fail');
+    Object.keys(localStorage).filter(k => k.startsWith('cache:')).forEach(k => localStorage.removeItem(k));
+  } catch {}
+  resetSourceState();
+
+  el.innerHTML = '<div style="margin:10px 0;padding:12px;background:rgba(255,255,255,0.02);border-radius:8px;font-size:0.82rem;color:var(--text3)">🩺 診斷中（已清除快取與熔斷狀態，測試真實連線）...</div>';
   const results = [];
   for (const t of tests) {
     let res;
