@@ -351,6 +351,56 @@ function recentTradingDays(n = 3) {
 }
 
 let _t86Promise = null;
+let _t86Fields = null;
+
+// 用 TWSE 回應的欄位名稱定位（寫死索引極易出錯：欄位 7 是「外資自營商」不是投信、
+// 欄位 11 是自營商不是三大法人合計）。找不到 fields 時退回官方文件的正確索引。
+function t86ColIdx() {
+  const f = _t86Fields;
+  const find = (...keys) => {
+    if (!Array.isArray(f)) return -1;
+    for (const k of keys) {
+      const i = f.findIndex(name => typeof name === 'string' && name.replace(/\s/g, '').includes(k));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+  const foreign = find('外陸資買賣超股數(不含外資自營商)', '外資買賣超股數');
+  const investment = find('投信買賣超股數');
+  // 「自營商買賣超股數」總計欄（避免抓到「自行買賣」或「避險」子欄）
+  const dealer = (() => {
+    if (!Array.isArray(f)) return -1;
+    const i = f.findIndex(n => typeof n === 'string' && n.replace(/\s/g, '') === '自營商買賣超股數');
+    return i >= 0 ? i : find('自營商買賣超股數');
+  })();
+  const total = find('三大法人買賣超股數');
+  return {
+    foreign:    foreign    >= 0 ? foreign    : 4,
+    investment: investment >= 0 ? investment : 10,
+    dealer:     dealer     >= 0 ? dealer     : 11,
+    total:      total      >= 0 ? total      : 18,
+  };
+}
+
+// 解析成 {id, name, foreign, investment, dealer, total}（單位：張）
+function parseT86Row(r, idx) {
+  const id = String(r[0] ?? '').trim();
+  const foreign = parseK(r[idx.foreign]);
+  const investment = parseK(r[idx.investment]);
+  const dealer = parseK(r[idx.dealer]);
+  // 合計欄若缺，用三者相加（比抓錯欄位可靠）
+  const rawTotal = r[idx.total];
+  const total = rawTotal != null && rawTotal !== '' ? parseK(rawTotal) : foreign + investment + dealer;
+  return { id, name: String(r[1] ?? '').trim(), foreign, investment, dealer, total };
+}
+
+// 全市場法人資料（已正確解析）
+async function fetchT86Parsed() {
+  const rows = await fetchT86All();
+  if (!rows?.length) return null;
+  const idx = t86ColIdx();
+  return rows.map(r => parseT86Row(r, idx)).filter(p => /^\d{4,6}$/.test(p.id));
+}
 
 async function fetchT86All() {
   if (_t86Memo) return _t86Memo;
@@ -360,20 +410,27 @@ async function fetchT86All() {
     // 先看快取（零成本）
     for (const { ymd, iso } of days) {
       const cached = cacheGet(`cache:t86:${ymd}`, 60 * 60 * 1000);
-      if (cached) { _t86Memo = cached; localStorage.setItem('t86-last-date', iso); return cached; }
+      if (cached) {
+        _t86Memo = cached;
+        _t86Fields = cacheGet(`cache:t86f:${ymd}`, 24 * 60 * 60 * 1000) || null;
+        localStorage.setItem('t86-last-date', iso);
+        return cached;
+      }
     }
     if (srcDead('t86')) return null;
     // 三天並行探測，誰先有資料就用誰（過去是序列 × 12 秒逾時 → 最壞數分鐘）
     const results = await Promise.all(days.map(async ({ ymd, iso }) => {
       try {
         const data = await proxyFetch(`https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALL&response=json`, 6000);
-        return data?.data?.length ? { rows: data.data, ymd, iso } : null;
+        return data?.data?.length ? { rows: data.data, fields: data.fields, ymd, iso } : null;
       } catch { return null; }
     }));
     const hit = results.find(Boolean); // days 已由新到舊排序
     if (hit) {
       _t86Memo = hit.rows;
+      _t86Fields = hit.fields || null;
       cacheSet(`cache:t86:${hit.ymd}`, hit.rows);
+      if (hit.fields) cacheSet(`cache:t86f:${hit.ymd}`, hit.fields);
       localStorage.setItem('t86-last-date', hit.iso);
       srcMarkAlive('t86');
       return hit.rows;
@@ -392,12 +449,8 @@ async function fetchInstitutional(stockId) {
   if (!table) return null;
   const row = table.find(r => r[0]?.trim() === stockId);
   if (!row) return null;
-  return {
-    foreign:    parseK(row[4]),
-    investment: parseK(row[7]),
-    dealer:     parseK(row[10]),
-    total:      parseK(row[11]),
-  };
+  const { id, name, ...vals } = parseT86Row(row, t86ColIdx());
+  return vals;
 }
 
 // ── TWSE / TPEx 官方估值資料（本益比 / 殖利率 / 股價淨值比）─────────────────
@@ -443,6 +496,59 @@ async function fetchTWFundAll() {
 
 async function fetchTWFundamentals(stockId) {
   const all = await fetchTWFundAll();
+  return all?.[stockId] || null;
+}
+
+// ── 月營收（台股最重要的即時基本面指標）──────────────────────────────────
+// 證交所 t187ap05_L（上市）+ 櫃買 mopsfin_t187ap05_O（上櫃），全市場一次抓。
+// 欄位名稱以關鍵字比對，避免官方調整欄位名時整組失效。
+let _revPromise = null;
+
+function pickNum(obj, ...keys) {
+  for (const k of keys) {
+    const hit = Object.keys(obj).find(n => n.replace(/\s/g, '').includes(k));
+    if (hit != null) {
+      const v = parseFloat(String(obj[hit]).replace(/,/g, ''));
+      if (isFinite(v)) return v;
+    }
+  }
+  return null;
+}
+
+async function fetchRevenueAll() {
+  if (_revPromise) return _revPromise;
+  _revPromise = (async () => {
+    const key = 'cache:revall';
+    const cached = cacheGet(key, 6 * 60 * 60 * 1000); // 月營收每月更新，快取 6 小時
+    if (cached) return cached;
+
+    const [twse, tpex] = await Promise.all([
+      officialJSON('https://openapi.twse.com.tw/v1/opendata/t187ap05_L', 'twse-rev', 8000).catch(() => null),
+      officialJSON('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O', 'tpex-rev', 8000).catch(() => null),
+    ]);
+
+    const map = {};
+    for (const r of [...(twse || []), ...(tpex || [])]) {
+      const id = String(r['公司代號'] ?? r['SecuritiesCompanyCode'] ?? '').trim();
+      if (!/^\d{4,6}$/.test(id)) continue;
+      const yoy = pickNum(r, '去年同月增減', '營收成長率');
+      const mom = pickNum(r, '上月比較增減');
+      const cumYoy = pickNum(r, '前期比較增減', '累計營業收入-去年同期增減');
+      const rev = pickNum(r, '當月營收');
+      const ym = String(r['資料年月'] ?? '').trim();
+      if (yoy == null && rev == null) continue;
+      map[id] = { yoy, mom, cumYoy, rev, ym };
+    }
+    if (Object.keys(map).length) { cacheSet(key, map); return map; }
+    return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000); // 月資料，舊一點也有價值
+  })();
+  const r = await _revPromise;
+  if (!r) _revPromise = null;
+  return r;
+}
+
+async function fetchRevenue(stockId) {
+  const all = await fetchRevenueAll();
   return all?.[stockId] || null;
 }
 

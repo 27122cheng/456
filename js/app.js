@@ -90,6 +90,10 @@ async function startScan() {
   loadInstitutionalOverview();
   fetchTWDayAll().catch(() => {});   // 預熱官方全市場行情（不走 proxy，供全部個股合併最新價）
   fetchTWFundAll().catch(() => {});  // 預熱官方估值資料（個股頁基本面秒開）
+  fetchRevenueAll().then(m => {      // 預熱月營收，並掛到 allStocks 供研判引擎使用
+    if (!m) return;
+    allStocks.forEach(s => { if (m[s.id]) s.rev = m[s.id]; });
+  }).catch(() => {});
   fetchYahooOHLCV('^TWII', '1d', '6mo').catch(() => {}); // 預熱大盤 6 個月（個股頁市場面 Beta 計算秒開）
 
   // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
@@ -114,6 +118,7 @@ async function startScan() {
       // Render incrementally every 5 stocks
       if (done % 5 === 0 || done === total) {
         renderDashboard();
+        renderFocusStocks(); // 邊掃邊更新，掃描未完成也不會卡在初始文字
         if (currentPage === 'ranking') renderRanking();
       }
     }
@@ -304,12 +309,16 @@ function scoreFactor(f) {
     if (f.chg5 < -0.8) return { pts: 1 * f.weight, dir: 'up' };
     return { pts: 0, dir: 'flat' };
   }
-  // Regular index: combine 1d + 5d momentum
-  let pts = 0;
-  if (f.chg1 > 0.5) pts += 1; else if (f.chg1 < -0.5) pts -= 1;
-  if (f.chg5 > 1.5) pts += 1; else if (f.chg5 < -1.5) pts -= 1;
-  pts = Math.max(-1, Math.min(1, pts)) * f.weight;
-  return { pts, dir: pts > 0 ? 'up' : pts < 0 ? 'dn' : 'flat' };
+  // Regular index: 5 日趨勢為主（權重 2/3）、1 日為輔（1/3）
+  // 過去 1 日與 5 日等權，導致「5 日跌 1.2% 但今日小漲」被判成偏多的矛盾
+  let p5 = 0;
+  if (f.chg5 > 1.5) p5 = 1; else if (f.chg5 > 0.4) p5 = 0.5;
+  else if (f.chg5 < -1.5) p5 = -1; else if (f.chg5 < -0.4) p5 = -0.5;
+  let p1 = 0;
+  if (f.chg1 > 0.8) p1 = 1; else if (f.chg1 > 0.3) p1 = 0.5;
+  else if (f.chg1 < -0.8) p1 = -1; else if (f.chg1 < -0.3) p1 = -0.5;
+  const pts = (p5 * 0.67 + p1 * 0.33) * f.weight;
+  return { pts, dir: pts > 0.05 ? 'up' : pts < -0.05 ? 'dn' : 'flat' };
 }
 
 function renderMarketOutlook() {
@@ -363,8 +372,14 @@ function renderMarketOutlook() {
   }
 
   // Composite verdict: normalize to -100..+100
-  const norm = maxPts ? Math.round((totalPts / maxPts) * 100) : 0;
+  // 分母用「完整因子組」的理論總權重，而非只用抓到的因子 —
+  // 否則只成功 3~4 項時，全部同向就會給出 ±100 的假滿分（與實際盤勢矛盾）
+  const fullMax = OUTLOOK_SYMBOLS.reduce((n, c) => n + Math.abs(c.weight) * (c.type === 'vix' ? 2 : 1), 0) + 2 + 2;
+  const denom = Math.max(maxPts, fullMax * 0.75); // 資料齊全度低於 75% 時分母不再縮水
+  const norm = denom ? Math.round((totalPts / denom) * 100) : 0;
+  const coverage = fullMax ? Math.round(maxPts / fullMax * 100) : 0;
   outlookData.norm = norm;
+  outlookData.coverage = coverage;
   let vClass, vIcon, vTitle, vAction;
   if (norm >= 35)       { vClass = 'v-bull';    vIcon = '🐂'; vTitle = '偏多 BULLISH';   vAction = '順勢偏多操作，回檔找買點'; }
   else if (norm >= 15)  { vClass = 'v-bull';    vIcon = '📈'; vTitle = '中性偏多';        vAction = '可小幅偏多，嚴設停損'; }
@@ -378,7 +393,10 @@ function renderMarketOutlook() {
     .map(r => `${r.f.name}${r.pts > 0 ? '偏多' : '偏空'}`).join('、');
   const twii = factors.find(f => f.sym === '^TWII');
   const sox  = factors.find(f => f.sym === '^SOX');
-  let predict = `綜合 ${rows.length} 項因子，市場評分 <strong>${norm > 0 ? '+' : ''}${norm}</strong>（區間 -100 ~ +100）。`;
+  let predict = `綜合 ${rows.length} 項因子，市場評分 <strong>${norm > 0 ? '+' : ''}${norm}</strong>（區間 -100 ~ +100）`;
+  predict += coverage >= 85
+    ? '。'
+    : `，<span style="color:var(--yellow)">資料完整度 ${coverage}%（部分來源未回應，評分僅供參考）</span>。`;
   if (drivers) predict += `主要驅動：${drivers}。`;
   if (twii) predict += ` 加權指數 5 日${twii.chg5 >= 0 ? '上漲' : '下跌'} ${Math.abs(twii.chg5).toFixed(1)}%`;
   if (sox)  predict += `，費半 5 日${sox.chg5 >= 0 ? '+' : ''}${sox.chg5.toFixed(1)}%（台股電子權值高度連動）`;
@@ -1450,12 +1468,10 @@ async function loadInstitutionalOverview() {
     return;
   }
 
-  // Sum market-wide totals (張)
+  // Sum market-wide totals (張) — 欄位以名稱定位，避免索引錯位
   let foreign = 0, investment = 0, dealer = 0, total = 0;
-  const parsed = rows.map(r => ({
-    id: r[0]?.trim(), name: r[1]?.trim(),
-    foreign: parseK(r[4]), investment: parseK(r[7]), dealer: parseK(r[10]), total: parseK(r[11]),
-  }));
+  const idx = t86ColIdx();
+  const parsed = rows.map(r => parseT86Row(r, idx)).filter(p => /^\d{4,6}$/.test(p.id));
   parsed.forEach(p => { foreign += p.foreign; investment += p.investment; dealer += p.dealer; total += p.total; });
 
   // 把個股法人買賣超附加到 allStocks（供機會實驗室「主力吸貨」偵測用）
@@ -1693,6 +1709,17 @@ function buildManagerAnalysis(s) {
   // 波動狀態
   if (a.squeeze?.state === 'squeeze') notes.push(a.squeeze.txt);
   else if (a.squeeze?.state === 'expansion') notes.push(a.squeeze.txt);
+
+  // 月營收年增率（台股最重要的即時基本面指標：營收翻揚常領先股價）
+  const rev = s.rev;
+  if (rev?.yoy != null) {
+    if (rev.yoy >= 30) { dir += 1.5; bull.push(`月營收年增 +${rev.yoy.toFixed(1)}%（高成長）`); }
+    else if (rev.yoy >= 10) { dir += 0.8; bull.push(`月營收年增 +${rev.yoy.toFixed(1)}%`); }
+    else if (rev.yoy <= -20) { dir -= 1.5; bear.push(`月營收年減 ${rev.yoy.toFixed(1)}%（衰退）`); }
+    else if (rev.yoy <= -5) { dir -= 0.8; bear.push(`月營收年減 ${rev.yoy.toFixed(1)}%`); }
+    if (rev.cumYoy != null && rev.yoy > 0 && rev.cumYoy < 0)
+      notes.push('單月轉正但累計仍負 — 復甦初期，續航待觀察');
+  }
 
   // 法人連續買/賣超天數（用逐日累積的真實歷史，連續性比單日更有意義）
   const streak = instStreak(s.id);
@@ -1965,6 +1992,12 @@ async function openStock(stockId) {
     renderOI(s, oi);
     renderManagerVerdict(s);
   }).catch(() => renderOI(s, null));
+  fetchRevenue(stockId).then(rev => {
+    if (currentStockId !== stockId || !rev) return;
+    s.rev = rev;
+    renderManagerVerdict(s);
+    renderAnalysisPanels(s, s._inst || null);
+  }).catch(() => {});
 }
 
 // ── 未平倉部位 O.I（融資融券餘額）───────────────────────────────────────────
@@ -2314,6 +2347,23 @@ async function renderAnalysisPanels(s, inst) {
       </div>`;
   }
 
+  // 月營收（台股最重要的即時基本面指標）
+  const rv = s.rev;
+  const revHtml = rv?.yoy != null ? (() => {
+    const c = rv.yoy >= 20 ? 'var(--bull)' : rv.yoy >= 0 ? 'var(--blue)' : rv.yoy > -15 ? 'var(--yellow)' : 'var(--bear)';
+    const ymTxt = rv.ym && rv.ym.length >= 5 ? `${+rv.ym.slice(0, 3) + 1911} 年 ${+rv.ym.slice(3)} 月` : '最新月份';
+    return `
+      <div class="fund-block" style="margin-top:10px">
+        <div class="fund-block-ttl">月營收（${ymTxt}）<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方</span></div>
+        <table class="qt-table"><tbody>
+          <tr><td style="color:var(--text3)">當月營收</td><td>${rv.rev != null ? (rv.rev >= 1e6 ? (rv.rev/1e6).toFixed(2) + ' 兆' : rv.rev >= 1e3 ? (rv.rev/1e3).toFixed(1) + ' 億' : rv.rev.toFixed(0) + ' 萬') : '--'}</td></tr>
+          <tr><td style="color:var(--text3)">年增率 YoY</td><td style="color:${c};font-weight:700">${rv.yoy >= 0 ? '+' : ''}${rv.yoy.toFixed(1)}%</td></tr>
+          ${rv.mom != null ? `<tr><td style="color:var(--text3)">月增率 MoM</td><td style="color:${rv.mom >= 0 ? 'var(--bull)' : 'var(--bear)'}">${rv.mom >= 0 ? '+' : ''}${rv.mom.toFixed(1)}%</td></tr>` : ''}
+          ${rv.cumYoy != null ? `<tr><td style="color:var(--text3)">累計年增率</td><td style="color:${rv.cumYoy >= 0 ? 'var(--bull)' : 'var(--bear)'}">${rv.cumYoy >= 0 ? '+' : ''}${rv.cumYoy.toFixed(1)}%</td></tr>` : ''}
+        </tbody></table>
+      </div>`;
+  })() : '';
+
   const keyStatsHtml = isRealFd ? `
       <div class="fund-block">
         <div class="fund-block-ttl">關鍵財務數據（由官方比率回推）</div>
@@ -2324,6 +2374,7 @@ async function renderAnalysisPanels(s, inst) {
             <tr><td style="color:var(--text3)">每股年股利</td><td class="${divPerSh > 0 ? 'qt-pos' : ''}">${divPerSh != null ? divPerSh.toFixed(2) + ' 元' : '--'}</td></tr>
           </tbody>
         </table>
+        ${revHtml}
         ${rangeHtml}
       </div>` : `
       <div class="fund-block">
@@ -2594,6 +2645,11 @@ async function renderAnalysisPanels(s, inst) {
     })(),
     { txt:`相對強弱 ${rsN>0?'+':''}${rs}%`, cls: rsN>2?'bull':rsN<-2?'bear':'neutral' },
   ];
+  // 月營收因子
+  if (s.rev?.yoy != null) {
+    factors.push({ txt: `月營收 YoY ${s.rev.yoy >= 0 ? '+' : ''}${s.rev.yoy.toFixed(0)}%`,
+                   cls: s.rev.yoy >= 10 ? 'bull' : s.rev.yoy <= -10 ? 'bear' : 'neutral' });
+  }
   // 融資融券 O.I 因子（若已抓到）
   if (s._oi) {
     const oi = s._oi;
@@ -3046,6 +3102,10 @@ async function runDiagnostics() {
         const r = await fetchT86All();
         return r?.length ? { ok: true, msg: `${r.length} 檔法人買賣超` } : { ok: false, msg: '無資料（非交易日或來源異常）' };
       } },
+    { name: '月營收 (t187ap05)', run: async () => {
+        const m = await fetchRevenueAll();
+        return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔月營收` } : { ok: false, msg: '無資料' };
+      } },
     { name: '融資融券 O.I (MI_MARGN)', run: async () => {
         const m = await fetchMarginAll();
         return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔融資融券` } : { ok: false, msg: '無資料' };
@@ -3172,7 +3232,15 @@ function renderFocusStocks() {
   const el = document.getElementById('focus-body');
   if (!el) return;
   const { daily, weekly } = computeFocusStocks();
-  if (!daily.length) { el.innerHTML = '<div class="adv-loading">數據不足</div>'; return; }
+  if (!daily.length) {
+    const ready = allStocks.filter(s => s.analysis).length;
+    el.innerHTML = `<div class="adv-loading">${scanning
+      ? `掃描中... 已分析 ${ready}/${allStocks.length} 檔，重點股即時產生中`
+      : ready === 0
+        ? '尚無可用資料 — 請至設定頁執行「🩺 資料源診斷」查看資料源狀態'
+        : '資料不足，等待下輪掃描補齊'}</div>`;
+    return;
+  }
 
   const item = (f, chgTxt) => `
     <div class="event-row" style="cursor:pointer" onclick="openStock('${f.s.id}')">
