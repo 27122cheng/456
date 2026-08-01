@@ -59,6 +59,17 @@ function srcMarkDead(name, minutes = 10) {
     localStorage.setItem('src-dead', JSON.stringify(m));
   } catch {}
 }
+// 診斷用：清空所有 in-flight/記憶體快取，讓下一輪請求真正重打
+function resetSourceState() {
+  _dayAllPromise = null; _dayAllResolved = null;
+  _t86Memo = null; _t86Promise = null; _t86Fields = null;
+  _marginMemo = null; _marginPromise = null;
+  _fundAllPromise = null; _revPromise = null; _finPromise = null;
+  _turnoverPromise = null;
+  Object.keys(_proxyFail).forEach(k => delete _proxyFail[k]);
+  _ohlcvInflight.clear();
+}
+
 function srcMarkAlive(name) {
   try {
     const m = JSON.parse(localStorage.getItem('src-dead') || '{}');
@@ -436,11 +447,17 @@ function parseT86Row(r, idx) {
 }
 
 // 全市場法人資料（已正確解析）
+// 只保留真正的股票／ETF：4 位數個股、或 00 開頭的 ETF。
+// 純數字 6 位代號多為權證，若計入會讓全市場買賣超加總嚴重灌水。
+function isRealStockId(id) {
+  return /^\d{4}$/.test(id) || /^00\d{2,4}$/.test(id);
+}
+
 async function fetchT86Parsed() {
   const rows = await fetchT86All();
   if (!rows?.length) return null;
   const idx = t86ColIdx();
-  return rows.map(r => parseT86Row(r, idx)).filter(p => /^\d{4,6}$/.test(p.id));
+  return rows.map(r => parseT86Row(r, idx)).filter(p => isRealStockId(p.id));
 }
 
 async function fetchT86All() {
@@ -462,7 +479,7 @@ async function fetchT86All() {
     // 三天並行探測，誰先有資料就用誰（過去是序列 × 12 秒逾時 → 最壞數分鐘）
     const results = await Promise.all(days.map(async ({ ymd, iso }) => {
       try {
-        const data = await proxyFetch(`https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALL&response=json`, 6000);
+        const data = await proxyFetch(`https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALLBUT0999&response=json`, 6000);
         return data?.data?.length ? { rows: data.data, fields: data.fields, ymd, iso } : null;
       } catch { return null; }
     }));
@@ -715,7 +732,7 @@ async function fetchMarginAll() {
       const map = {};
       for (const r of rows) {
         const id = String(r[0] ?? '').trim();
-        if (!/^\d{4,6}$/.test(id)) continue;
+        if (!isRealStockId(id)) continue;
         // 欄位：[2..7]融資(買進,賣出,現金償還,前日餘額,今日餘額,限額) [8..13]融券(同序)
         map[id] = { finPrev: num(r[5]), finBal: num(r[6]), shortPrev: num(r[11]), shortBal: num(r[12]) };
       }
