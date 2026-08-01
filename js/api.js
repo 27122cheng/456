@@ -311,18 +311,59 @@ async function fetchTWII() {
   return fetchYahooOHLCV('^TWII', '1d', '5d');
 }
 
-// Fetch a single index quote: latest price + 1d / 5d change %
+// 由收盤價序列算出 {price, chg1, chg5}
+function quoteFromCloses(closes) {
+  if (!closes || closes.length < 2) return null;
+  const last = closes[closes.length - 1];
+  const prev = closes[closes.length - 2];
+  const w = closes.length >= 6 ? closes[closes.length - 6] : closes[0];
+  if (!last || !prev || !w) return null;
+  return { price: last, chg1: (last - prev) / prev * 100, chg5: (last - w) / w * 100 };
+}
+
+// Stooq 備援（Yahoo 對雲端 IP 常限流；Stooq 提供免費 CSV，經自家代理取回）
+const STOOQ_SYM = {
+  '^TWII': '^twse', '^SOX': '^sox', '^GSPC': '^spx',
+  '^IXIC': '^ndq', '^DJI': '^dji', '^VIX': '^vix', 'TWD=X': 'usdtwd',
+};
+
+async function fetchStooqCloses(sym) {
+  const s = STOOQ_SYM[sym];
+  if (!s) return null;
+  const key = `cache:stooq:${s}`;
+  const cached = cacheGet(key, 30 * 60 * 1000);
+  if (cached) return cached;
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`;
+  const csv = await proxyFetchText(url, 7000).catch(() => null);
+  if (!csv || !/^Date/i.test(csv.trim())) return null;
+  const closes = csv.trim().split('\n').slice(1)
+    .map(line => parseFloat(line.split(',')[4]))
+    .filter(v => isFinite(v) && v > 0)
+    .slice(-30);
+  if (closes.length < 2) return null;
+  cacheSet(key, closes);
+  return closes;
+}
+
+// 加權指數優先用證交所官方資料（FMTQIK 本就含每日指數，無須依賴 Yahoo）
+async function fetchTWIIQuoteOfficial() {
+  const rows = await fetchMarketTurnover().catch(() => null);
+  if (!rows?.length) return null;
+  const closes = rows.map(r => r.index).filter(v => isFinite(v) && v > 0);
+  return quoteFromCloses(closes);
+}
+
+// Fetch a single index quote: 官方(僅台股) → Yahoo → Stooq 三層備援
 async function fetchIndexQuote(sym) {
+  if (sym === '^TWII') {
+    const official = await fetchTWIIQuoteOfficial().catch(() => null);
+    if (official) return official;
+  }
   const data = await fetchYahooOHLCV(sym, '1d', '1mo');
-  if (data.length < 2) return null;
-  const last = data[data.length - 1];
-  const prev = data[data.length - 2];
-  const w    = data.length >= 6 ? data[data.length - 6] : data[0];
-  return {
-    price: last.close,
-    chg1: (last.close - prev.close) / prev.close * 100,
-    chg5: (last.close - w.close) / w.close * 100,
-  };
+  const q = quoteFromCloses(data.map(d => d.close));
+  if (q) return q;
+  const stooq = await fetchStooqCloses(sym).catch(() => null);
+  return stooq ? quoteFromCloses(stooq) : null;
 }
 
 // ── TWSE Institutional T86（全表快取：每日只抓一次）─────────────────────────
@@ -595,6 +636,54 @@ async function fetchRevenueAll() {
 
 async function fetchRevenue(stockId) {
   const all = await fetchRevenueAll();
+  return all?.[stockId] || null;
+}
+
+// ── 季度財報（綜合損益表：營收、毛利、淨利、EPS）──────────────────────────
+// TWSE t187ap06_L_ci（上市一般業）+ TPEx mopsfin_t187ap06_O_ci（上櫃）
+let _finPromise = null;
+
+async function fetchFinancialsAll() {
+  if (_finPromise) return _finPromise;
+  _finPromise = (async () => {
+    const key = 'cache:finall';
+    const cached = cacheGet(key, 12 * 60 * 60 * 1000); // 季報更新頻率低，快取 12 小時
+    if (cached) return cached;
+
+    const [twse, tpex] = await Promise.all([
+      officialJSON('https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci', 'twse-fin', 9000).catch(() => null),
+      officialJSON('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci', 'tpex-fin', 9000).catch(() => null),
+    ]);
+
+    const map = {};
+    for (const r of [...(twse || []), ...(tpex || [])]) {
+      const id = String(r['公司代號'] ?? r['SecuritiesCompanyCode'] ?? '').trim();
+      if (!/^\d{4,6}$/.test(id)) continue;
+      const revenue = pickNum(r, '營業收入');
+      const gross   = pickNum(r, '營業毛利');
+      const opInc   = pickNum(r, '營業利益');
+      const netInc  = pickNum(r, '本期淨利', '稅後淨利');
+      const eps     = pickNum(r, '基本每股盈餘', '每股盈餘');
+      if (revenue == null && eps == null) continue;
+      map[id] = {
+        year: String(r['年度'] ?? '').trim(),
+        quarter: String(r['季別'] ?? '').trim(),
+        revenue, gross, opInc, netInc, eps,
+        grossMargin: revenue > 0 && gross != null ? gross / revenue * 100 : null,
+        opMargin:    revenue > 0 && opInc != null ? opInc / revenue * 100 : null,
+        netMargin:   revenue > 0 && netInc != null ? netInc / revenue * 100 : null,
+      };
+    }
+    if (Object.keys(map).length) { cacheSet(key, map); return map; }
+    return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+  })();
+  const r = await _finPromise;
+  if (!r) _finPromise = null;
+  return r;
+}
+
+async function fetchFinancials(stockId) {
+  const all = await fetchFinancialsAll();
   return all?.[stockId] || null;
 }
 
