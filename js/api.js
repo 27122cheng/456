@@ -26,19 +26,44 @@ const PROXIES = [
     text: async r => (await r.json())?.contents ?? null },
 ];
 
-// 熔斷器：連續失敗 3 次的 proxy（被限流/掛掉）冷卻 90 秒，
-// 避免之後每個請求都先白等它逾時，也讓負載自動轉移到其他家
-const _proxyFail = {};
+// 熔斷器：連續失敗 2 次的 proxy（被限流/掛掉）冷卻 5 分鐘，
+// 並持久化到 localStorage — 重新整理頁面不會又去試已知掛掉的來源。
+const _proxyFail = (() => {
+  try { return JSON.parse(localStorage.getItem('proxy-fail') || '{}'); } catch { return {}; }
+})();
+function _proxySave() {
+  try { localStorage.setItem('proxy-fail', JSON.stringify(_proxyFail)); } catch {}
+}
 function _proxyUsable(p) {
   const f = _proxyFail[p.name];
-  return !f || f.n < 3 || Date.now() > f.until;
+  return !f || f.n < 2 || Date.now() > f.until;
 }
 function _proxyMark(p, ok) {
-  if (ok) { delete _proxyFail[p.name]; return; }
+  if (ok) { if (_proxyFail[p.name]) { delete _proxyFail[p.name]; _proxySave(); } return; }
   const f = _proxyFail[p.name] || { n: 0, until: 0 };
   f.n++;
-  if (f.n >= 3) { f.until = Date.now() + 90 * 1000; }
+  if (f.n >= 2) f.until = Date.now() + 5 * 60 * 1000;
   _proxyFail[p.name] = f;
+  _proxySave();
+}
+
+// 整體資料源熔斷：某個上游（如 TWSE 全市場行情）失敗後，
+// N 分鐘內所有頁面都直接跳過，不再重複空等 → 這是「跑不動」的主因
+function srcDead(name) {
+  try { return Date.now() < (JSON.parse(localStorage.getItem('src-dead') || '{}')[name] || 0); } catch { return false; }
+}
+function srcMarkDead(name, minutes = 10) {
+  try {
+    const m = JSON.parse(localStorage.getItem('src-dead') || '{}');
+    m[name] = Date.now() + minutes * 60 * 1000;
+    localStorage.setItem('src-dead', JSON.stringify(m));
+  } catch {}
+}
+function srcMarkAlive(name) {
+  try {
+    const m = JSON.parse(localStorage.getItem('src-dead') || '{}');
+    if (m[name]) { delete m[name]; localStorage.setItem('src-dead', JSON.stringify(m)); }
+  } catch {}
 }
 
 function proxyOrder() {
@@ -58,7 +83,7 @@ function proxyOrder() {
   return arr;
 }
 
-async function proxyFetch(url, timeout = 8000) {
+async function proxyFetch(url, timeout = 5000) {
   const enc = encodeURIComponent(url);
   for (const p of proxyOrder()) {
     const res = await fetchWithTimeout(p.wrap(enc), timeout);
@@ -161,53 +186,56 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
 
 let _dayAllPromise = null;
 
+// 官方來源直抓（支援 CORS）→ 失敗才退 proxy；並對整體來源做熔斷
+async function officialJSON(url, srcName, timeout = 6000) {
+  if (srcDead(srcName)) return null;
+  const res = await fetchWithTimeout(url, timeout);
+  if (res) { try { const j = await res.json(); if (j) { srcMarkAlive(srcName); return j; } } catch {} }
+  const viaProxy = await proxyFetch(url, timeout);
+  if (viaProxy) { srcMarkAlive(srcName); return viaProxy; }
+  srcMarkDead(srcName, 10);
+  return null;
+}
+
 async function fetchTWDayAll() {
   if (_dayAllPromise) return _dayAllPromise; // in-flight 去重：掃描 worker 並行時只抓一次
   _dayAllPromise = (async () => {
     const key = 'cache:dayall';
     const cached = cacheGet(key, 10 * 60 * 1000);
-    if (cached) return cached;
+    if (cached) { _dayAllResolved = cached; return cached; }
 
     const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
     const map = {};
 
-    // 直接抓（有 CORS）→ 失敗才退回 proxy
-    const getJSON = async url => {
-      const res = await fetchWithTimeout(url, 10000);
-      if (res) { try { return await res.json(); } catch {} }
-      return proxyFetch(url, 10000);
-    };
+    // 上市與上櫃並行抓，互不等待（過去是序列 → 時間加倍）
+    const [twse, tpex] = await Promise.all([
+      officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', 'twse-day').catch(() => null),
+      officialJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes', 'tpex-day').catch(() => null),
+    ]);
 
-    // 上市（TWSE）
-    try {
-      const rows = await getJSON('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
-      for (const r of rows || []) {
-        const close = num(r.ClosingPrice);
-        if (!r.Code || close == null) continue;
-        map[r.Code] = {
-          open: num(r.OpeningPrice) ?? close, high: num(r.HighestPrice) ?? close,
-          low: num(r.LowestPrice) ?? close, close,
-          volume: num(r.TradeVolume) ?? 0, chg: num(r.Change),
-        };
-      }
-    } catch {}
+    for (const r of twse || []) {
+      const close = num(r.ClosingPrice);
+      if (!r.Code || close == null) continue;
+      map[r.Code] = {
+        open: num(r.OpeningPrice) ?? close, high: num(r.HighestPrice) ?? close,
+        low: num(r.LowestPrice) ?? close, close,
+        volume: num(r.TradeVolume) ?? 0, chg: num(r.Change),
+      };
+    }
+    for (const r of tpex || []) {
+      const close = num(r.Close);
+      if (!r.SecuritiesCompanyCode || close == null) continue;
+      map[r.SecuritiesCompanyCode] = {
+        open: num(r.Open) ?? close, high: num(r.High) ?? close,
+        low: num(r.Low) ?? close, close,
+        volume: num(r.TradingShares) ?? 0, chg: num(r.Change),
+      };
+    }
 
-    // 上櫃（TPEx）
-    try {
-      const rows = await getJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes');
-      for (const r of rows || []) {
-        const close = num(r.Close);
-        if (!r.SecuritiesCompanyCode || close == null) continue;
-        map[r.SecuritiesCompanyCode] = {
-          open: num(r.Open) ?? close, high: num(r.High) ?? close,
-          low: num(r.Low) ?? close, close,
-          volume: num(r.TradingShares) ?? 0, chg: num(r.Change),
-        };
-      }
-    } catch {}
-
-    if (Object.keys(map).length) { cacheSet(key, map); return map; }
-    return cacheGetStale(key, 72 * 60 * 60 * 1000); // 全失敗 → 舊資料頂著
+    if (Object.keys(map).length) { cacheSet(key, map); _dayAllResolved = map; return map; }
+    const stale = cacheGetStale(key, 72 * 60 * 60 * 1000); // 全失敗 → 舊資料頂著
+    if (stale) _dayAllResolved = stale;
+    return stale;
   })();
   const result = await _dayAllPromise;
   if (!result) _dayAllPromise = null; // 失敗不要黏住，下次重試
@@ -243,30 +271,39 @@ function yahooSymbol(stockId) {
   return `${stockId}.TW`;
 }
 
+// 官方當日行情：只有「已經抓好」時才拿來合併，永不阻塞個股 K 線
+let _dayAllResolved = null;
+
+const _ohlcvInflight = new Map(); // 同一檔同時被多處請求時只發一次
+
 async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
-  // 記住哪些股票是上櫃（.TWO），下次直接抓對的，不用先等 .TW 失敗
-  const suffixKey = `sym-suffix:${stockId}`;
-  const knownSuffix = localStorage.getItem(suffixKey);
-  let ohlcv = [];
-  if (knownSuffix === 'TWO') {
-    ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
-  }
-  if (!ohlcv.length) {
-    ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range);
-    if (!ohlcv.length) {
-      const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
-      if (two.length) localStorage.setItem(suffixKey, 'TWO');
-      ohlcv = two;
+  const ikey = `${stockId}:${interval}:${range}`;
+  if (_ohlcvInflight.has(ikey)) return _ohlcvInflight.get(ikey);
+  const task = (async () => {
+    // 記住哪些股票是上櫃（.TWO），下次直接抓對的，不用先等 .TW 失敗
+    const suffixKey = `sym-suffix:${stockId}`;
+    const knownSuffix = localStorage.getItem(suffixKey);
+    let ohlcv = [];
+    if (knownSuffix === 'TWO') {
+      ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
     }
-  }
-  // 日線：用官方當日行情刷新最後一根 K 棒（官方源不走 proxy，最可靠）
-  if (interval === '1d' && ohlcv.length) {
-    try {
-      const dayAll = await fetchTWDayAll();
-      mergeOfficialBar(ohlcv, dayAll?.[stockId]);
-    } catch {}
-  }
-  return ohlcv;
+    if (!ohlcv.length) {
+      ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range);
+      if (!ohlcv.length) {
+        const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
+        if (two.length) localStorage.setItem(suffixKey, 'TWO');
+        ohlcv = two;
+      }
+    }
+    // 日線：若官方當日行情「已就緒」才刷新最後一根 K 棒；尚未就緒就直接回傳，
+    // 絕不等待（過去每檔都 await 全市場行情 → 整站卡死的主因）
+    if (interval === '1d' && ohlcv.length && _dayAllResolved) {
+      try { mergeOfficialBar(ohlcv, _dayAllResolved[stockId]); } catch {}
+    }
+    return ohlcv;
+  })();
+  _ohlcvInflight.set(ikey, task);
+  try { return await task; } finally { _ohlcvInflight.delete(ikey); }
 }
 
 // Fetch TWII (加權指數) for market overview
@@ -296,32 +333,57 @@ function parseK(s) {
 
 let _t86Memo = null; // in-memory：同一個頁面生命週期共用
 
-async function fetchT86All() {
-  if (_t86Memo) return _t86Memo;
-  // 週末只是最常見情況 — 國定假日、颱風假 TWSE 也沒資料，往回最多找 6 天抓最近交易日
+// 最近 N 個「可能的交易日」（跳過週末），供官方逐日 API 回溯用
+function recentTradingDays(n = 3) {
+  const out = [];
   const base = new Date();
-  for (let back = 0; back <= 6; back++) {
+  for (let back = 0; back <= 9 && out.length < n; back++) {
     const d = new Date(base);
     d.setDate(d.getDate() - back);
     const dow = d.getDay();
     if (dow === 0 || dow === 6) continue;
-    const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-    const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-    const key = `cache:t86:${ymd}`;
-    const cached = cacheGet(key, 60 * 60 * 1000); // T86 每日更新一次，快取 1 小時
-    if (cached) { _t86Memo = cached; localStorage.setItem('t86-last-date', iso); return cached; }
-    try {
-      const url = `https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALL&response=json`;
-      const data = await proxyFetch(url, 12000);
-      if (data?.data?.length) {
-        _t86Memo = data.data;
-        cacheSet(key, data.data);
-        localStorage.setItem('t86-last-date', iso);
-        return data.data;
-      }
-    } catch {}
+    out.push({
+      ymd: `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`,
+      iso: `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`,
+    });
   }
-  return null;
+  return out;
+}
+
+let _t86Promise = null;
+
+async function fetchT86All() {
+  if (_t86Memo) return _t86Memo;
+  if (_t86Promise) return _t86Promise;
+  _t86Promise = (async () => {
+    const days = recentTradingDays(3);
+    // 先看快取（零成本）
+    for (const { ymd, iso } of days) {
+      const cached = cacheGet(`cache:t86:${ymd}`, 60 * 60 * 1000);
+      if (cached) { _t86Memo = cached; localStorage.setItem('t86-last-date', iso); return cached; }
+    }
+    if (srcDead('t86')) return null;
+    // 三天並行探測，誰先有資料就用誰（過去是序列 × 12 秒逾時 → 最壞數分鐘）
+    const results = await Promise.all(days.map(async ({ ymd, iso }) => {
+      try {
+        const data = await proxyFetch(`https://www.twse.com.tw/rwd/zh/fund/T86?date=${ymd}&selectType=ALL&response=json`, 6000);
+        return data?.data?.length ? { rows: data.data, ymd, iso } : null;
+      } catch { return null; }
+    }));
+    const hit = results.find(Boolean); // days 已由新到舊排序
+    if (hit) {
+      _t86Memo = hit.rows;
+      cacheSet(`cache:t86:${hit.ymd}`, hit.rows);
+      localStorage.setItem('t86-last-date', hit.iso);
+      srcMarkAlive('t86');
+      return hit.rows;
+    }
+    srcMarkDead('t86', 10);
+    return null;
+  })();
+  const r = await _t86Promise;
+  if (!r) _t86Promise = null;
+  return r;
 }
 
 // 單檔法人：直接查快取的全表，不再重複下載整份 T86
@@ -352,33 +414,24 @@ async function fetchTWFundAll() {
     if (cached) return cached;
 
     const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
-    const getJSON = async url => {
-      const res = await fetchWithTimeout(url, 10000);
-      if (res) { try { return await res.json(); } catch {} }
-      return proxyFetch(url, 10000);
-    };
     const map = {};
 
-    // 上市（TWSE BWIBBU_ALL：Code / PEratio / DividendYield(%) / PBratio）
-    try {
-      const rows = await getJSON('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL');
-      for (const r of rows || []) {
-        if (!r.Code) continue;
-        const dy = num(r.DividendYield);
-        map[r.Code] = { pe: num(r.PEratio), pb: num(r.PBratio), divYield: dy != null ? dy / 100 : null };
-      }
-    } catch {}
-
-    // 上櫃（TPEx peratio_analysis：SecuritiesCompanyCode / PriceEarningRatio / YieldRatio(%) / PriceBookRatio）
-    try {
-      const rows = await getJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis');
-      for (const r of rows || []) {
-        const id = r.SecuritiesCompanyCode;
-        if (!id) continue;
-        const dy = num(r.YieldRatio);
-        map[id] = { pe: num(r.PriceEarningRatio), pb: num(r.PriceBookRatio), divYield: dy != null ? dy / 100 : null };
-      }
-    } catch {}
+    // 上市 BWIBBU_ALL 與上櫃 peratio_analysis 並行抓
+    const [twse, tpex] = await Promise.all([
+      officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL', 'twse-fund').catch(() => null),
+      officialJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis', 'tpex-fund').catch(() => null),
+    ]);
+    for (const r of twse || []) {
+      if (!r.Code) continue;
+      const dy = num(r.DividendYield);
+      map[r.Code] = { pe: num(r.PEratio), pb: num(r.PBratio), divYield: dy != null ? dy / 100 : null };
+    }
+    for (const r of tpex || []) {
+      const id = r.SecuritiesCompanyCode;
+      if (!id) continue;
+      const dy = num(r.YieldRatio);
+      map[id] = { pe: num(r.PriceEarningRatio), pb: num(r.PriceBookRatio), divYield: dy != null ? dy / 100 : null };
+    }
 
     if (Object.keys(map).length) { cacheSet(key, map); return map; }
     return cacheGetStale(key, 72 * 60 * 60 * 1000);
@@ -402,43 +455,42 @@ async function fetchMarginAll() {
   if (_marginMemo) return _marginMemo;
   if (_marginPromise) return _marginPromise;
   _marginPromise = (async () => {
-    const base = new Date();
-    for (let back = 0; back <= 6; back++) {
-      const d = new Date(base);
-      d.setDate(d.getDate() - back);
-      const dow = d.getDay();
-      if (dow === 0 || dow === 6) continue;
-      const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-      const key = `cache:margin:${ymd}`;
-      const cached = cacheGet(key, 60 * 60 * 1000);
+    const days = recentTradingDays(3);
+    for (const { ymd } of days) {
+      const cached = cacheGet(`cache:margin:${ymd}`, 60 * 60 * 1000);
       if (cached) { _marginMemo = cached; return cached; }
-      try {
-        const url = `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=${ymd}&selectType=ALL&response=json`;
-        const json = await proxyFetch(url, 12000);
-        // rwd 回應可能是 {data} 或 {tables:[...]}：取欄位數最多的那張明細表
-        let rows = json?.data;
-        if (!rows && Array.isArray(json?.tables)) {
-          const t = json.tables.filter(t => Array.isArray(t.data) && t.data.length)
-            .sort((a, b) => (b.fields?.length || 0) - (a.fields?.length || 0))[0];
-          rows = t?.data;
-        }
-        if (rows?.length) {
-          const num = v => parseInt(String(v ?? '').replace(/,/g, ''), 10) || 0;
-          const map = {};
-          for (const r of rows) {
-            const id = String(r[0] ?? '').trim();
-            if (!/^\d{4,6}$/.test(id)) continue;
-            // 欄位：[2..7]融資(買進,賣出,現金償還,前日餘額,今日餘額,限額) [8..13]融券(同序)
-            map[id] = {
-              finPrev: num(r[5]), finBal: num(r[6]),
-              shortPrev: num(r[11]), shortBal: num(r[12]),
-            };
-          }
-          if (Object.keys(map).length) { _marginMemo = map; cacheSet(key, map); return map; }
-        }
-      } catch {}
     }
-    return cacheGetStale('cache:margin-any', 0) || null; // 無資料
+    if (srcDead('margin')) return null;
+    const parse = json => {
+      // rwd 回應可能是 {data} 或 {tables:[...]}：取欄位數最多的那張明細表
+      let rows = json?.data;
+      if (!rows && Array.isArray(json?.tables)) {
+        const t = json.tables.filter(t => Array.isArray(t.data) && t.data.length)
+          .sort((a, b) => (b.fields?.length || 0) - (a.fields?.length || 0))[0];
+        rows = t?.data;
+      }
+      if (!rows?.length) return null;
+      const num = v => parseInt(String(v ?? '').replace(/,/g, ''), 10) || 0;
+      const map = {};
+      for (const r of rows) {
+        const id = String(r[0] ?? '').trim();
+        if (!/^\d{4,6}$/.test(id)) continue;
+        // 欄位：[2..7]融資(買進,賣出,現金償還,前日餘額,今日餘額,限額) [8..13]融券(同序)
+        map[id] = { finPrev: num(r[5]), finBal: num(r[6]), shortPrev: num(r[11]), shortBal: num(r[12]) };
+      }
+      return Object.keys(map).length ? map : null;
+    };
+    const results = await Promise.all(days.map(async ({ ymd }) => {
+      try {
+        const json = await proxyFetch(`https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=${ymd}&selectType=ALL&response=json`, 6000);
+        const map = parse(json);
+        return map ? { map, ymd } : null;
+      } catch { return null; }
+    }));
+    const hit = results.find(Boolean);
+    if (hit) { _marginMemo = hit.map; cacheSet(`cache:margin:${hit.ymd}`, hit.map); srcMarkAlive('margin'); return hit.map; }
+    srcMarkDead('margin', 10);
+    return null;
   })();
   const result = await _marginPromise;
   if (!result) _marginPromise = null;
@@ -459,20 +511,40 @@ async function fetchMargin(stockId) {
 
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────
 
-async function fetchMTFSignals(stockId) {
-  const intervals = [
-    { label: '60分', tf: '60m', range: '1mo' },
-    { label: '日線', tf: '1d',  range: '6mo' },
-    { label: '週線', tf: '1wk', range: '2y' },
-  ];
-  return Promise.all(intervals.map(async ({ label, tf, range }) => {
-    const ohlcv = await fetchStockOHLCV(stockId, tf, range);
-    if (ohlcv.length >= 20) {
-      const a = calculateScore(ohlcv);
-      return { label, score: a.score, signal: a.signal };
+// 日線用已抓好的資料直接計算（零請求）；週線由日線聚合（零請求）；
+// 只有 60 分需要額外抓 → 3 個請求縮成 1 個
+function aggregateWeekly(daily) {
+  const out = [];
+  let cur = null;
+  for (const b of daily) {
+    const d = new Date(b.time + 'T00:00:00');
+    // 以「週一」為每週起點分組
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+    const wk = monday.toISOString().slice(0, 10);
+    if (!cur || cur.time !== wk) {
+      cur = { time: wk, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume || 0 };
+      out.push(cur);
+    } else {
+      cur.high = Math.max(cur.high, b.high);
+      cur.low = Math.min(cur.low, b.low);
+      cur.close = b.close;
+      cur.volume += b.volume || 0;
     }
-    return { label, score: null, signal: '--' };
-  }));
+  }
+  return out;
+}
+
+async function fetchMTFSignals(stockId, dailyBars = null) {
+  const daily = dailyBars?.length ? dailyBars : await fetchStockOHLCV(stockId, '1d', '6mo');
+  const score = bars => (bars?.length >= 20 ? (b => ({ score: b.score, signal: b.signal }))(calculateScore(bars)) : { score: null, signal: '--' });
+
+  const h1 = await fetchStockOHLCV(stockId, '60m', '1mo').catch(() => []);
+  return [
+    { label: '60分', ...score(h1) },
+    { label: '日線', ...score(daily) },
+    { label: '週線', ...score(aggregateWeekly(daily)) },
+  ];
 }
 
 // ── 財經新聞（Google News RSS，繁中台股）───────────────────────────────────
