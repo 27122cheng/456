@@ -173,6 +173,11 @@ async function startScan() {
 
   // 每日 / 每週重點關注股
   renderFocusStocks();
+
+  // AI 預測準確度：先結算到期預測，再記錄今日預測（順序不可調換）
+  resolvePredictions();
+  recordPredictions();
+  renderPredAccuracy();
   if (currentPage === 'lab') renderLab();
 
   // 價格警報檢查
@@ -2831,7 +2836,7 @@ function navigateTo(page, opts = {}) {
   if (page === 'dashboard') renderDashboard();
   if (page === 'tradelog') renderTradelog();
   if (page === 'positions') renderPositions();
-  if (page === 'report') renderReport();
+  if (page === 'report') { renderReport(); renderPredAccuracy(); }
   if (page === 'lab') renderLab();
 
   // Apply filter from opts
@@ -3186,6 +3191,145 @@ function renderCustomStocksList() {
       <button onclick="removeCustomStock('${s.id}')" title="移除">×</button>
     </div>`).join('');
   if (cnt) cnt.textContent = `共 ${list.length} 檔`;
+}
+
+// ── AI 預測準確度追蹤 ───────────────────────────────────────────────────────
+// 系統每天做多空預測與挑重點股，但過去從不記錄、也不驗證對錯。
+// 這裡把每日預測存檔，7 天後自動比對實際結果並計分 → 準確度可被衡量。
+
+const PRED_KEY = 'pred-log';
+const PRED_HOLD_DAYS = 7; // 預測驗證期（日曆日，約 5 個交易日）
+
+function getPredLog() {
+  try { return JSON.parse(localStorage.getItem(PRED_KEY) || '[]'); } catch { return []; }
+}
+function savePredLog(log) {
+  try { localStorage.setItem(PRED_KEY, JSON.stringify(log.slice(-400))); } catch {}
+}
+
+function twiiLevel() {
+  const f = outlookData.factors?.find(x => x.sym === '^TWII');
+  return f?.price ?? null;
+}
+
+// 每日記錄一次預測快照（掃描完成後呼叫）
+function recordPredictions() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return;                 // 資料不足不記錄，避免污染統計
+  const twii = twiiLevel();
+  const today = new Date().toISOString().slice(0, 10);
+  const log = getPredLog();
+  if (log.some(p => p.date === today)) return;  // 每日只記一次
+
+  const norm = outlookData.norm ?? 0;
+  const focus = computeFocusStocks().daily.slice(0, 5)
+    .map(f => ({ id: f.s.id, name: f.s.name, price: f.s.analysis.price }))
+    .filter(f => f.price > 0);
+
+  log.push({
+    date: today,
+    market: twii ? { norm, dir: norm >= 15 ? 1 : norm <= -15 ? -1 : 0, twii } : null,
+    focus: focus.length ? focus : null,
+    resolved: false,
+  });
+  savePredLog(log);
+}
+
+// 結算已到期的預測（每次掃描檢查）
+function resolvePredictions() {
+  const log = getPredLog();
+  const now = Date.now();
+  const twiiNow = twiiLevel();
+  let changed = false;
+
+  for (const p of log) {
+    if (p.resolved) continue;
+    const age = (now - new Date(p.date + 'T00:00:00').getTime()) / 86400000;
+    if (age < PRED_HOLD_DAYS) continue;
+
+    // 市場方向：預測偏多/偏空 vs 大盤實際漲跌（中性預測不計分）
+    if (p.market && twiiNow) {
+      const chg = (twiiNow - p.market.twii) / p.market.twii * 100;
+      p.market.actualChg = +chg.toFixed(2);
+      if (p.market.dir !== 0) {
+        // 漲跌幅小於 0.5% 視為持平，不算命中也不算失誤
+        p.market.hit = Math.abs(chg) < 0.5 ? null : (chg > 0) === (p.market.dir > 0);
+      } else {
+        p.market.hit = null;
+      }
+    }
+
+    // 重點股：平均報酬是否跑贏大盤（這才是選股能力的真正檢驗）
+    if (p.focus && twiiNow && p.market?.twii) {
+      const rets = p.focus.map(f => {
+        const s = allStocks.find(x => x.id === f.id);
+        const now2 = s?.analysis?.price;
+        return now2 > 0 ? (now2 - f.price) / f.price * 100 : null;
+      }).filter(v => v != null);
+      if (rets.length) {
+        const avg = rets.reduce((a, b) => a + b, 0) / rets.length;
+        const mkt = (twiiNow - p.market.twii) / p.market.twii * 100;
+        p.focusAvgRet = +avg.toFixed(2);
+        p.focusExcess = +(avg - mkt).toFixed(2);
+        p.focusBeat = avg > mkt;
+        p.focusN = rets.length;
+      }
+    }
+
+    p.resolved = true;
+    changed = true;
+  }
+  if (changed) savePredLog(log);
+}
+
+function computePredAccuracy() {
+  const done = getPredLog().filter(p => p.resolved);
+
+  const mkt = done.filter(p => p.market?.hit === true || p.market?.hit === false);
+  const mktHit = mkt.filter(p => p.market.hit).length;
+
+  const foc = done.filter(p => p.focusBeat != null);
+  const focBeat = foc.filter(p => p.focusBeat).length;
+  const focExcess = foc.length ? foc.reduce((s, p) => s + p.focusExcess, 0) / foc.length : 0;
+  const focRet = foc.length ? foc.reduce((s, p) => s + p.focusAvgRet, 0) / foc.length : 0;
+
+  return {
+    market: { n: mkt.length, hit: mktHit, pct: mkt.length ? mktHit / mkt.length * 100 : null },
+    focus:  { n: foc.length, beat: focBeat, pct: foc.length ? focBeat / foc.length * 100 : null,
+              avgExcess: focExcess, avgRet: focRet },
+    pending: getPredLog().filter(p => !p.resolved).length,
+  };
+}
+
+function renderPredAccuracy() {
+  const el = document.getElementById('pred-acc-body');
+  if (!el) return;
+  const a = computePredAccuracy();
+  const col = pct => pct == null ? 'var(--text3)' : pct >= 60 ? 'var(--bull)' : pct >= 45 ? 'var(--yellow)' : 'var(--bear)';
+  const card = (title, sub, pct, n, extra) => `
+    <div class="inst-card" style="text-align:left">
+      <div class="inst-card-lbl">${title}</div>
+      <div style="font-size:1.5rem;font-weight:800;color:${col(pct)};font-family:var(--mono)">${pct != null ? pct.toFixed(0) + '%' : '--'}</div>
+      <div style="font-size:0.7rem;color:var(--text3);margin-top:2px">${n > 0 ? `${n} 次已驗證` : '尚無樣本'}${extra || ''}</div>
+      <div style="font-size:0.68rem;color:var(--text3);margin-top:3px">${sub}</div>
+    </div>`;
+
+  const enough = a.market.n >= 10 || a.focus.n >= 10;
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      ${card('大盤多空預測命中率', '預測偏多/偏空後 7 日，大盤實際方向是否相符（中性與 ±0.5% 內不計分）',
+             a.market.pct, a.market.n)}
+      ${card('重點股跑贏大盤比率', '每日 5 檔重點股 7 日平均報酬是否勝過加權指數',
+             a.focus.pct, a.focus.n,
+             a.focus.n ? `　平均超額 ${a.focus.avgExcess >= 0 ? '+' : ''}${a.focus.avgExcess.toFixed(2)}%` : '')}
+    </div>
+    <div style="margin-top:10px;font-size:0.78rem;color:var(--text3);line-height:1.7">
+      ${a.pending > 0 ? `目前有 <strong style="color:var(--blue)">${a.pending}</strong> 筆預測驗證中（滿 ${PRED_HOLD_DAYS} 天自動結算）。` : ''}
+      ${enough
+        ? `樣本已具參考性。${a.focus.n >= 10 ? `重點股 7 日平均報酬 <strong style="color:${a.focus.avgRet >= 0 ? 'var(--bull)' : 'var(--bear)'}">${a.focus.avgRet >= 0 ? '+' : ''}${a.focus.avgRet.toFixed(2)}%</strong>。` : ''}`
+        : '樣本數不足 10 次，準確度僅供初步參考 — 系統每日自動累積，請持續觀察。'}
+      <br><span style="color:var(--text3);font-size:0.72rem">此為系統對自身預測的誠實記分：每日預測存檔後 ${PRED_HOLD_DAYS} 天回頭比對實際結果，無法事後修改。</span>
+    </div>`;
 }
 
 // ── 每日 / 每週重點關注股 ──────────────────────────────────────────────────
