@@ -1735,6 +1735,14 @@ function buildManagerAnalysis(s) {
       notes.push('單月轉正但累計仍負 — 復甦初期，續航待觀察');
   }
 
+  // 獲利品質（官方季報）：高毛利＋正淨利 = 有本質支撐，虧損股追高風險高
+  const fin = s._fin;
+  if (fin) {
+    if (fin.netMargin != null && fin.netMargin < 0) { dir -= 1; bear.push(`本業虧損（淨利率 ${fin.netMargin.toFixed(1)}%）`); }
+    else if (fin.grossMargin != null && fin.grossMargin >= 35 && fin.netMargin > 8) { dir += 0.8; bull.push(`高獲利品質（毛利率 ${fin.grossMargin.toFixed(0)}%、淨利率 ${fin.netMargin.toFixed(0)}%）`); }
+    else if (fin.grossMargin != null && fin.grossMargin < 10) notes.push(`毛利率僅 ${fin.grossMargin.toFixed(1)}%，缺乏定價能力`);
+  }
+
   // 法人連續買/賣超天數（用逐日累積的真實歷史，連續性比單日更有意義）
   const streak = instStreak(s.id);
   if (streak) {
@@ -2006,9 +2014,13 @@ async function openStock(stockId) {
     renderOI(s, oi);
     renderManagerVerdict(s);
   }).catch(() => renderOI(s, null));
-  fetchRevenue(stockId).then(rev => {
-    if (currentStockId !== stockId || !rev) return;
-    s.rev = rev;
+  Promise.all([
+    fetchRevenue(stockId).catch(() => null),
+    fetchFinancials(stockId).catch(() => null),
+  ]).then(([rev, fin]) => {
+    if (currentStockId !== stockId || (!rev && !fin)) return;
+    if (rev) s.rev = rev;
+    if (fin) s._fin = fin;
     renderManagerVerdict(s);
     renderAnalysisPanels(s, s._inst || null);
   }).catch(() => {});
@@ -2313,6 +2325,27 @@ async function renderAnalysisPanels(s, inst) {
       </div>`;
   })() : '';
 
+  // 季度財報（官方綜合損益表）：毛利率/營益率/淨利率是判斷獲利品質的核心
+  if (s._fin === undefined) { s._fin = await fetchFinancials(s.id).catch(() => null); }
+  const fin = s._fin;
+  const finHtml = fin ? (() => {
+    const pct = (v, good, bad) => v == null ? '<span style="color:var(--text3)">--</span>'
+      : `<span style="color:${v >= good ? 'var(--bull)' : v <= bad ? 'var(--bear)' : 'var(--text2)'};font-weight:600">${v.toFixed(1)}%</span>`;
+    const q = fin.year && fin.quarter ? `${+fin.year + 1911 || fin.year} 年 Q${fin.quarter}` : '最新季度';
+    const money = v => v == null ? '--' : Math.abs(v) >= 1e8 ? (v/1e8).toFixed(2) + ' 兆' : Math.abs(v) >= 1e4 ? (v/1e4).toFixed(1) + ' 億' : (v/1e3).toFixed(1) + ' 百萬';
+    return `
+      <div class="fund-block" style="margin-top:10px">
+        <div class="fund-block-ttl">季度財報（${q}）<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方</span></div>
+        <table class="qt-table"><tbody>
+          <tr><td style="color:var(--text3)">營業收入</td><td>${money(fin.revenue)}</td></tr>
+          <tr><td style="color:var(--text3)">毛利率</td><td>${pct(fin.grossMargin, 30, 10)}</td></tr>
+          <tr><td style="color:var(--text3)">營益率</td><td>${pct(fin.opMargin, 15, 0)}</td></tr>
+          <tr><td style="color:var(--text3)">淨利率</td><td>${pct(fin.netMargin, 10, 0)}</td></tr>
+          <tr><td style="color:var(--text3)">單季 EPS</td><td class="${fin.eps > 0 ? 'qt-pos' : fin.eps < 0 ? 'qt-neg' : ''}">${fin.eps != null ? fin.eps.toFixed(2) + ' 元' : '--'}</td></tr>
+        </tbody></table>
+      </div>`;
+  })() : '';
+
   const keyStatsHtml = `
       <div class="fund-block">
         ${isRealFd ? `
@@ -2325,6 +2358,7 @@ async function renderAnalysisPanels(s, inst) {
           </tbody>
         </table>` : ''}
         ${revHtml}
+        ${finHtml}
         ${rangeHtml}
       </div>`;
 
@@ -3035,6 +3069,19 @@ async function runDiagnostics() {
     { name: '月營收 (t187ap05)', run: async () => {
         const m = await fetchRevenueAll();
         return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔月營收` } : { ok: false, msg: '無資料' };
+      } },
+    { name: '季度財報 (t187ap06)', run: async () => {
+        const m = await fetchFinancialsAll();
+        return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔綜合損益表` } : { ok: false, msg: '無資料（端點格式可能已變更）' };
+      } },
+    { name: '大盤量能 (FMTQIK)', run: async () => {
+        const r = await fetchMarketTurnover();
+        const t = analyzeTurnover(r);
+        return t ? { ok: true, msg: `${t.date} 成交 ${(t.amount/1e8).toFixed(0)} 億｜${t.verdict.split(' —')[0]}` } : { ok: false, msg: '無資料' };
+      } },
+    { name: '美股指數備援 (Stooq)', run: async () => {
+        const c = await fetchStooqCloses('^GSPC');
+        return c?.length ? { ok: true, msg: `S&P500 ${c.length} 筆，最新 ${c[c.length-1]}` } : { ok: false, msg: '無回應（Yahoo 正常時不影響）' };
       } },
     { name: '融資融券 O.I (MI_MARGN)', run: async () => {
         const m = await fetchMarginAll();

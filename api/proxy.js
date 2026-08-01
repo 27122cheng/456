@@ -9,6 +9,7 @@ const ALLOW = [
   /^https:\/\/openapi\.twse\.com\.tw\//,
   /^https:\/\/www\.tpex\.org\.tw\//,
   /^https:\/\/news\.google\.com\//,
+  /^https:\/\/stooq\.com\/q\//,
 ];
 
 export default async function handler(req, res) {
