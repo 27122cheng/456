@@ -96,6 +96,69 @@ function calcStoch(highs, lows, closes, k = 14, d = 3) {
   return ((closes[closes.length - 1] - recentL) / (recentH - recentL)) * 100;
 }
 
+// ── OBV 能量潮：量能是否確認價格（識破無量假突破 / 隱性吸籌）─────────────
+function calcOBV(closes, volumes) {
+  const obv = [0];
+  for (let i = 1; i < closes.length; i++) {
+    const v = volumes[i] || 0;
+    obv.push(obv[i-1] + (closes[i] > closes[i-1] ? v : closes[i] < closes[i-1] ? -v : 0));
+  }
+  return obv;
+}
+
+// 線性回歸原始斜率（每根 K 的絕對變化量）
+function rawSlope(arr) {
+  const n = arr.length;
+  if (n < 5) return 0;
+  const mx = (n - 1) / 2;
+  const my = arr.reduce((a, b) => a + b, 0) / n;
+  let num = 0, den = 0;
+  for (let i = 0; i < n; i++) { num += (i - mx) * (arr[i] - my); den += (i - mx) ** 2; }
+  return den ? num / den : 0;
+}
+
+// 價格斜率：正規化為「每根 K 的漲跌百分比」
+function slopePct(arr) {
+  const my = arr.reduce((a, b) => a + b, 0) / arr.length;
+  return my ? rawSlope(arr) / Math.abs(my) * 100 : 0;
+}
+
+// 量價背離：價格與 OBV 走勢相反 = 趨勢缺乏量能支撐（頂背離）或暗中吸貨（底背離）
+// OBV 斜率以「平均成交量」正規化（OBV 會跨零，用均值正規化會失真），
+// 結果可解讀為：每根 K 淨流入/流出相當於幾倍的日均量。
+function detectDivergence(closes, volumes, lookback = 20) {
+  if (closes.length < lookback + 5) return null;
+  const obv = calcOBV(closes, volumes);
+  const pSlope = slopePct(closes.slice(-lookback));
+  const vAvg = volumes.slice(-lookback).reduce((a, b) => a + (b || 0), 0) / lookback;
+  if (!vAvg) return null;
+  const oSlope = rawSlope(obv.slice(-lookback)) / vAvg;
+
+  const P = 0.25, O = 0.15; // 價格 0.25%/根、OBV 0.15 倍日均量/根 為顯著門檻
+  if (pSlope > P && oSlope < -O) return { type: 'bear', txt: '量價頂背離：價漲但資金淨流出，追價力道轉弱' };
+  if (pSlope < -P && oSlope > O) return { type: 'bull', txt: '量價底背離：價跌但資金默默流入，具止跌訊號' };
+  if (pSlope > P && oSlope > O * 2) return { type: 'confirm', txt: '量價同步走揚，上漲有量能確認' };
+  return null;
+}
+
+// 布林壓縮：通道寬度處於近期極低區間 → 變盤前夕，突破方向常為後續主趨勢
+function detectSqueeze(closes, period = 20, lookback = 60) {
+  if (closes.length < period + lookback) return null;
+  const widths = [];
+  for (let i = closes.length - lookback; i < closes.length; i++) {
+    const seg = closes.slice(i - period + 1, i + 1);
+    const mean = seg.reduce((a, b) => a + b, 0) / period;
+    const std = Math.sqrt(seg.reduce((s, v) => s + (v - mean) ** 2, 0) / period);
+    widths.push(mean ? (4 * std) / mean * 100 : 0);
+  }
+  const cur = widths[widths.length - 1];
+  const sorted = [...widths].sort((a, b) => a - b);
+  const pctRank = sorted.findIndex(w => w >= cur) / widths.length * 100;
+  if (pctRank <= 15) return { state: 'squeeze', pctRank, txt: `布林帶寬處近${lookback}日最低 ${pctRank.toFixed(0)}% 區間 — 變盤前夕，等突破表態` };
+  if (pctRank >= 85) return { state: 'expansion', pctRank, txt: `波動大幅擴張（帶寬前 ${(100-pctRank).toFixed(0)}%）— 趨勢加速中，勿逆勢` };
+  return null;
+}
+
 // ── Master Score & Signal ─────────────────────────────────────────────────
 
 function calculateScore(ohlcv) {
@@ -119,6 +182,8 @@ function calculateScore(ohlcv) {
   const volMA = calcVolumeMA(volumes, 20);
   const boll  = calcBollinger(closes);
   const stoch = calcStoch(highs, lows, closes);
+  const diverg = detectDivergence(closes, volumes);
+  const squeeze = detectSqueeze(closes);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -188,6 +253,15 @@ function calculateScore(ohlcv) {
     else if (ret20 < -8) { score -= 4; }
   }
 
+  // 量價背離：頂背離是最常見的假突破前兆，權重給高一些
+  if (diverg) {
+    if (diverg.type === 'bear') { score -= 7; reasons.push('⚠ 量價頂背離'); }
+    else if (diverg.type === 'bull') { score += 5; reasons.push('量價底背離（暗中吸籌）'); }
+    else if (diverg.type === 'confirm') { score += 4; reasons.push('量價同步確認'); }
+  }
+  // 波動擴張且順勢 → 趨勢加速；壓縮則不加減分（方向未定）
+  if (squeeze?.state === 'expansion' && price > (ema20 || 0)) { score += 3; reasons.push('波動擴張且站上均線'); }
+
   score = Math.max(0, Math.min(100, Math.round(score)));
 
   let signal;
@@ -199,7 +273,8 @@ function calculateScore(ohlcv) {
   else if (score <= bear) signal = '空頭';
   else signal = '中性';
 
-  return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch, price, prevClose, lastVol };
+  return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
+           diverg, squeeze, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────

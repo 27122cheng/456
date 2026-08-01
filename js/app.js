@@ -116,11 +116,10 @@ async function startScan() {
         renderDashboard();
         if (currentPage === 'ranking') renderRanking();
       }
-      // 請求間加入抖動，平滑突發流量（免費 proxy 對瞬間大量請求最敏感）
-      await delay(120 + Math.random() * 180);
     }
   }
-  await Promise.all(Array.from({ length: 4 }, scanWorker));
+  // 自家代理有 CDN 快取且無限流，可提高並行度；請求本身已去重
+  await Promise.all(Array.from({ length: 8 }, scanWorker));
 
   // 第一輪失敗的個股再重試一次（免費 proxy 偶發逾時很常見，重試通常就會成功）
   const failed = allStocks.filter(s => !s.ohlcv?.length);
@@ -281,13 +280,12 @@ const OUTLOOK_SYMBOLS = [
 ];
 
 async function loadMarketOutlook() {
-  const factors = [];
-  for (const cfg of OUTLOOK_SYMBOLS) {
+  // 7 個指數並行抓（過去序列 + 150ms 延遲 → 最壞要等 7 輪逾時）
+  const results = await Promise.all(OUTLOOK_SYMBOLS.map(async cfg => {
     const q = await fetchIndexQuote(cfg.sym).catch(() => null);
-    if (q) factors.push({ ...cfg, ...q });
-    await delay(150);
-  }
-  outlookData.factors = factors;
+    return q ? { ...cfg, ...q } : null;
+  }));
+  outlookData.factors = results.filter(Boolean);
   renderMarketOutlook();
 }
 
@@ -1621,6 +1619,22 @@ function rankingRow(s, rank) {
   </tr>`;
 }
 
+// 法人連續買/賣超天數（依 inst-hist 逐日累積的真實資料）
+function instStreak(stockId) {
+  let hist = [];
+  try { hist = JSON.parse(localStorage.getItem('inst-hist') || '{}')[stockId] || []; } catch {}
+  if (hist.length < 2) return null;
+  const net = hist.map(r => (r.f || 0) + (r.i || 0) + (r.dl || 0));
+  const last = net[net.length - 1];
+  if (!last) return null;
+  const dir = last > 0 ? 1 : -1;
+  let days = 0, total = 0;
+  for (let i = net.length - 1; i >= 0; i--) {
+    if (dir > 0 ? net[i] > 0 : net[i] < 0) { days++; total += net[i]; } else break;
+  }
+  return { dir, days, total };
+}
+
 // ── 資深股票經理人研判引擎 ───────────────────────────────────────────────────
 // 綜合技術、趨勢強度、動能、量能、法人籌碼、融資融券 O.I、多週期、波動、
 // 相對位置，輸出一位資深操盤手的完整決策：方向、當沖適配、進出場點位、
@@ -1671,6 +1685,21 @@ function buildManagerAnalysis(s) {
   else if (volR < 0.6) { notes.push('量能萎縮，追價意願低'); }
   if (foreign != null && foreign > 1000) { dir += 1; bull.push(`外資買超 ${foreign.toLocaleString()} 張`); }
   else if (foreign != null && foreign < -1000) { dir -= 1; bear.push(`外資賣超 ${Math.abs(foreign).toLocaleString()} 張`); }
+
+  // 量價背離：最能識破假突破的訊號，權重高
+  if (a.diverg?.type === 'bear') { dir -= 1.5; bear.push(a.diverg.txt); }
+  else if (a.diverg?.type === 'bull') { dir += 1; bull.push(a.diverg.txt); }
+  else if (a.diverg?.type === 'confirm') { dir += 0.5; bull.push(a.diverg.txt); }
+  // 波動狀態
+  if (a.squeeze?.state === 'squeeze') notes.push(a.squeeze.txt);
+  else if (a.squeeze?.state === 'expansion') notes.push(a.squeeze.txt);
+
+  // 法人連續買/賣超天數（用逐日累積的真實歷史，連續性比單日更有意義）
+  const streak = instStreak(s.id);
+  if (streak) {
+    if (streak.dir > 0 && streak.days >= 3) { dir += 1; bull.push(`法人連續 ${streak.days} 日買超（累計 ${streak.total.toLocaleString()} 張）`); }
+    else if (streak.dir < 0 && streak.days >= 3) { dir -= 1; bear.push(`法人連續 ${streak.days} 日賣超（累計 ${Math.abs(streak.total).toLocaleString()} 張）`); }
+  }
   if (oi) {
     if (oi.dFin > 0 && foreign != null && foreign < -500) { dir -= 0.5; bear.push('散戶融資加碼但外資站賣方（籌碼對作）'); }
     if (oi.shortFinRatio >= 30) { notes.push(`券資比 ${oi.shortFinRatio.toFixed(0)}%，具軋空題材`); }
@@ -1924,7 +1953,7 @@ async function openStock(stockId) {
     renderFullRisk(s, inst);
     renderManagerVerdict(s);
   });
-  fetchMTFSignals(stockId).then(mtf => {
+  fetchMTFSignals(stockId, s.ohlcv).then(mtf => {
     if (currentStockId !== stockId) return;
     s._mtf = mtf;
     renderMTF(mtf);
