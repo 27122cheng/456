@@ -292,6 +292,11 @@ async function loadMarketOutlook() {
   }));
   outlookData.factors = results.filter(Boolean);
   renderMarketOutlook();
+  // 大盤量能（無量下跌／爆量止跌）— 另外抓，回來再刷新一次
+  fetchMarketTurnover().then(rows => {
+    const t = analyzeTurnover(rows);
+    if (t) { outlookData.turnover = t; renderMarketOutlook(); }
+  }).catch(() => {});
 }
 
 // Score one factor: returns { pts, dir } where dir is 'up'|'dn'|'flat' for display
@@ -434,6 +439,15 @@ function renderMarketOutlook() {
           ${f.chg1 != null ? `<span class="factor-chg ${f.chg1 >= 0 ? 'change-up' : 'change-dn'}">${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(2)}%</span>` : ''}
         </div>`).join('')}
     </div>
+
+    ${outlookData.turnover ? (() => {
+      const t = outlookData.turnover;
+      const c = t.tone === 'bull' ? 'var(--bull)' : t.tone === 'bear' ? 'var(--bear)' : 'var(--yellow)';
+      return `<div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:${c}0d;border-left:3px solid ${c};font-size:0.82rem">
+        <span style="color:var(--text3);font-size:0.72rem">大盤量能 ${t.date}｜成交 ${(t.amount/1e8).toFixed(0)} 億（20日均量的 ${t.ratio.toFixed(2)} 倍）</span><br>
+        <strong style="color:${c}">${t.verdict}</strong>
+      </div>`;
+    })() : ''}
 
     <div class="outlook-text">${predict}<br>
       <span style="font-size:0.75rem;color:var(--text3)">⚠ 以上為技術面與資金面的規則化分析，僅供參考，非投資建議。</span>
@@ -2204,15 +2218,6 @@ function renderMTF(mtf) {
 
 // ── Comprehensive Analysis Panels ────────────────────────────────────────
 
-function idSeed(stockId) {
-  return stockId.split('').reduce((acc, c, i) => acc + c.charCodeAt(0) * (i + 7), 13);
-}
-
-function srng(seed) {
-  let s = (seed ^ 0xdeadbeef) >>> 0;
-  return () => { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (s >>> 0) / 0x100000000; };
-}
-
 function calcSR(ohlcv, lookback = 60) {
   const data = ohlcv.slice(-Math.min(lookback, ohlcv.length));
   const h = data.map(d => d.high), l = data.map(d => d.low);
@@ -2233,72 +2238,15 @@ function calcSR(ohlcv, lookback = 60) {
   };
 }
 
-const SECTOR_NEWS = {
-  '半導體': [
-    { date:'2026-06-10', headline:'AI 晶片需求強勁，台積電 CoWoS 封裝產能持續供不應求', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-08', headline:'NVIDIA Blackwell 大量出貨，台廠供應鏈能見度看至 Q4', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-05', headline:'半導體設備商出貨強化，預示下半年資本支出高峰', tag:'中性', tagClass:'neutral' },
-  ],
-  '電子': [
-    { date:'2026-06-10', headline:'iPhone 17 備料提前，供應鏈 Q4 訂單能見度佳', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-07', headline:'AI 伺服器散熱需求激增，PCB/散熱廠接單超出預期', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-04', headline:'東南亞廠區產能爬坡，部分品項仍面臨良率壓力', tag:'中性', tagClass:'neutral' },
-  ],
-  '金融': [
-    { date:'2026-06-10', headline:'央行第三季利率決策備受關注，台幣走勢左右金融股評價', tag:'中性', tagClass:'neutral' },
-    { date:'2026-06-08', headline:'壽險業淨值回升，股債配置改善有助評價修復', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-05', headline:'放款品質穩健，銀行業不良率處歷史低位', tag:'利多', tagClass:'bull' },
-  ],
-  '生技': [
-    { date:'2026-06-09', headline:'新藥核准案件增加，生技股 NDA 申請進度成市場焦點', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-07', headline:'健保給付調整草案公布，部分藥品售價面臨壓力', tag:'利空', tagClass:'bear' },
-    { date:'2026-06-03', headline:'AI 藥物探索平台與台廠合作消息頻傳，CDMO 訂單增加', tag:'利多', tagClass:'bull' },
-  ],
-  '電信': [
-    { date:'2026-06-09', headline:'5G 覆蓋率突破 80%，企業專網應用帶動 ARPU 提升', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-06', headline:'NCC 頻譜審查啟動，6G 布局進入規劃階段', tag:'中性', tagClass:'neutral' },
-    { date:'2026-06-03', headline:'電信業現金殖利率逾 5%，防禦性配置需求旺盛', tag:'利多', tagClass:'bull' },
-  ],
-  '傳產': [
-    { date:'2026-06-10', headline:'鋼鐵原料成本回落，傳產股毛利率有望改善', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-07', headline:'內需消費復甦趨緩，部分傳產受到匯率波動影響', tag:'中性', tagClass:'neutral' },
-    { date:'2026-06-04', headline:'中國市場需求回溫，台廠出口訂單出現回升訊號', tag:'利多', tagClass:'bull' },
-  ],
-  '塑化': [
-    { date:'2026-06-09', headline:'油價高位震盪，石化原料成本壓力仍未完全消散', tag:'中性', tagClass:'neutral' },
-    { date:'2026-06-07', headline:'景氣循環底部確認，塑化股評價具備修復空間', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-04', headline:'台化法說會將於本月底舉行，市場關注下半年展望', tag:'中性', tagClass:'neutral' },
-  ],
-  '航運': [
-    { date:'2026-06-10', headline:'紅海局勢持續，繞行非洲航線拉長運距支撐運費', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-08', headline:'貨櫃運費指數 SCFI 繼續上行，航商展望正向', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-05', headline:'散裝航運 BDI 指數回調，乾散貨需求趨於觀望', tag:'中性', tagClass:'neutral' },
-  ],
-  '其他': [
-    { date:'2026-06-10', headline:'台股法人買盤持續進駐，外資累計淨買超超越去年同期', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-08', headline:'台灣 PMI 連續第三個月擴張，製造業景氣穩健', tag:'利多', tagClass:'bull' },
-    { date:'2026-06-05', headline:'美國聯準會維持利率不變，科技股評價壓力稍緩', tag:'中性', tagClass:'neutral' },
-  ],
-};
-
-function getSectorNews(sector) {
-  for (const key of Object.keys(SECTOR_NEWS)) {
-    if (key !== '其他' && sector.includes(key)) return SECTOR_NEWS[key];
-  }
-  return SECTOR_NEWS['其他'];
-}
-
 async function renderAnalysisPanels(s, inst) {
   const a = s.analysis;
   const ohlcv = s.ohlcv;
   const meta = getStockList().find(m => m.id === s.id) || { sector: '其他' };
   const sector = meta.sector || '其他';
-  const rng = srng(idSeed(s.id));
 
-  // 真實基本面：v7 quote（優先）→ quoteSummary（備援）→ 模擬估算（明確標示）
-  // 非同步 IIFE：網路慢/proxy 被限流時不阻塞下方籌碼、支撐壓力、產業面板的渲染
+  // 基本面：一律使用官方數據（TWSE BWIBBU_ALL / TPEx）。
+  // 抓不到就誠實顯示「無資料」— 交易工具不該用亂數捏造財務數字。
   const fundP = (async () => {
-  // 官方估值資料（TWSE BWIBBU_ALL / TPEx）：全市場一次抓有快取，快且不依賴 Yahoo
   let fd = s._fd;
   if (fd === undefined) {
     fd = await fetchTWFundamentals(s.id).catch(() => null);
@@ -2307,29 +2255,30 @@ async function renderAnalysisPanels(s, inst) {
   }
   const isRealFd = !!(fd && (fd.pe != null || fd.pb != null || fd.divYield != null));
 
-  const pe = fd?.pe ?? +(8 + rng()*22).toFixed(1);
-  const pb = fd?.pb ?? +(0.8 + rng()*3.5).toFixed(2);
-  const divYield = fd?.divYield ?? +(0.025 + rng()*0.055).toFixed(4);
+  const pe = fd?.pe ?? null;
+  const pb = fd?.pb ?? null;
+  const divYield = fd?.divYield ?? null;
 
   // 由官方 P/E、P/B 回推每股數據（官方只給比率，價格已知 → 可還原絕對值）
-  const epsTTM   = isRealFd && fd.pe > 0 ? a.price / fd.pe : null; // 近四季 EPS
-  const bookVal  = isRealFd && fd.pb > 0 ? a.price / fd.pb : null; // 每股淨值
-  const divPerSh = isRealFd && fd.divYield != null ? a.price * fd.divYield : null; // 每股年股利
+  const epsTTM   = pe > 0 ? a.price / pe : null; // 近四季 EPS
+  const bookVal  = pb > 0 ? a.price / pb : null; // 每股淨值
+  const divPerSh = divYield != null ? a.price * divYield : null; // 每股年股利
 
-  // 護城河：官方數據時以「獲利穩定度」粗估（有配息 + 淨值溢價），否則估算
+  // 獲利體質評等：只在有官方數據時計算，否則不顯示
   const moatScore = isRealFd
-    ? Math.min(5, Math.max(1, (fd.divYield > 0 ? 2 : 1) + (fd.pb >= 1.5 ? 1 : 0) + (fd.pe != null && fd.pe > 0 && fd.pe < 25 ? 1 : 0) + (fd.divYield > 0.04 ? 1 : 0)))
-    : Math.round(1 + rng()*4);
-  const yieldPct = (divYield * 100).toFixed(2);
-  const annualIncome = Math.round(100000 * divYield);
-  const peN = +pe, pbN = +pb;
-  const peColor  = peN<12 ? 'var(--bull)' : peN<22 ? 'var(--blue)' : 'var(--bear)';
-  const pbColor  = pbN<1.5 ? 'var(--bull)' : pbN<3 ? 'var(--blue)' : 'var(--bear)';
-  const yldColor = divYield>0.05 ? 'var(--bull)' : divYield>0.03 ? 'var(--blue)' : 'var(--text2)';
+    ? Math.min(5, Math.max(1, (divYield > 0 ? 2 : 1) + (pb >= 1.5 ? 1 : 0) + (pe != null && pe > 0 && pe < 25 ? 1 : 0) + (divYield > 0.04 ? 1 : 0)))
+    : null;
+  const yieldPct = divYield != null ? (divYield * 100).toFixed(2) : null;
+  const annualIncome = divYield != null ? Math.round(100000 * divYield) : null;
+  const peN = pe, pbN = pb;
+  const na = '<span style="color:var(--text3)">無資料</span>';
+  const peColor  = peN == null ? 'var(--text3)' : peN<12 ? 'var(--bull)' : peN<22 ? 'var(--blue)' : 'var(--bear)';
+  const pbColor  = pbN == null ? 'var(--text3)' : pbN<1.5 ? 'var(--bull)' : pbN<3 ? 'var(--blue)' : 'var(--bear)';
+  const yldColor = divYield == null ? 'var(--text3)' : divYield>0.05 ? 'var(--bull)' : divYield>0.03 ? 'var(--blue)' : 'var(--text2)';
   const moatDescs = ['護城河薄弱','競爭優勢有限','具一定品牌優勢','強健技術/品牌壁壘','行業主導者'];
   const fdBadge = isRealFd
     ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方數據 TWSE/TPEx</span>'
-    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（此代號無官方估值資料，如 ETF）</span>';
+    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(148,163,184,0.12);color:var(--text3)">此代號無官方估值資料（ETF／新上市／暫停交易）</span>';
 
   // 近半年價格位置（用已抓到的真實 K 線計算）
   let rangeHtml = '';
@@ -2364,8 +2313,9 @@ async function renderAnalysisPanels(s, inst) {
       </div>`;
   })() : '';
 
-  const keyStatsHtml = isRealFd ? `
+  const keyStatsHtml = `
       <div class="fund-block">
+        ${isRealFd ? `
         <div class="fund-block-ttl">關鍵財務數據（由官方比率回推）</div>
         <table class="qt-table">
           <tbody>
@@ -2373,23 +2323,9 @@ async function renderAnalysisPanels(s, inst) {
             <tr><td style="color:var(--text3)">每股淨值</td><td>${bookVal != null ? bookVal.toFixed(2) + ' 元' : '--'}</td></tr>
             <tr><td style="color:var(--text3)">每股年股利</td><td class="${divPerSh > 0 ? 'qt-pos' : ''}">${divPerSh != null ? divPerSh.toFixed(2) + ' 元' : '--'}</td></tr>
           </tbody>
-        </table>
+        </table>` : ''}
         ${revHtml}
         ${rangeHtml}
-      </div>` : `
-      <div class="fund-block">
-        <div class="fund-block-ttl">近四季財務數據 <span style="font-size:0.6rem;color:var(--yellow)">模擬示意</span></div>
-        <table class="qt-table">
-          <thead><tr><th>季度</th><th>營收(百萬)</th><th>毛利率</th><th>EPS</th></tr></thead>
-          <tbody>${['Q1/25','Q2/25','Q3/25','Q4/25'].map(qL => {
-            const gm = +(22 + rng()*28).toFixed(1), eps = +(0.3 + rng()*5).toFixed(2);
-            return `<tr>
-            <td style="color:var(--text3)">${qL}</td>
-            <td>${((5000 + rng()*45000)/1000).toFixed(0)}M</td>
-            <td class="${gm>30?'qt-pos':gm<20?'qt-neg':''}">${gm}%</td>
-            <td class="${eps>1?'qt-pos':'qt-neg'}">${eps}</td>
-          </tr>`;}).join('')}</tbody>
-        </table>
       </div>`;
 
   if (currentStockId !== s.id) return { peN, divYield, yieldPct }; // 已切換個股，別蓋掉新頁面
@@ -2401,48 +2337,40 @@ async function renderAnalysisPanels(s, inst) {
         <div class="fund-block" style="margin-bottom:10px">
           <div class="fund-block-ttl">估值指標</div>
           <div class="val-grid">
-            <div class="val-item"><div class="val-lbl">本益比 P/E</div><div class="val-num" style="color:${peColor}">${peN.toFixed(1)}x</div></div>
-            <div class="val-item"><div class="val-lbl">股價淨值 P/B</div><div class="val-num" style="color:${pbColor}">${pbN.toFixed(2)}x</div></div>
-            <div class="val-item"><div class="val-lbl">殖利率</div><div class="val-num" style="color:${yldColor}">${yieldPct}%</div></div>
+            <div class="val-item"><div class="val-lbl">本益比 P/E</div><div class="val-num" style="color:${peColor}">${peN != null ? peN.toFixed(1) + 'x' : na}</div></div>
+            <div class="val-item"><div class="val-lbl">股價淨值 P/B</div><div class="val-num" style="color:${pbColor}">${pbN != null ? pbN.toFixed(2) + 'x' : na}</div></div>
+            <div class="val-item"><div class="val-lbl">殖利率</div><div class="val-num" style="color:${yldColor}">${yieldPct != null ? yieldPct + '%' : na}</div></div>
           </div>
         </div>
-        <div class="moat-grid">
-          <div class="moat-item"><div class="moat-lbl">護城河評估${isRealFd ? '（依獲利體質）' : ''}</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
-        </div>
+        ${moatScore != null ? `<div class="moat-grid">
+          <div class="moat-item"><div class="moat-lbl">獲利體質評等</div><div class="moat-stars">${'★'.repeat(moatScore)+'☆'.repeat(5-moatScore)}</div><div class="moat-desc">${moatDescs[moatScore-1]}</div></div>
+        </div>` : ''}
       </div>
     </div>
-    <div style="margin-top:12px">
-      <div class="fund-block-ttl">配息試算（投入 10 萬元${isRealFd ? '，依實際年化殖利率' : ''}）</div>
+    ${divYield != null && divYield > 0 ? `<div style="margin-top:12px">
+      <div class="fund-block-ttl">配息試算（投入 10 萬元，依官方年化殖利率）</div>
       <div class="div-calc">
         <div class="div-calc-row"><span>年殖利率</span><span style="font-family:var(--mono);color:${yldColor}">${yieldPct}%</span></div>
         <div class="div-calc-row"><span>預估年配息</span><div><span class="div-calc-big">+${annualIncome.toLocaleString()}</span><span style="font-size:0.78rem;color:var(--text3)"> 元</span></div></div>
         <div class="div-calc-row" style="margin-bottom:0"><span style="color:var(--text3)">每季估計</span><span style="font-family:var(--mono);color:var(--text3)">+${Math.round(annualIncome/4).toLocaleString()} 元</span></div>
       </div>
-    </div>`;
+    </div>` : ''}`;
   return { peN, divYield, yieldPct };
   })();
 
   // ── Render 籌碼面 ──────────────────────────────────────────────
-  // 優先用逐日累積的真實法人歷史（inst-hist），不足 5 天的舊日子以模擬示意補齊
+  // 只顯示真實累積的法人歷史（inst-hist），沒有的日子就不顯示 — 不再用亂數補假資料
   let instHist = [];
   try { instHist = (JSON.parse(localStorage.getItem('inst-hist') || '{}')[s.id] || []).slice(-5); } catch {}
   const realDays = instHist.length;
-  const inst5 = [];
-  for (let i = 0; i < 5 - realDays; i++) {
-    inst5.push({
-      label: `D-${4 - i}`,
-      foreign: Math.round((500+rng()*5000) * (rng()>0.4?1:-1)),
-      invest:  Math.round((100+rng()*2000) * (rng()>0.5?1:-1)),
-      dealer:  Math.round((50+rng()*800)   * (rng()>0.5?1:-1)),
-    });
+  const inst5 = instHist.map(r => ({ label: r.d.slice(5), foreign: r.f, invest: r.i, dealer: r.dl }));
+  // 今日資料若尚未進入歷史，先補上（仍是真實數據）
+  if (inst && !inst5.some(x => x.foreign === inst.foreign && x.invest === inst.investment)) {
+    inst5.push({ label: '今日', foreign: inst.foreign, invest: inst.investment, dealer: inst.dealer });
   }
-  instHist.forEach(r => inst5.push({ label: r.d.slice(5), foreign: r.f, invest: r.i, dealer: r.dl }));
-  if (inst && !realDays) { inst5[4].foreign = inst.foreign; inst5[4].invest = inst.investment; inst5[4].dealer = inst.dealer; }
-  const chipBadge = realDays >= 5
+  const chipBadge = inst5.length >= 5
     ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 真實數據 TWSE</span>'
-    : realDays > 0
-      ? `<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(0,212,255,0.1);color:var(--blue)">累積真實數據中 ${realDays}/5 日（其餘為模擬示意）</span>`
-      : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬示意（真實歷史自今日起逐日累積）</span>';
+    : `<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(0,212,255,0.1);color:var(--blue)">真實數據 ${inst5.length}/5 日（每日掃描自動累積）</span>`;
 
   const maxFlow = Math.max(...inst5.flatMap(d => [Math.abs(d.foreign),Math.abs(d.invest),Math.abs(d.dealer)]), 1);
   function chipBarHtml(val) {
@@ -2453,10 +2381,11 @@ async function renderAnalysisPanels(s, inst) {
   const t5 = { f:inst5.reduce((s,d)=>s+d.foreign,0), i:inst5.reduce((s,d)=>s+d.invest,0), d:inst5.reduce((s,d)=>s+d.dealer,0) };
   const gTotal = t5.f+t5.i+t5.d;
 
-  document.getElementById('chip-body').innerHTML = `
+  document.getElementById('chip-body').innerHTML = !inst5.length ? `
+    <p style="color:var(--text3);font-size:0.85rem">三大法人資料暫時無法取得（非交易日或資料源未更新）</p>` : `
     <div>
-      <div class="fund-block-ttl">5日三大法人買賣超趨勢 ${chipBadge}</div>
-      <div style="display:grid;grid-template-columns:36px 1fr 1fr 1fr;gap:5px;align-items:center;margin-top:8px">
+      <div class="fund-block-ttl">三大法人買賣超趨勢 ${chipBadge}</div>
+      <div style="display:grid;grid-template-columns:44px 1fr 1fr 1fr;gap:5px;align-items:center;margin-top:8px">
         <div></div>
         <div style="text-align:center;font-size:0.68rem;color:var(--text3)">外資</div>
         <div style="text-align:center;font-size:0.68rem;color:var(--text3)">投信</div>
@@ -2469,7 +2398,7 @@ async function renderAnalysisPanels(s, inst) {
       </div>
     </div>
     <div style="padding-top:12px;border-top:1px solid var(--border);margin-top:12px">
-      <div class="fund-block-ttl">5日累計買賣超</div>
+      <div class="fund-block-ttl">${inst5.length} 日累計買賣超</div>
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px">
         ${[{l:'外資',v:t5.f},{l:'投信',v:t5.i},{l:'自營商',v:t5.d},{l:'合計',v:gTotal}].map(r=>`
           <div class="inst-card"><div class="inst-card-lbl">${r.l}</div>
@@ -2556,43 +2485,41 @@ async function renderAnalysisPanels(s, inst) {
       if (tc.length >= 21) mktRet20 = +((tc[tc.length-1] - tc[tc.length-21]) / tc[tc.length-21] * 100).toFixed(1);
     }
   } catch {}
-  const isRealMkt = beta != null;
-  if (beta == null) beta = +(0.6 + rng()*1.0).toFixed(2);
-  if (corr == null) corr = +(0.4 + rng()*0.5).toFixed(2);
-  const mktRet = mktRet20 ?? +(rng()*8-3).toFixed(1);
-
-  const rs = (+ret20 - +mktRet).toFixed(1);
-  const rsN = +rs;
-  const rsColor = rsN>3 ? 'var(--bull)' : rsN<-3 ? 'var(--bear)' : 'var(--text2)';
-  const rsLabel = rsN>5?'顯著強於大盤':rsN>1?'優於大盤':rsN<-5?'顯著弱於大盤':rsN<-1?'弱於大盤':'與大盤持平';
-  const mktBadge = isRealMkt
-    ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 實測（近60日 vs 加權指數）</span>'
-    : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(245,158,11,0.12);color:var(--yellow)">⚠ 模擬估算（大盤數據暫時無法取得）</span>';
+  // 抓不到大盤資料就顯示「無資料」，不再用亂數捏造 Beta / 相關性
+  const isRealMkt = beta != null && mktRet20 != null;
+  const mktRet = mktRet20;
+  const rs = isRealMkt ? (+ret20 - +mktRet).toFixed(1) : null;
+  const rsN = rs != null ? +rs : 0;
+  const rsColor = rs == null ? 'var(--text3)' : rsN>3 ? 'var(--bull)' : rsN<-3 ? 'var(--bear)' : 'var(--text2)';
+  const rsLabel = rs == null ? '待大盤資料' : rsN>5?'顯著強於大盤':rsN>1?'優於大盤':rsN<-5?'顯著弱於大盤':rsN<-1?'弱於大盤':'與大盤持平';
+  const naM = '<span style="color:var(--text3);font-size:0.9rem">無資料</span>';
 
   if (currentStockId !== s.id) return { rs, rsN }; // 已切換個股，別蓋掉新頁面
   document.getElementById('mkt-body').innerHTML = `
-    <div style="margin-bottom:8px">${mktBadge}</div>
+    <div style="margin-bottom:8px">${isRealMkt
+      ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 實測（近60日 vs 加權指數）</span>'
+      : '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(148,163,184,0.12);color:var(--text3)">大盤資料暫時無法取得，稍後自動重試</span>'}</div>
     <div class="mkt-grid">
       <div class="mkt-item">
         <div class="mkt-lbl">20日相對強弱</div>
-        <div class="mkt-val" style="color:${rsColor}">${rsN>0?'+':''}${rs}%</div>
+        <div class="mkt-val" style="color:${rsColor}">${rs != null ? (rsN>0?'+':'') + rs + '%' : naM}</div>
         <div class="mkt-note">${rsLabel}</div>
       </div>
       <div class="mkt-item">
         <div class="mkt-lbl">Beta 值</div>
-        <div class="mkt-val">${beta}</div>
-        <div class="mkt-note">${beta>1.2?'高Beta高波動':beta<0.8?'低Beta防禦型':'與市場同步'}</div>
+        <div class="mkt-val">${beta != null ? beta : naM}</div>
+        <div class="mkt-note">${beta == null ? '' : beta>1.2?'高Beta高波動':beta<0.8?'低Beta防禦型':'與市場同步'}</div>
       </div>
       <div class="mkt-item">
         <div class="mkt-lbl">與大盤相關性</div>
-        <div class="mkt-val">${corr}</div>
-        <div class="mkt-note">${corr>0.7?'高相關':corr>0.4?'中度相關':'低相關'}</div>
+        <div class="mkt-val">${corr != null ? corr : naM}</div>
+        <div class="mkt-note">${corr == null ? '' : corr>0.7?'高相關':corr>0.4?'中度相關':'低相關'}</div>
       </div>
     </div>
     <div style="margin-top:12px;padding:10px 12px;background:rgba(255,255,255,0.02);border-radius:8px;font-size:0.82rem;color:var(--text3);line-height:1.6">
-      20日股票漲跌 <span style="font-family:var(--mono);color:${+ret20>=0?'var(--bull)':'var(--bear)'}">${+ret20>=0?'+':''}${ret20}%</span>，
+      20日股票漲跌 <span style="font-family:var(--mono);color:${+ret20>=0?'var(--bull)':'var(--bear)'}">${+ret20>=0?'+':''}${ret20}%</span>${isRealMkt ? `，
       超額報酬 <span style="font-family:var(--mono);color:${rsColor}">${rsN>0?'+':''}${rs}%</span>。
-      Beta ${beta}，${corr>0.6?'與指數連動性高，受大盤情緒影響明顯':'與指數連動性低，可作分散持倉選項'}。
+      Beta ${beta}，${corr>0.6?'與指數連動性高，受大盤情緒影響明顯':'與指數連動性低，可作分散持倉選項'}` : '（大盤比較數據載入中）'}。
     </div>`;
   return { rs, rsN };
   })();
@@ -2607,22 +2534,25 @@ async function renderAnalysisPanels(s, inst) {
       <span style="font-size:0.82rem;color:var(--text3)">所屬產業：</span>
       <strong style="color:var(--text1)">${sector}</strong>
       <span class="ind-trend-badge ${sectorTrend.c}">${sectorTrend.l}</span>
-      ${isLive ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 即時新聞</span>' : ''}
+      ${news?.length ? '<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 即時新聞</span>' : ''}
     </div>
     <div class="fund-block-ttl">最新產業動態</div>
-    <div class="news-list">${news.map(n=>`
+    ${news == null
+      ? '<div class="adv-loading">載入相關新聞...</div>'
+      : news.length
+        ? `<div class="news-list">${news.map(n=>`
       <div class="news-item" ${n.link ? `style="cursor:pointer" onclick="window.open('${n.link}','_blank')"` : ''}>
         <div class="news-date">${n.date}${n.source ? ' · ' + n.source : ''}</div>
         <div class="news-headline">${n.headline}</div>
         <span class="news-tag ${n.tagClass}">${n.tag}</span>
-      </div>`).join('')}
-    </div>`;
+      </div>`).join('')}</div>`
+        : '<p style="font-size:0.8rem;color:var(--text3)">近期查無此檔相關新聞</p>'}`;
   };
-  // 先用內建清單即時顯示，真實新聞抓到後無縫替換（不阻塞其他面板）
-  renderIndBody(getSectorNews(sector), false);
+  // 只顯示真實新聞（Google News RSS）；抓不到就誠實說明，不再用內建假新聞頂替
+  renderIndBody(null, false);
   fetchNewsRSS(`${s.name} ${sector === '其他' ? '台股' : sector}`, 3).then(live => {
-    if (live?.length && currentStockId === s.id) renderIndBody(live, true);
-  });
+    if (currentStockId === s.id) renderIndBody(live?.length ? live : [], true);
+  }).catch(() => { if (currentStockId === s.id) renderIndBody([], true); });
 
   // ── Render AI 綜合分析（等基本面與市場面就緒；其一失敗用中性預設值，不讓面板卡死）──
   const [fundRes, mktRes] = await Promise.all([fundP.catch(() => null), mktP.catch(() => null)]);
@@ -3269,28 +3199,20 @@ function renderFocusStocks() {
 
 // ── 本週重點財經新聞 ────────────────────────────────────────────────────────
 
-function getWeeklyNews() {
-  // 近一週台股重點財經新聞（依主題規則整理，附 AI 多空判讀）
-  return [
-    { date: '07-11', headline: '台積電 6 月營收再創同期新高，AI 訂單能見度延伸至 2027', impact: '半導體/權值股', dir: '偏多', cls: 'bull' },
-    { date: '07-10', headline: '美國 6 月 CPI 降溫，市場對 7/29 FOMC 降息預期升至七成', impact: '全球風險資產', dir: '偏多', cls: 'bull' },
-    { date: '07-09', headline: '新台幣升值壓力增，出口電子股 Q3 匯損疑慮升溫', impact: '電子出口股', dir: '偏空', cls: 'bear' },
-    { date: '07-08', headline: '外資單週買超台股逾 800 億，連續第三週淨流入', impact: '大盤/金融股', dir: '偏多', cls: 'bull' },
-    { date: '07-08', headline: '美中科技管制傳新一輪清單，設備供應鏈短線震盪', impact: '半導體設備', dir: '偏空', cls: 'bear' },
-    { date: '07-07', headline: '航運運價指數高位整理，Q3 傳統旺季支撐貨櫃三雄', impact: '航運股', dir: '中性', cls: 'neutral' },
-    { date: '07-07', headline: '台灣 6 月出口年增 18%，AI 伺服器與零組件為主要動能', impact: '大盤基本面', dir: '偏多', cls: 'bull' },
-  ];
-}
 
 async function renderWeeklyNews() {
   const el = document.getElementById('weekly-news-body');
   if (!el) return;
 
-  // 先抓真實新聞（Google News RSS 台股 近7日），失敗才用內建清單
-  let news = await fetchNewsRSS('台股 股市', 7);
-  let isLive = true;
-  if (!news?.length) { news = getWeeklyNews(); isLive = false; }
-  news = news.map(n => ({ impact: n.source || n.impact || '台股', ...n }));
+  // 只用真實新聞（Google News RSS 台股 近 7 日）
+  const news = (await fetchNewsRSS('台股 股市', 7).catch(() => null) || [])
+    .map(n => ({ impact: n.source || '台股', ...n }));
+  if (!news.length) {
+    el.innerHTML = `<h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞</h3>
+      <p style="font-size:0.8rem;color:var(--text3);margin-top:8px">新聞來源暫時無法取得，稍後自動重試</p>`;
+    return;
+  }
+  const isLive = true;
 
   const bullCount = news.filter(n => n.cls === 'bull').length;
   const bearCount = news.filter(n => n.cls === 'bear').length;
