@@ -499,6 +499,52 @@ async function fetchTWFundamentals(stockId) {
   return all?.[stockId] || null;
 }
 
+// ── 大盤成交量能（分辨「無量下跌」與「爆量止跌」）─────────────────────────
+// TWSE FMTQIK：近一個月每日成交股數/金額/加權指數/漲跌點數
+let _turnoverPromise = null;
+
+async function fetchMarketTurnover() {
+  if (_turnoverPromise) return _turnoverPromise;
+  _turnoverPromise = (async () => {
+    const key = 'cache:turnover';
+    const cached = cacheGet(key, 30 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK', 'twse-turnover', 7000).catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const parsed = rows.map(r => ({
+      date: String(r['日期'] ?? '').trim(),
+      amount: num(r['成交金額']),
+      index: num(r['發行量加權股價指數']),
+      chg: num(r['漲跌點數']),
+    })).filter(r => r.amount != null);
+    if (!parsed.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    cacheSet(key, parsed);
+    return parsed;
+  })();
+  const r = await _turnoverPromise;
+  if (!r) _turnoverPromise = null;
+  return r;
+}
+
+// 量價研判：今日量能 vs 20 日均量，配合指數漲跌，判斷這根 K 的性質
+function analyzeTurnover(rows) {
+  if (!rows?.length) return null;
+  const recent = rows.slice(-20);
+  if (recent.length < 5) return null;
+  const last = recent[recent.length - 1];
+  const avg = recent.reduce((s, r) => s + r.amount, 0) / recent.length;
+  const ratio = avg ? last.amount / avg : 1;
+  const up = (last.chg ?? 0) >= 0;
+  let verdict, tone;
+  if (!up && ratio < 0.8) { verdict = '無量下跌 — 賣壓不重但買盤觀望，易緩跌打底'; tone = 'neutral'; }
+  else if (!up && ratio > 1.3) { verdict = '爆量下跌 — 恐慌賣壓宣洩，留意是否落底'; tone = 'bear'; }
+  else if (up && ratio > 1.3) { verdict = '帶量上攻 — 買盤積極，漲勢有量能支撐'; tone = 'bull'; }
+  else if (up && ratio < 0.8) { verdict = '無量上漲 — 追價意願不足，反彈力道存疑'; tone = 'neutral'; }
+  else { verdict = '量能持平，多空拉鋸'; tone = 'neutral'; }
+  return { amount: last.amount, avg, ratio, up, chg: last.chg, index: last.index, date: last.date, verdict, tone };
+}
+
 // ── 月營收（台股最重要的即時基本面指標）──────────────────────────────────
 // 證交所 t187ap05_L（上市）+ 櫃買 mopsfin_t187ap05_O（上櫃），全市場一次抓。
 // 欄位名稱以關鍵字比對，避免官方調整欄位名時整組失效。
