@@ -125,7 +125,10 @@ async function runScan() {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
   }).catch(() => {});
-  fetchYahooOHLCV('^TWII', '1d', '6mo').catch(() => {}); // 預熱大盤 6 個月（個股頁市場面 Beta 計算秒開）
+  // 預熱官方加權指數日線（供相對強弱、Beta、市場面計算；不再依賴 Yahoo）
+  fetchTWIIHistory(5).then(bars => {
+    if (bars?.length) { _twiiSeries = bars; renderFocusStocks(); }
+  }).catch(() => {});
 
   // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
   const queue = [...allStocks];
@@ -1138,7 +1141,105 @@ function renderManagerVerdict(s) {
       ${m.notes.map(t => `<div style="font-size:0.76rem;color:var(--text3)">· ${t}</div>`).join('')}
       </div>
     </div>` : ''}
+    ${entryPlanHtml(s, m)}
     <p style="font-size:0.75rem;color:var(--text3);margin-top:12px">⚠ 以上為技術面與籌碼面的規則化分析，僅供研究參考，非投資建議。</p>`;
+}
+
+// ── AI 進場建議（做多）───────────────────────────────────────────────────────
+// 在所有分析（技術／基本面／籌碼／量價／多週期）完成後才生成，
+// 條件不足時明確說明「不建議進場」而非硬給一組數字。
+function buildEntryPlan(s, m) {
+  const a = s.analysis;
+  if (!a || !m) return null;
+  const price = m.price;
+  const atr = m.atr || price * 0.02;
+  const lows = s.ohlcv.map(d => d.low);
+
+  // 只在偏多結構才給進場建議（先以做多為主）
+  if (m.dir < 1.5) {
+    return { ok: false, why: m.dir <= -1
+      ? '目前為偏空/轉弱結構，不建議做多進場。待站回均線且動能轉正後再評估。'
+      : '多空拉鋸、方向未明，勝率不足。建議等待突破區間或回測支撐止穩後再評估。' };
+  }
+
+  // 進場區間：理想為回踩支撐/EMA20，上緣不追過現價太多
+  const pullback = Math.max(
+    a.ema20 && a.ema20 < price ? a.ema20 : 0,
+    m.sup,
+    price - atr * 1.2
+  );
+  const lo = +Math.min(pullback, price).toFixed(2);
+  const hi = +Math.min(price * 1.01, Math.max(lo * 1.015, price)).toFixed(2);
+
+  // 離場（停損）：支撐與近 5 日低點取較低者再留緩衝，並確保至少 1×ATR 空間
+  const struct = Math.min(m.sup, Math.min(...lows.slice(-5)));
+  let stop = +Math.min(struct * 0.99, lo - atr).toFixed(2);
+  if (stop >= lo) stop = +(lo - atr).toFixed(2);
+  const riskPct = (lo - stop) / lo * 100;
+
+  // 出場（目標）：以風險倍數與前方壓力綜合，取較保守者為第一目標
+  const r = lo - stop;
+  const t1 = +Math.min(lo + r * 2, Math.max(m.res, lo + r * 1.5)).toFixed(2);
+  const t2 = +Math.max(lo + r * 3, m.hi20 * 1.02).toFixed(2);
+
+  return {
+    ok: true, lo, hi, stop, t1, t2, riskPct,
+    rewardPct1: (t1 - lo) / lo * 100,
+    rewardPct2: (t2 - lo) / lo * 100,
+    rr: r > 0 ? (t1 - lo) / r : null,
+    horizon: m.horizon,
+    note: price > hi
+      ? '現價已高於理想進場區，建議等回踩，不追高'
+      : price < lo
+        ? '現價已低於進場區下緣，留意支撐是否失守'
+        : '現價位於進場區內，可分批布局',
+  };
+}
+
+function entryPlanHtml(s, m) {
+  const p = buildEntryPlan(s, m);
+  if (!p) return '';
+  if (!p.ok) {
+    return `<div style="margin-top:14px;padding:12px 14px;border-radius:10px;background:rgba(148,163,184,0.06);border:1px solid var(--border)">
+      <div style="font-size:0.82rem;font-weight:700;color:var(--text2);margin-bottom:4px">🎯 AI 進場建議（做多）</div>
+      <div style="font-size:0.8rem;color:var(--yellow)">目前不建議進場</div>
+      <div style="font-size:0.76rem;color:var(--text3);margin-top:4px;line-height:1.6">${p.why}</div>
+    </div>`;
+  }
+  const rrColor = p.rr >= 2 ? 'var(--bull)' : p.rr >= 1.5 ? 'var(--yellow)' : 'var(--bear)';
+  return `
+    <div style="margin-top:14px;padding:12px 14px;border-radius:10px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.18)">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <span style="font-size:0.82rem;font-weight:700;color:var(--blue)">🎯 AI 進場建議（做多）</span>
+        <span style="font-size:0.68rem;color:var(--text3)">綜合技術・基本面・籌碼・量價分析後生成</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div style="padding:8px 10px;background:rgba(255,255,255,0.02);border-radius:7px">
+          <div style="font-size:0.68rem;color:var(--text3)">進場範圍</div>
+          <div style="font-family:var(--mono);font-weight:700;color:var(--blue);font-size:0.95rem">${p.lo} ~ ${p.hi}</div>
+        </div>
+        <div style="padding:8px 10px;background:rgba(239,68,68,0.06);border-radius:7px">
+          <div style="font-size:0.68rem;color:var(--text3)">離場（停損）</div>
+          <div style="font-family:var(--mono);font-weight:700;color:var(--bear);font-size:0.95rem">${p.stop}
+            <span style="font-size:0.68rem;font-weight:400">（-${p.riskPct.toFixed(1)}%）</span></div>
+        </div>
+        <div style="padding:8px 10px;background:rgba(34,197,94,0.06);border-radius:7px">
+          <div style="font-size:0.68rem;color:var(--text3)">出場目標一</div>
+          <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t1}
+            <span style="font-size:0.68rem;font-weight:400">（+${p.rewardPct1.toFixed(1)}%）</span></div>
+        </div>
+        <div style="padding:8px 10px;background:rgba(34,197,94,0.04);border-radius:7px">
+          <div style="font-size:0.68rem;color:var(--text3)">出場目標二</div>
+          <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t2}
+            <span style="font-size:0.68rem;font-weight:400">（+${p.rewardPct2.toFixed(1)}%）</span></div>
+        </div>
+      </div>
+      <div style="margin-top:9px;display:flex;gap:14px;flex-wrap:wrap;font-size:0.75rem;color:var(--text3)">
+        <span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr ? p.rr.toFixed(1) : '--'}</strong></span>
+        <span>參考持有 ${p.horizon}</span>
+      </div>
+      <div style="margin-top:8px;font-size:0.76rem;color:var(--text2);line-height:1.6">📌 ${p.note}。跌破 <strong style="color:var(--bear)">${p.stop}</strong> 代表研判失效，應離場；觸及 <strong style="color:var(--bull)">${p.t1}</strong> 可先減碼，剩餘續抱看 ${p.t2}。</div>
+    </div>`;
 }
 
 
@@ -1719,7 +1820,9 @@ async function renderAnalysisPanels(s, inst) {
   const mktP = (async () => {
   let beta = null, corr = null, mktRet20 = null;
   try {
-    const twiiBars = await fetchYahooOHLCV('^TWII', '1d', '6mo');
+    // 官方加權指數日線優先（Yahoo 對雲端 IP 常限流 → 過去這裡永遠是「無資料」）
+    let twiiBars = await fetchTWIIHistory(5).catch(() => []);
+    if (!twiiBars?.length) twiiBars = await fetchYahooOHLCV('^TWII', '1d', '6mo');
     if (twiiBars?.length >= 30 && ohlcv.length >= 30) {
       const idxMap = new Map(twiiBars.map(b => [b.time, b.close]));
       const pairs = [];
@@ -2426,12 +2529,19 @@ function savePredLog(log) {
   try { localStorage.setItem(PRED_KEY, JSON.stringify(log.slice(-400))); } catch {}
 }
 
-// 大盤近 20 日報酬（供相對強弱計算）— 用官方量能資料的指數序列
+// 大盤近 20 日報酬（供相對強弱計算）
+let _twiiSeries = null; // 由 fetchTWIIHistory 填入，供同步計算使用
 function marketRet20() {
+  const from = arr => arr.length >= 21
+    ? (arr[arr.length-1] - arr[arr.length-21]) / arr[arr.length-21] * 100 : null;
+  if (_twiiSeries?.length) {
+    const r = from(_twiiSeries.map(b => b.close).filter(v => v > 0));
+    if (r != null) return r;
+  }
   try {
     const rows = cacheGet('cache:turnover', 24 * 60 * 60 * 1000);
-    const idx = (rows || []).map(r => r.index).filter(v => v > 0);
-    if (idx.length >= 21) return (idx[idx.length-1] - idx[idx.length-21]) / idx[idx.length-21] * 100;
+    const r = from((rows || []).map(r => r.index).filter(v => v > 0));
+    if (r != null) return r;
   } catch {}
   const t = outlookData.factors?.find(f => f.sym === '^TWII');
   return t?.chg5 != null ? t.chg5 * 2 : null; // 退而求其次：5 日報酬概估
