@@ -277,6 +277,62 @@ function mergeOfficialBar(ohlcv, q) {
   return ohlcv;
 }
 
+// ── 證交所官方日線歷史（Yahoo 全掛時的備援）─────────────────────────────────
+// STOCK_DAY 每次回傳一個月。過去月份的資料永不變動 → 快取 7 天，
+// 只有當月需要重抓，因此第二次之後的掃描成本極低。
+function rocToISO(d) {
+  const m = String(d).trim().match(/^(\d{2,3})\/(\d{2})\/(\d{2})$/);
+  if (!m) return null;
+  return `${+m[1] + 1911}-${m[2]}-${m[3]}`;
+}
+
+async function fetchTWSEMonth(stockId, year, month) {
+  const ym = `${year}${String(month).padStart(2, '0')}`;
+  const key = `cache:sd:${stockId}:${ym}`;
+  const now = new Date();
+  const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
+  const cached = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const url = `https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date=${ym}01&stockNo=${stockId}&response=json`;
+  const j = await proxyFetch(url, 7000).catch(() => null);
+  if (!j?.data?.length) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  // 欄位：日期,成交股數,成交金額,開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數
+  const bars = j.data.map(r => {
+    const time = rocToISO(r[0]);
+    const close = num(r[6]);
+    if (!time || close == null) return null;
+    return { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
+             low: num(r[5]) ?? close, close, volume: num(r[1]) ?? 0 };
+  }).filter(Boolean);
+  if (!bars.length) return null;
+  cacheSet(key, bars);
+  return bars;
+}
+
+// 抓最近 N 個月併成連續日線（預設 7 個月 ≈ 140 根，足夠 EMA50/RSI/MACD/ADX）
+async function fetchTWSEHistory(stockId, months = 7) {
+  const now = new Date();
+  const reqs = [];
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    reqs.push(fetchTWSEMonth(stockId, d.getFullYear(), d.getMonth() + 1));
+  }
+  const parts = await Promise.all(reqs.map(p => p.catch(() => null)));
+  const seen = new Set();
+  const bars = [];
+  for (const part of parts) {
+    for (const b of part || []) {
+      if (seen.has(b.time)) continue;
+      seen.add(b.time);
+      bars.push(b);
+    }
+  }
+  bars.sort((a, b) => a.time.localeCompare(b.time));
+  return bars;
+}
+
 // Taiwan stock — append ".TW" (TWSE listed) or ".TWO" (TPEx/OTC)
 function yahooSymbol(stockId) {
   return `${stockId}.TW`;
@@ -305,6 +361,10 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
         if (two.length) localStorage.setItem(suffixKey, 'TWO');
         ohlcv = two;
       }
+    }
+    // Yahoo 全掛時改用證交所官方日線（已證實可通），確保技術分析不中斷
+    if (!ohlcv.length && interval === '1d') {
+      ohlcv = await fetchTWSEHistory(stockId).catch(() => []);
     }
     // 日線：若官方當日行情「已就緒」才刷新最後一根 K 棒；尚未就緒就直接回傳，
     // 絕不等待（過去每檔都 await 全市場行情 → 整站卡死的主因）
