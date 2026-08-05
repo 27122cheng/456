@@ -2107,10 +2107,66 @@ const CHART_TF = {
   'D': { tf: '1d',  range: '6mo', label: '日線' },
   'W': { tf: '1wk', range: '2y',  label: '週線' },
   'M': { tf: '1mo', range: '5y',  label: '月線' },
-  // 分鐘級資料台灣官方無免費來源，僅 Yahoo 提供（可能因限流失敗）
-  '5': { tf: '5m',  range: '5d',  label: '5分', intraday: true },
+  // 分鐘級：台灣官方無免費來源，改由 TradingView 嵌入圖表提供
+  '5': { label: '5分', tv: '5' },
+  '15': { label: '15分', tv: '15' },
 };
 let _chartToken = 0;
+
+// ── TradingView 嵌入圖表（分鐘級資料唯一可行來源）──────────────────────────
+// 由 TradingView 在瀏覽器端載入自家資料，完全繞過我方代理與 Yahoo 封鎖。
+// 注意：舊版失敗是因為 <script> 被直接塞進容器，缺少官方要求的
+// tradingview-widget-container / __widget 巢狀結構，小工具找不到掛載點
+// 便以預設商品（AAPL）初始化 —— 此處依官方格式正確建構。
+function renderTradingViewChart(container, stockId, tvInterval, label) {
+  const ex = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? 'TPEX' : 'TWSE';
+  container.innerHTML = '';
+  container.style.position = 'relative';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'tradingview-widget-container';
+  wrap.style.cssText = 'height:100%;width:100%';
+  const inner = document.createElement('div');
+  inner.className = 'tradingview-widget-container__widget';
+  inner.style.cssText = 'height:calc(100% - 22px);width:100%';
+  wrap.appendChild(inner);
+
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.innerHTML = JSON.stringify({
+    autosize: true,
+    symbol: `${ex}:${stockId}`,
+    interval: tvInterval,
+    timezone: 'Asia/Taipei',
+    theme: 'dark',
+    style: '1',
+    locale: 'zh_TW',
+    backgroundColor: '#070b12',
+    gridColor: 'rgba(255,255,255,0.05)',
+    hide_side_toolbar: true,
+    allow_symbol_change: false,
+    save_image: false,
+    studies: ['STD;EMA'],
+    support_host: 'https://www.tradingview.com',
+  });
+  wrap.appendChild(script);
+  container.appendChild(wrap);
+
+  // 圖表載不出來時（商品不存在／腳本被擋）給出路，不留空白
+  const notice = document.createElement('div');
+  notice.style.cssText = 'position:absolute;left:8px;bottom:4px;font-size:0.62rem;color:var(--text3);pointer-events:none';
+  notice.textContent = `${label} · TradingView 提供（免費版為延遲報價）`;
+  container.appendChild(notice);
+  setTimeout(() => {
+    if (!container.querySelector('iframe')) {
+      container.innerHTML = `<div class="adv-loading" style="padding-top:180px;text-align:center;line-height:1.8">
+        TradingView 圖表載入失敗<br><span style="font-size:0.78rem">可能為網路阻擋或該商品不支援</span><br>
+        <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','D')">改看日線</button></div>`;
+    }
+  }, 6000);
+}
 
 async function initTVChart(stockId, interval = 'D') {
   const container = document.getElementById('tv-chart-container');
@@ -2118,6 +2174,9 @@ async function initTVChart(stockId, interval = 'D') {
   const token = ++_chartToken;
   const cfg = CHART_TF[interval] || CHART_TF.D;
   container.innerHTML = '<div class="adv-loading" style="padding-top:200px;text-align:center">載入 K 線資料...</div>';
+
+  // 分鐘級週期交由 TradingView（我方無免費分鐘資料來源）
+  if (cfg.tv) { renderTradingViewChart(container, stockId, cfg.tv, cfg.label); return; }
 
   // 日線用掃描已抓好的資料；週/月由日線聚合 → 三者皆零額外請求
   const daily = allStocks.find(x => x.id === stockId)?.ohlcv;
