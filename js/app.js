@@ -2107,9 +2107,9 @@ const CHART_TF = {
   'D': { tf: '1d',  range: '6mo', label: '日線' },
   'W': { tf: '1wk', range: '2y',  label: '週線' },
   'M': { tf: '1mo', range: '5y',  label: '月線' },
-  // 分鐘級：台灣官方無免費來源，改由 TradingView 嵌入圖表提供
-  '5': { label: '5分', tv: '5' },
-  '15': { label: '15分', tv: '15' },
+  // 分鐘級：優先自繪（與其他週期一致），Yahoo 分鐘資料取不到才退回 TradingView
+  '5':  { tf: '5m',  range: '1mo', label: '5分',  intraday: true, tv: '5' },
+  '15': { tf: '15m', range: '1mo', label: '15分', intraday: true, tv: '15' },
 };
 let _chartToken = 0;
 
@@ -2175,8 +2175,7 @@ async function initTVChart(stockId, interval = 'D') {
   const cfg = CHART_TF[interval] || CHART_TF.D;
   container.innerHTML = '<div class="adv-loading" style="padding-top:200px;text-align:center">載入 K 線資料...</div>';
 
-  // 分鐘級週期交由 TradingView（我方無免費分鐘資料來源）
-  if (cfg.tv) { renderTradingViewChart(container, stockId, cfg.tv, cfg.label); return; }
+
 
   // 日線用掃描已抓好的資料；週/月由日線聚合 → 三者皆零額外請求
   const daily = allStocks.find(x => x.id === stockId)?.ohlcv;
@@ -2188,13 +2187,10 @@ async function initTVChart(stockId, interval = 'D') {
   if (token !== _chartToken || currentStockId !== stockId) return; // 已切換股票/週期
 
   if (!bars?.length) {
-    container.innerHTML = `<div class="adv-loading" style="padding-top:180px;text-align:center;line-height:1.8">
-      ${cfg.intraday
-        ? '分鐘級 K 線目前無法取得<br><span style="font-size:0.78rem">台灣官方未提供免費分鐘資料，僅 Yahoo 有，而其對雲端伺服器限流中</span>'
-        : 'K 線資料載入失敗（資料源逾時）'}<br>
-      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button>
-      ${cfg.intraday ? `<button class="btn-ghost" style="margin-top:10px;margin-left:6px;padding:5px 16px" onclick="initTVChart('${stockId}','D')">改看日線</button>` : ''}
-    </div>`;
+    // 分鐘資料取不到 → 自動改用 TradingView 嵌入，仍看得到分鐘 K
+    if (cfg.tv) { renderTradingViewChart(container, stockId, cfg.tv, cfg.label); return; }
+    container.innerHTML = `<div class="adv-loading" style="padding-top:190px;text-align:center">K 線資料載入失敗（資料源逾時）<br>
+      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button></div>`;
     return;
   }
   drawCandleChart(container, bars, cfg.label, stockId);
@@ -2250,7 +2246,8 @@ function drawCandleChart(container, allBars, tfLabel, stockId) {
   for (let i = 0; i < n; i += step) {
     const t = bars[i].time || '';
     ctx.fillStyle = TXT;
-    ctx.fillText(t.slice(5), x(i), H - 6);
+    // 分鐘 K 顯示時間（"2026-08-05 09:05" → "09:05"），日線以上顯示月日
+    ctx.fillText(t.includes(' ') ? t.split(' ')[1] : t.slice(5), x(i), H - 6);
   }
 
   // 成交量

@@ -167,10 +167,25 @@ function tsToDate(ts) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 }
 
+// 分鐘級需要保留時分，否則同一天的每根 K 都會是相同字串 → 座標與去重全錯
+const isIntradayTF = tf => /^\d+m$|^\d+h$|^60m$/.test(tf);
+function tsToLabel(ts, interval) {
+  if (!isIntradayTF(interval)) return tsToDate(ts);
+  const d = new Date(ts * 1000);
+  // 以台北時間顯示（使用者所在市場時區）
+  const p = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d).reduce((o, x) => (o[x.type] = x.value, o), {});
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
 async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const key = `cache:ohlcv:${symbol}:${interval}:${range}`;
-  // 日線盤中只有最後一根 K 會變，10 分鐘快取即可 — 大幅減少 proxy 請求量（避免被限流）
-  const cached = cacheGet(key, interval === '1d' || interval === '1wk' ? 10 * 60 * 1000 : CACHE_TTL);
+  // 日線盤中只有最後一根 K 會變 → 10 分鐘快取；分鐘級變動快 → 2 分鐘
+  const ttl = isIntradayTF(interval) ? 2 * 60 * 1000
+            : (interval === '1d' || interval === '1wk') ? 10 * 60 * 1000 : CACHE_TTL;
+  const cached = cacheGet(key, ttl);
   if (cached) return cached;
 
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
@@ -180,7 +195,7 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const { timestamp, indicators } = result;
   const q = indicators.quote[0];
   const ohlcv = timestamp.map((ts, i) => ({
-    time: tsToDate(ts),
+    time: tsToLabel(ts, interval),
     open:   q.open[i]   ? +q.open[i].toFixed(2)   : null,
     high:   q.high[i]   ? +q.high[i].toFixed(2)   : null,
     low:    q.low[i]    ? +q.low[i].toFixed(2)     : null,
