@@ -57,19 +57,22 @@ let scanning = false;
 // ── Init ───────────────────────────────────────────────────────────────────
 
 async function initApp() {
-  loadSettings();
-  renderCustomStocksList();
-  initNavSearch();
-  initEventListeners();
+  // 任一面板初始化失敗都不得中斷後續流程 —— 尤其不能擋住掃描啟動
+  const safe = (label, fn) => { try { const r = fn(); if (r?.catch) r.catch(e => console.warn(label, e)); }
+                                catch (e) { console.warn(`初始化 ${label} 失敗:`, e); } };
+  safe('設定', loadSettings);
+  safe('自選股清單', renderCustomStocksList);
+  safe('搜尋', initNavSearch);
+  safe('事件監聽', initEventListeners);
   // Hide loader immediately — scan runs in background with its own progress bar
-  hideLoader();
-  renderEvents();
-  renderCapitalFlow();
-  renderWeeklyNews();
-  renderTopBottomReversal();
-  startRefreshCycle();
-  startDailyBriefingCheck();
-  startScan();
+  safe('載入遮罩', hideLoader);
+  safe('財經事件', renderEvents);
+  safe('資金流動', renderCapitalFlow);
+  safe('本週新聞', renderWeeklyNews);
+  safe('頂底反轉', renderTopBottomReversal);
+  safe('刷新循環', startRefreshCycle);
+  safe('每日簡報', startDailyBriefingCheck);
+  safe('掃描', startScan);
 }
 
 // ── Scan ───────────────────────────────────────────────────────────────────
@@ -77,6 +80,24 @@ async function initApp() {
 async function startScan() {
   if (scanning) return;
   scanning = true;
+  // 最後防線：無論發生什麼事，60 秒後一定解除鎖定，
+  // 避免任何未預期的例外讓 scanning 永遠卡在 true → 之後再也不會掃描
+  const failsafe = setTimeout(() => {
+    if (scanning) { scanning = false; showScanBar(false); console.warn('掃描逾時，已自動解除鎖定'); }
+  }, 60000);
+  try {
+    await runScan();
+  } catch (e) {
+    console.error('掃描發生錯誤:', e);
+    showToast('掃描過程發生錯誤，下輪將自動重試', 'error');
+  } finally {
+    clearTimeout(failsafe);
+    scanning = false;
+    showScanBar(false);
+  }
+}
+
+async function runScan() {
 
   const stocks = getStockList();
   allStocks = stocks.map(s => ({ ...s, ohlcv: [], analysis: null, reversal: null }));
@@ -124,13 +145,15 @@ async function startScan() {
         console.warn(`Failed ${s.id}:`, e);
       }
       done++;
-      setScanProgress((done / total) * 100, `分析 ${s.name} (${s.id})... ${done}/${total}`);
-      // Render incrementally every 5 stocks
-      if (done % 5 === 0 || done === total) {
-        renderDashboard();
-        renderFocusStocks(); // 邊掃邊更新，掃描未完成也不會卡在初始文字
-        if (currentPage === 'ranking') renderRanking();
-      }
+      // 渲染錯誤絕不能讓 worker 死掉 —— 否則 Promise.all 中斷、scanning 永遠卡在 true
+      try {
+        setScanProgress((done / total) * 100, `分析 ${s.name} (${s.id})... ${done}/${total}`);
+        if (done % 5 === 0 || done === total) {
+          renderDashboard();
+          renderFocusStocks(); // 邊掃邊更新，掃描未完成也不會卡在初始文字
+          if (currentPage === 'ranking') renderRanking();
+        }
+      } catch (e) { console.warn('渲染失敗（不影響掃描）:', e); }
     }
   }
   // 自家代理有 CDN 快取且無限流，可提高並行度；請求本身已去重
@@ -164,30 +187,20 @@ async function startScan() {
 
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
-  document.getElementById('last-updated').textContent = new Date().toLocaleTimeString('zh-TW');
-  scanning = false;
+  const lu = document.getElementById('last-updated');
+  if (lu) lu.textContent = new Date().toLocaleTimeString('zh-TW');
 
-  // Re-render outlook now that breadth (bull/bear counts) is known
-  renderMarketOutlook();
-
-  // AI 自動交易：結算既有部位 → 產生新建議
-
-  // 每日 / 每週重點關注股
-  renderFocusStocks();
-
+  // 掃描後的收尾工作各自獨立，任一失敗都不影響其他項目
+  const after = (label, fn) => { try { fn(); } catch (e) { console.warn(`${label} 失敗:`, e); } };
+  after('市場多空總覽', renderMarketOutlook);   // 需等 breadth（多空家數）算完
+  after('重點關注股', renderFocusStocks);
   // AI 預測準確度：先結算到期預測，再記錄今日預測（順序不可調換）
-  resolvePredictions();
-  recordPredictions();
-  renderPredAccuracy();
-  if (currentPage === 'lab') renderLab();
-
-  // 價格警報檢查
-  checkAlerts();
-
-  // Telegram：強勢訊號 + 數據公布預測 + 每日重點股（各每日一次）
-  autoNotifyTelegram();
-  notifyEventPredictions();
-  notifyDailyFocus();
+  after('結算預測', resolvePredictions);
+  after('記錄預測', recordPredictions);
+  after('預測準確度', renderPredAccuracy);
+  after('機會實驗室', () => { if (currentPage === 'lab') renderLab(); });
+  after('價格警報', checkAlerts);
+  after('Telegram 推送', () => { autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus(); });
 }
 
 // ── Dashboard Rendering ────────────────────────────────────────────────────
@@ -698,6 +711,14 @@ function sqGradeColor(grade) {
 
 
 
+
+// 某年某月的第三個星期五（富時/ETF 成分股調整生效日）
+function thirdFriday(y, m) {
+  const d = new Date(y, m, 1);
+  // 先找到當月第一個週五，再加兩週
+  d.setDate(1 + ((5 - d.getDay() + 7) % 7) + 14);
+  return d;
+}
 
 function getCapitalFlowEvents() {
   const now = new Date();
@@ -2648,8 +2669,17 @@ function computeFocusStocks() {
   if (!valid.length) return { daily: [], weekly: [] };
 
   const mktRet20 = marketRet20() ?? 0;
-  const scored = valid.map(s => ({ s, d: scoreStockDimensions(s, mktRet20) }))
-    .filter(x => x.d && !x.d.excluded);
+  const all = valid.map(s => ({ s, d: scoreStockDimensions(s, mktRet20) })).filter(x => x.d);
+  let scored = all.filter(x => !x.d.excluded);
+  // 全市場過熱或普遍轉弱時可能全被排除 → 改列排除項中相對最佳者並標明風險，
+  // 不讓面板空白（空白無法區分「沒機會」與「系統故障」）
+  if (scored.length < 3) {
+    const fallback = all.filter(x => x.d.excluded)
+      .sort((p, q) => q.d.total - p.d.total)
+      .slice(0, 5 - scored.length)
+      .map(x => ({ ...x, d: { ...x.d, warnings: [x.d.excluded, ...x.d.warnings].slice(0, 3) } }));
+    scored = [...scored, ...fallback];
+  }
 
   // 短線推薦：綜合分數為主，額外看重當日動能與量價
   const daily = scored.map(x => {
