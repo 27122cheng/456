@@ -333,6 +333,64 @@ async function fetchTWSEHistory(stockId, months = 7) {
   return bars;
 }
 
+// 加權指數官方日線歷史（FMTQIK 按月版）— 供 Beta／相關性／相對強弱計算
+// 欄位：日期,成交股數,成交金額,成交筆數,發行量加權股價指數,漲跌點數
+async function fetchTWIIMonth(year, month) {
+  const ym = `${year}${String(month).padStart(2, '0')}`;
+  const key = `cache:twii:${ym}`;
+  const now = new Date();
+  const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
+  const cached = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const j = await proxyFetch(`https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date=${ym}01&response=json`, 7000).catch(() => null);
+  if (!j?.data?.length) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const bars = j.data.map(r => {
+    const time = rocToISO(r[0]);
+    const close = num(r[4]);
+    return time && close != null ? { time, close, amount: num(r[2]) ?? 0, chg: num(r[5]) } : null;
+  }).filter(Boolean);
+  if (!bars.length) return null;
+  cacheSet(key, bars);
+  return bars;
+}
+
+async function fetchTWIIHistory(months = 5) {
+  const now = new Date();
+  const parts = await Promise.all(
+    Array.from({ length: months }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - (months - 1 - i), 1);
+      return fetchTWIIMonth(d.getFullYear(), d.getMonth() + 1).catch(() => null);
+    })
+  );
+  const seen = new Set(), bars = [];
+  for (const p of parts) for (const b of p || []) {
+    if (!seen.has(b.time)) { seen.add(b.time); bars.push(b); }
+  }
+  bars.sort((a, b) => a.time.localeCompare(b.time));
+  return bars;
+}
+
+// 由日線聚合月線（台灣官方無免費分鐘 K，改用可靠的月線取代 60 分）
+function aggregateMonthly(daily) {
+  const out = [];
+  let cur = null;
+  for (const b of daily) {
+    const ym = b.time.slice(0, 7);
+    if (!cur || cur.time !== ym) {
+      cur = { time: ym, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume || 0 };
+      out.push(cur);
+    } else {
+      cur.high = Math.max(cur.high, b.high);
+      cur.low = Math.min(cur.low, b.low);
+      cur.close = b.close;
+      cur.volume += b.volume || 0;
+    }
+  }
+  return out;
+}
+
 // Taiwan stock — append ".TW" (TWSE listed) or ".TWO" (TPEx/OTC)
 function yahooSymbol(stockId) {
   return `${stockId}.TW`;
@@ -853,15 +911,17 @@ function aggregateWeekly(daily) {
   return out;
 }
 
+// 日／週／月三週期：全部由已抓好的日線聚合，零額外請求且永遠有資料。
+// （原本的 60 分 K 只有 Yahoo 提供，Yahoo 一掛就永遠顯示「--」）
 async function fetchMTFSignals(stockId, dailyBars = null) {
   const daily = dailyBars?.length ? dailyBars : await fetchStockOHLCV(stockId, '1d', '6mo');
-  const score = bars => (bars?.length >= 20 ? (b => ({ score: b.score, signal: b.signal }))(calculateScore(bars)) : { score: null, signal: '--' });
-
-  const h1 = await fetchStockOHLCV(stockId, '60m', '1mo').catch(() => []);
+  const score = bars => (bars?.length >= 20
+    ? (b => ({ score: b.score, signal: b.signal }))(calculateScore(bars))
+    : { score: null, signal: '--' });
   return [
-    { label: '60分', ...score(h1) },
     { label: '日線', ...score(daily) },
     { label: '週線', ...score(aggregateWeekly(daily)) },
+    { label: '月線', ...score(aggregateMonthly(daily)) },
   ];
 }
 
