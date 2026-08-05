@@ -202,8 +202,13 @@ async function runScan() {
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
   after('機會實驗室', () => { if (currentPage === 'lab') renderLab(); });
+  after('我的持倉', renderHoldings);
   after('價格警報', checkAlerts);
-  after('Telegram 推送', () => { autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus(); });
+  after('Telegram 推送', () => {
+    autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
+    notifyEntrySignals();   // 適合進場的訊號
+    notifyHoldingExits();   // 持倉出場檢查
+  });
 }
 
 // ── Dashboard Rendering ────────────────────────────────────────────────────
@@ -1171,23 +1176,104 @@ function buildEntryPlan(s, m) {
   const lo = +Math.min(pullback, price).toFixed(2);
   const hi = +Math.min(price * 1.01, Math.max(lo * 1.015, price)).toFixed(2);
 
-  // 離場（停損）：支撐與近 5 日低點取較低者再留緩衝，並確保至少 1×ATR 空間
-  const struct = Math.min(m.sup, Math.min(...lows.slice(-5)));
+  // ── 進場依據：大戶籌碼 / 基本面 / 技術面三個面向的支撐 ──
+  const support = { chips: [], fund: [], tech: [] };
+  // 大戶籌碼
+  const streak = instStreak(s.id);
+  if (s.foreign > 1000) support.chips.push(`外資買超 ${s.foreign.toLocaleString()} 張`);
+  else if (s.foreign > 200) support.chips.push(`外資小幅買超 ${s.foreign.toLocaleString()} 張`);
+  if (streak?.dir > 0 && streak.days >= 2) support.chips.push(`法人連 ${streak.days} 日買超（累計 ${streak.total.toLocaleString()} 張）`);
+  if (s.investment > 500) support.chips.push(`投信買超 ${s.investment.toLocaleString()} 張`);
+  if (m.oi?.shortFinRatio >= 30) support.chips.push(`券資比 ${m.oi.shortFinRatio.toFixed(0)}%，具軋空動能`);
+  if (m.oi?.dFin < 0 && s.foreign > 0) support.chips.push('融資減少但外資買進，籌碼由散戶轉入法人');
+  // 基本面
+  const rev = s.rev, fin = s._fin, fd = s._fd;
+  if (rev?.yoy >= 10) support.fund.push(`月營收年增 +${rev.yoy.toFixed(1)}%`);
+  if (rev?.cumYoy >= 10) support.fund.push(`累計營收年增 +${rev.cumYoy.toFixed(1)}%`);
+  if (fin?.grossMargin >= 30) support.fund.push(`毛利率 ${fin.grossMargin.toFixed(1)}%`);
+  if (fin?.netMargin >= 8) support.fund.push(`淨利率 ${fin.netMargin.toFixed(1)}%`);
+  if (fd?.pe > 0 && fd.pe < 20) support.fund.push(`本益比 ${fd.pe.toFixed(1)}x 合理`);
+  if (fd?.divYield >= 0.04) support.fund.push(`殖利率 ${(fd.divYield * 100).toFixed(1)}%`);
+  // 技術面
+  if (a.ema20 && lo <= a.ema20 * 1.02 && lo >= a.ema20 * 0.98) support.tech.push(`進場區貼合 EMA20（${a.ema20.toFixed(2)}）`);
+  if (m.sup && lo <= m.sup * 1.03) support.tech.push(`進場區位於支撐 ${m.sup} 之上`);
+  if (a.ema50 && price > a.ema50) support.tech.push(`站穩季線 EMA50（${a.ema50.toFixed(2)}）`);
+  if (a.ema200 && price > a.ema200) support.tech.push('位於年線之上，長期結構偏多');
+  if (a.macd?.macd > a.macd?.signal) support.tech.push('MACD 金叉');
+  if (a.adx >= 25) support.tech.push(`ADX ${a.adx.toFixed(0)} 趨勢確立`);
+  if (a.diverg?.type === 'confirm') support.tech.push('量價同步，漲勢有量能支撐');
+  if (m.mtfAligned === 'bull') support.tech.push('日線／週線／月線同步偏多');
+
+  // ── 離場（停損）：取結構低點與 ATR 緩衝的較低者，並說明依據 ──
+  const low5 = Math.min(...lows.slice(-5));
+  const struct = Math.min(m.sup, low5);
   let stop = +Math.min(struct * 0.99, lo - atr).toFixed(2);
   if (stop >= lo) stop = +(lo - atr).toFixed(2);
+  // 上限保護：突破創新高時結構支撐可能離得很遠，
+  // 停損距離超過 8% 或 3×ATR 就改用較近者，避免單筆風險過大
+  const maxRisk = Math.min(lo * 0.08, atr * 3);
+  let stopCapped = false;
+  if (lo - stop > maxRisk) { stop = +(lo - maxRisk).toFixed(2); stopCapped = true; }
   const riskPct = (lo - stop) / lo * 100;
+  const stopBasis = [];
+  if (stopCapped) {
+    stopBasis.push(`結構支撐距離過遠，改以風險上限 ${riskPct.toFixed(1)}%（${(maxRisk / atr).toFixed(1)}×ATR）設定`);
+  } else {
+    if (m.sup && stop < m.sup) stopBasis.push(`低於支撐位 ${m.sup}（跌破代表支撐失守）`);
+    if (stop < low5) stopBasis.push(`低於近 5 日最低 ${low5.toFixed(2)}`);
+    stopBasis.push(`保留 ${((lo - stop) / atr).toFixed(1)}×ATR 緩衝，避免日常波動誤觸`);
+  }
+  if (a.ema50 && stop < a.ema50) stopBasis.push('位於季線之下，跌破即中期轉弱');
 
-  // 出場（目標）：以風險倍數與前方壓力綜合，取較保守者為第一目標
+  // ── 止盈：先找上方是否存在真實壓力，沒有就續抱 ──
   const r = lo - stop;
-  const t1 = +Math.min(lo + r * 2, Math.max(m.res, lo + r * 1.5)).toFixed(2);
-  const t2 = +Math.max(lo + r * 3, m.hi20 * 1.02).toFixed(2);
+  // 壓力必須是「先前」形成的價位 —— 排除最近 3 根 K，
+  // 否則今天自己的最高價會被當成壓力，突破創新高的股票將永遠判不出「無壓力」
+  const highs = s.ohlcv.map(d => d.high);
+  const prior = highs.slice(0, -3);
+  const priorHi20 = prior.length >= 20 ? Math.max(...prior.slice(-20)) : null;
+  const priorHi60 = prior.length >= 60 ? Math.max(...prior.slice(-60)) : null;
+  // 直接取真實偵測到的壓力位（m.res 在無壓力時會退回 hi20，含今日高點，不可用）
+  const realRes = calcSR(s.ohlcv).resistances || [];
+  const resList = [];
+  // 門檻設 1.5%：今日自身高點通常僅高於收盤 1% 內，藉此濾掉「假壓力」
+  for (const v of realRes) if (v > price * 1.015) resList.push({ v: +v.toFixed(2), why: '前波壓力區' });
+  if (priorHi20 > price * 1.015) resList.push({ v: +priorHi20.toFixed(2), why: '前 20 日高點' });
+  if (priorHi60 > price * 1.015) resList.push({ v: +priorHi60.toFixed(2), why: '前 3 個月高點' });
+  if (a.boll?.upper > price * 1.015) resList.push({ v: +a.boll.upper.toFixed(2), why: '布林上軌' });
+  resList.sort((x, y) => x.v - y.v);
+  // 合併過近的壓力（相差 <1% 視為同一區，避免目標一與目標二顯示同價位）
+  const merged = [];
+  for (const r0 of resList) {
+    const prev = merged[merged.length - 1];
+    if (prev && (r0.v - prev.v) / prev.v < 0.01) { prev.why += `／${r0.why}`; continue; }
+    merged.push({ ...r0 });
+  }
+  resList.length = 0; resList.push(...merged);
+
+  const nearHigh = priorHi60 ? price >= priorHi60 * 0.995 : false; // 已站上前 3 個月高點
+  const hasResistance = resList.length > 0;
+
+  let t1 = null, t2 = null, targetNote = '', holdOn = false;
+  if (hasResistance) {
+    t1 = +resList[0].v.toFixed(2);
+    t2 = resList[1] ? +resList[1].v.toFixed(2) : +(lo + r * 3).toFixed(2);
+    targetNote = `第一目標為${resList[0].why} ${t1}${resList[1] ? `，其上為${resList[1].why} ${t2}` : ''}`;
+  } else {
+    holdOn = true;
+    targetNote = nearHigh
+      ? '股價已突破近 3 個月高點，上方無套牢賣壓與明顯壓力區 → 不設固定停利，持續持倉'
+      : '上方無明顯壓力區 → 不設固定停利，持續持倉';
+  }
+  // 續抱時的移動停利基準（隨股價墊高，鎖住獲利）
+  const trail = +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2);
 
   return {
-    ok: true, lo, hi, stop, t1, t2, riskPct,
-    rewardPct1: (t1 - lo) / lo * 100,
-    rewardPct2: (t2 - lo) / lo * 100,
-    rr: r > 0 ? (t1 - lo) / r : null,
-    horizon: m.horizon,
+    ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail,
+    rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
+    rewardPct2: t2 ? (t2 - lo) / lo * 100 : null,
+    rr: r > 0 && t1 ? (t1 - lo) / r : null,
+    horizon: m.horizon, support, stopBasis,
     note: price > hi
       ? '現價已高於理想進場區，建議等回踩，不追高'
       : price < lo
@@ -1223,6 +1309,12 @@ function entryPlanHtml(s, m) {
           <div style="font-family:var(--mono);font-weight:700;color:var(--bear);font-size:0.95rem">${p.stop}
             <span style="font-size:0.68rem;font-weight:400">（-${p.riskPct.toFixed(1)}%）</span></div>
         </div>
+        ${p.holdOn ? `
+        <div style="padding:8px 10px;background:rgba(34,197,94,0.06);border-radius:7px;grid-column:1/-1">
+          <div style="font-size:0.68rem;color:var(--text3)">出場目標</div>
+          <div style="font-weight:700;color:var(--bull);font-size:0.88rem">上方無壓力 — 持續持倉</div>
+          <div style="font-size:0.7rem;color:var(--text3);margin-top:2px">移動停利參考 <span style="font-family:var(--mono);color:var(--yellow)">${p.trail}</span>（隨股價墊高）</div>
+        </div>` : `
         <div style="padding:8px 10px;background:rgba(34,197,94,0.06);border-radius:7px">
           <div style="font-size:0.68rem;color:var(--text3)">出場目標一</div>
           <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t1}
@@ -1232,13 +1324,41 @@ function entryPlanHtml(s, m) {
           <div style="font-size:0.68rem;color:var(--text3)">出場目標二</div>
           <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t2}
             <span style="font-size:0.68rem;font-weight:400">（+${p.rewardPct2.toFixed(1)}%）</span></div>
-        </div>
+        </div>`}
       </div>
       <div style="margin-top:9px;display:flex;gap:14px;flex-wrap:wrap;font-size:0.75rem;color:var(--text3)">
-        <span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr ? p.rr.toFixed(1) : '--'}</strong></span>
+        ${p.rr ? `<span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr.toFixed(1)}</strong></span>` : ''}
         <span>參考持有 ${p.horizon}</span>
       </div>
-      <div style="margin-top:8px;font-size:0.76rem;color:var(--text2);line-height:1.6">📌 ${p.note}。跌破 <strong style="color:var(--bear)">${p.stop}</strong> 代表研判失效，應離場；觸及 <strong style="color:var(--bull)">${p.t1}</strong> 可先減碼，剩餘續抱看 ${p.t2}。</div>
+
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">📊 進場依據</div>
+        ${[['🏦 大戶籌碼', p.support.chips, 'var(--blue)'],
+           ['📈 基本面', p.support.fund, 'var(--bull)'],
+           ['📐 技術面', p.support.tech, 'var(--text2)']]
+          .filter(([, arr]) => arr.length)
+          .map(([lbl, arr, c]) => `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:4px;line-height:1.6">
+            <span style="color:${c};font-weight:600">${lbl}</span>：${arr.join('・')}</div>`).join('')
+          || '<div style="font-size:0.75rem;color:var(--text3)">目前僅技術面條件成立，籌碼與基本面數據不足</div>'}
+      </div>
+
+      <div style="margin-top:8px">
+        <div style="font-size:0.72rem;color:var(--text3);margin-bottom:4px">🛑 停損依據</div>
+        <div style="font-size:0.75rem;color:var(--text3);line-height:1.6">${p.stopBasis.join('；')}</div>
+      </div>
+
+      <div style="margin-top:8px">
+        <div style="font-size:0.72rem;color:var(--text3);margin-bottom:4px">🎯 停利依據</div>
+        <div style="font-size:0.75rem;color:var(--text3);line-height:1.6">${p.targetNote}</div>
+      </div>
+
+      <div style="margin-top:10px;font-size:0.76rem;color:var(--text2);line-height:1.6">📌 ${p.note}。跌破 <strong style="color:var(--bear)">${p.stop}</strong> 代表研判失效，應離場；${p.holdOn
+        ? `上方無壓力，續抱並以移動停利 <strong style="color:var(--yellow)">${p.trail}</strong> 保護獲利。`
+        : `觸及 <strong style="color:var(--bull)">${p.t1}</strong> 可先減碼，剩餘續抱看 ${p.t2}。`}</div>
+
+      <div style="margin-top:12px">
+        <button class="btn-primary" style="padding:7px 16px;font-size:0.8rem" onclick="addHolding('${s.id}')">📌 記錄我的持倉（每日檢查出場訊號）</button>
+      </div>
     </div>`;
 }
 
@@ -2513,6 +2633,168 @@ function renderCustomStocksList() {
       <button onclick="removeCustomStock('${s.id}')" title="移除">×</button>
     </div>`).join('');
   if (cnt) cnt.textContent = `共 ${list.length} 檔`;
+}
+
+// ── 我的持倉：每日檢查出場訊號 ──────────────────────────────────────────────
+// 不做自動撮合，只記錄你實際買進的部位，每輪掃描重新評估是否該離場。
+
+function getHoldings() {
+  try { return JSON.parse(localStorage.getItem('my-holdings') || '[]'); } catch { return []; }
+}
+function saveHoldings(h) { localStorage.setItem('my-holdings', JSON.stringify(h)); }
+
+function addHolding(stockId) {
+  const s = allStocks.find(x => x.id === stockId);
+  if (!s?.analysis) { showToast('資料未就緒，稍後再試', 'error'); return; }
+  const holdings = getHoldings();
+  if (holdings.some(h => h.id === stockId)) { showToast('此股已在持倉清單中', 'info'); return; }
+
+  const m = buildManagerAnalysis(s);
+  const p = buildEntryPlan(s, m);
+  const def = s.analysis.price.toFixed(2);
+  const input = prompt(`記錄「${s.name}(${stockId})」的持倉\n\n請輸入你的實際買進均價：`, def);
+  if (input === null) return;
+  const entry = parseFloat(input);
+  if (!isFinite(entry) || entry <= 0) { showToast('進場價格式不正確', 'error'); return; }
+
+  holdings.push({
+    id: stockId, name: s.name, entry: +entry.toFixed(2),
+    stop: p?.ok ? p.stop : +(entry * 0.93).toFixed(2),
+    t1: p?.ok && p.t1 ? p.t1 : null,
+    addedAt: new Date().toISOString().slice(0, 10),
+  });
+  saveHoldings(holdings);
+  showToast(`📌 已記錄 ${s.name} 持倉（每日自動檢查出場訊號）`, 'success');
+  renderHoldings();
+}
+
+function removeHolding(stockId) {
+  saveHoldings(getHoldings().filter(h => h.id !== stockId));
+  renderHoldings();
+}
+
+// 對單一持倉做出場研判
+function checkHoldingExit(h) {
+  const s = allStocks.find(x => x.id === h.id);
+  if (!s?.analysis) return null;
+  const a = s.analysis;
+  const price = a.price;
+  const m = buildManagerAnalysis(s);
+  const retPct = (price - h.entry) / h.entry * 100;
+  const reasons = [];
+  let level = 'hold';  // hold | watch | exit
+
+  if (price <= h.stop) { level = 'exit'; reasons.push(`跌破停損 ${h.stop}`); }
+  if (m && m.dir <= -1) { level = 'exit'; reasons.push(`研判轉為「${m.stance}」，多方結構失效`); }
+  if (a.ema20 && price < a.ema20 && a.ema50 && price < a.ema50) {
+    if (level !== 'exit') level = 'watch';
+    reasons.push('跌破 EMA20 與 EMA50，短中期均線雙破');
+  }
+  if (a.diverg?.type === 'bear') {
+    if (level !== 'exit') level = 'watch';
+    reasons.push('出現量價頂背離，追價動能減弱');
+  }
+  if (s.foreign != null && s.foreign < -2000) {
+    if (level !== 'exit') level = 'watch';
+    reasons.push(`外資賣超 ${Math.abs(s.foreign).toLocaleString()} 張`);
+  }
+  if (s.rev?.yoy != null && s.rev.yoy <= -20) {
+    if (level !== 'exit') level = 'watch';
+    reasons.push(`月營收年減 ${s.rev.yoy.toFixed(0)}%，基本面轉差`);
+  }
+  if (h.t1 && price >= h.t1) {
+    if (level === 'hold') level = 'watch';
+    reasons.push(`已達目標價 ${h.t1}，可考慮減碼鎖利`);
+  }
+  if (!reasons.length) reasons.push(m ? `結構維持「${m.stance}」，續抱` : '結構穩定，續抱');
+
+  return { h, s, price, retPct, level, reasons, stance: m?.stance, trail: m ? +Math.max(price - (m.atr || price * 0.02) * 2, a.ema20 || 0).toFixed(2) : null };
+}
+
+function renderHoldings() {
+  const el = document.getElementById('holdings-body');
+  if (!el) return;
+  const holdings = getHoldings();
+  if (!holdings.length) {
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">尚無記錄。在個股分析頁按「📌 記錄我的持倉」即可加入，系統每輪掃描會自動檢查是否出現出場訊號。</p>';
+    return;
+  }
+  const rows = holdings.map(checkHoldingExit).filter(Boolean);
+  if (!rows.length) { el.innerHTML = '<div class="adv-loading">等待掃描完成後評估持倉...</div>'; return; }
+
+  const badge = { exit: { t: '🔴 建議出場', c: 'var(--bear)' }, watch: { t: '🟡 留意', c: 'var(--yellow)' }, hold: { t: '🟢 續抱', c: 'var(--bull)' } };
+  el.innerHTML = rows.map(r => `
+    <div style="padding:10px 12px;border-radius:9px;background:${badge[r.level].c}0d;border-left:3px solid ${badge[r.level].c};margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:0.86rem;cursor:pointer" onclick="openStock('${r.h.id}')">${r.h.name} <span style="color:var(--text3);font-size:0.74rem">${r.h.id}</span></strong>
+        <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${badge[r.level].t}</span>
+        <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${r.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%</span>
+        <button class="del-trade-btn" onclick="removeHolding('${r.h.id}')" title="移除">×</button>
+      </div>
+      <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
+        成本 ${r.h.entry}｜現價 ${r.price.toFixed(2)}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}
+      </div>
+      <div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.6">${r.reasons.join('；')}</div>
+    </div>`).join('');
+}
+
+// 每日一次：持倉出場訊號 Telegram 推送
+function notifyHoldingExits() {
+  if (!tgWants('sig')) return;
+  const holdings = getHoldings();
+  if (!holdings.length) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('tg-holdings-date') === today) return;
+
+  const rows = holdings.map(checkHoldingExit).filter(Boolean);
+  if (rows.length < holdings.length) return; // 資料未齊，等下輪再推
+
+  const icon = { exit: '🔴', watch: '🟡', hold: '🟢' };
+  const lines = rows.map(r =>
+    `${icon[r.level]} ${r.h.name}(${r.h.id}) ${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%\n` +
+    `　成本 ${r.h.entry}｜現價 ${r.price.toFixed(2)}｜停損 ${r.h.stop}\n　${r.reasons.join('；')}`
+  ).join('\n\n');
+  const exits = rows.filter(r => r.level === 'exit').length;
+  const watches = rows.filter(r => r.level === 'watch').length;
+  tgPush(`📋 台股雷達 每日持倉檢查\n${today}\n\n` +
+    (exits ? `⚠ 有 ${exits} 檔出現出場訊號\n` : watches ? `留意 ${watches} 檔\n` : '全部續抱，無出場訊號\n') +
+    `\n${lines}\n\n⚠ 僅供參考，非投資建議`);
+  localStorage.setItem('tg-holdings-date', today);
+}
+
+// 每日一次：適合進場的個股訊號推送
+function notifyEntrySignals() {
+  if (!tgWants('sig')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  if (localStorage.getItem('tg-entry-date') === today) return;
+
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return;
+
+  const picks = [];
+  for (const s of ready) {
+    const m = buildManagerAnalysis(s);
+    if (!m || m.dir < 3) continue;                   // 只推研判強度足夠者
+    const p = buildEntryPlan(s, m);
+    if (!p?.ok) continue;
+    if (s.analysis.price > p.hi * 1.02) continue;    // 已明顯追高不推
+    const d = scoreStockDimensions(s, marketRet20() ?? 0);
+    if (!d || d.excluded || d.total < 65) continue;  // 需通過五維度綜合門檻
+    picks.push({ s, m, p, d });
+  }
+  if (!picks.length) return;
+  picks.sort((a, b) => b.d.total - a.d.total);
+
+  const lines = picks.slice(0, 5).map(({ s, p, d }) => {
+    const sup = [...p.support.chips.slice(0, 1), ...p.support.fund.slice(0, 1), ...p.support.tech.slice(0, 1)];
+    return `📈 ${s.name}(${s.id})　綜合 ${d.total}／100\n` +
+      `　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）\n` +
+      `　${p.holdOn ? '上方無壓力，續抱為主' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}\n` +
+      `　依據：${sup.join('・') || '技術面轉強'}`;
+  }).join('\n\n');
+
+  tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}\n\n⚠ 僅供參考，非投資建議`);
+  localStorage.setItem('tg-entry-date', today);
 }
 
 // ── AI 預測準確度追蹤 ───────────────────────────────────────────────────────
