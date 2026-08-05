@@ -2320,8 +2320,14 @@ async function runDiagnostics() {
         return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔融資融券` } : { ok: false, msg: '無資料' };
       } },
     { name: 'Yahoo 個股 K 線 (2330)', run: async () => {
-        const b = await fetchStockOHLCV('2330', '1d', '1mo');
-        return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` } : { ok: false, msg: '無資料' };
+        const b = await fetchYahooOHLCV('2330.TW', '1d', '1mo');
+        return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
+                         : { ok: false, msg: 'Yahoo 無回應（將改用證交所備援）' };
+      } },
+    { name: '證交所日線備援 (STOCK_DAY)', run: async () => {
+        const b = await fetchTWSEHistory('2330', 2);
+        return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
+                         : { ok: false, msg: '無資料' };
       } },
   ];
   // 先清除熔斷與記憶體快取，否則測到的是「先前失敗的紀錄」而非資料源真實狀態
