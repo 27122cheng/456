@@ -126,7 +126,7 @@ async function runScan() {
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
   }).catch(() => {});
   // 預熱官方加權指數日線（供相對強弱、Beta、市場面計算；不再依賴 Yahoo）
-  fetchTWIIHistory(5).then(bars => {
+  fetchTWIIOHLC(5).then(bars => {
     if (bars?.length) { _twiiSeries = bars; renderFocusStocks(); }
   }).catch(() => {});
 
@@ -1941,7 +1941,8 @@ async function renderAnalysisPanels(s, inst) {
   let beta = null, corr = null, mktRet20 = null;
   try {
     // 官方加權指數日線優先（Yahoo 對雲端 IP 常限流 → 過去這裡永遠是「無資料」）
-    let twiiBars = await fetchTWIIHistory(5).catch(() => []);
+    let twiiBars = await fetchTWIIOHLC(5).catch(() => []);
+    if (!twiiBars?.length) twiiBars = await fetchTWIIHistory(5).catch(() => []);
     if (!twiiBars?.length) twiiBars = await fetchYahooOHLCV('^TWII', '1d', '6mo');
     if (twiiBars?.length >= 30 && ohlcv.length >= 30) {
       const idxMap = new Map(twiiBars.map(b => [b.time, b.close]));
@@ -2103,10 +2104,11 @@ async function renderAnalysisPanels(s, inst) {
 // 自繪 Canvas K 線圖：用已抓到的真實 OHLCV 繪製，不依賴 TradingView
 // （TradingView 免費小工具對台股代碼常顯示「無法顯示」並跳去預設的 AAPL）
 const CHART_TF = {
-  'D':  { tf: '1d',  range: '6mo', label: '日線' },
-  'W':  { tf: '1wk', range: '2y',  label: '週線' },
-  'M':  { tf: '1mo', range: '5y',  label: '月線' },
-  '60': { tf: '60m', range: '1mo', label: '60分' },
+  'D': { tf: '1d',  range: '6mo', label: '日線' },
+  'W': { tf: '1wk', range: '2y',  label: '週線' },
+  'M': { tf: '1mo', range: '5y',  label: '月線' },
+  // 分鐘級資料台灣官方無免費來源，僅 Yahoo 提供（可能因限流失敗）
+  '5': { tf: '5m',  range: '5d',  label: '5分', intraday: true },
 };
 let _chartToken = 0;
 
@@ -2117,15 +2119,23 @@ async function initTVChart(stockId, interval = 'D') {
   const cfg = CHART_TF[interval] || CHART_TF.D;
   container.innerHTML = '<div class="adv-loading" style="padding-top:200px;text-align:center">載入 K 線資料...</div>';
 
-  // 日線優先用掃描時已抓的資料（零額外請求）
+  // 日線用掃描已抓好的資料；週/月由日線聚合 → 三者皆零額外請求
+  const daily = allStocks.find(x => x.id === stockId)?.ohlcv;
   let bars = null;
-  if (cfg.tf === '1d') bars = allStocks.find(x => x.id === stockId)?.ohlcv;
-  if (!bars?.length) bars = await fetchStockOHLCV(stockId, cfg.tf, cfg.range);
+  if (cfg.tf === '1d')       bars = daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo');
+  else if (cfg.tf === '1wk') bars = aggregateWeekly(daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo'));
+  else if (cfg.tf === '1mo') bars = aggregateMonthly(daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo'));
+  else                       bars = await fetchStockOHLCV(stockId, cfg.tf, cfg.range);
   if (token !== _chartToken || currentStockId !== stockId) return; // 已切換股票/週期
 
   if (!bars?.length) {
-    container.innerHTML = `<div class="adv-loading" style="padding-top:190px;text-align:center">K 線資料載入失敗（資料源逾時）<br>
-      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button></div>`;
+    container.innerHTML = `<div class="adv-loading" style="padding-top:180px;text-align:center;line-height:1.8">
+      ${cfg.intraday
+        ? '分鐘級 K 線目前無法取得<br><span style="font-size:0.78rem">台灣官方未提供免費分鐘資料，僅 Yahoo 有，而其對雲端伺服器限流中</span>'
+        : 'K 線資料載入失敗（資料源逾時）'}<br>
+      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button>
+      ${cfg.intraday ? `<button class="btn-ghost" style="margin-top:10px;margin-left:6px;padding:5px 16px" onclick="initTVChart('${stockId}','D')">改看日線</button>` : ''}
+    </div>`;
     return;
   }
   drawCandleChart(container, bars, cfg.label, stockId);
@@ -2546,6 +2556,10 @@ async function runDiagnostics() {
         const b = await fetchYahooOHLCV('2330.TW', '1d', '1mo');
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
                          : { ok: false, msg: 'Yahoo 無回應（將改用證交所備援）' };
+      } },
+    { name: '加權指數官方日線 (MI_5MINS_HIST)', run: async () => {
+        const b = await fetchTWIIOHLC(2);
+        return b?.length ? { ok: true, msg: `${b.length} 根，最新收盤 ${b[b.length-1].close}` } : { ok: false, msg: '無資料' };
       } },
     { name: '證交所日線備援 (STOCK_DAY)', run: async () => {
         const b = await fetchTWSEHistory('2330', 2);

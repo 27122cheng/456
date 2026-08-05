@@ -356,6 +356,46 @@ async function fetchTWIIMonth(year, month) {
   return bars;
 }
 
+// 加權指數官方日線「開高低收」（MI_5MINS_HIST 每日彙總，比 FMTQIK 多了開高低）
+async function fetchTWIIOHLCMonth(year, month) {
+  const ym = `${year}${String(month).padStart(2, '0')}`;
+  const key = `cache:twiix:${ym}`;
+  const now = new Date();
+  const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
+  const cached = cacheGet(key, isCurrent ? 20 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const j = await proxyFetch(`https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_HIST?date=${ym}01&response=json`, 7000).catch(() => null);
+  if (!j?.data?.length) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const bars = j.data.map(r => {
+    const time = rocToISO(r[0]);
+    const close = num(r[4]);
+    if (!time || close == null) return null;
+    return { time, open: num(r[1]) ?? close, high: num(r[2]) ?? close, low: num(r[3]) ?? close, close, volume: 0 };
+  }).filter(Boolean);
+  if (!bars.length) return null;
+  cacheSet(key, bars);
+  return bars;
+}
+
+// 大盤指數日線（含開高低收）— 官方優先，Yahoo 僅作備援
+async function fetchTWIIOHLC(months = 2) {
+  const now = new Date();
+  const parts = await Promise.all(
+    Array.from({ length: months }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - (months - 1 - i), 1);
+      return fetchTWIIOHLCMonth(d.getFullYear(), d.getMonth() + 1).catch(() => null);
+    })
+  );
+  const seen = new Set(), bars = [];
+  for (const p of parts) for (const b of p || []) {
+    if (!seen.has(b.time)) { seen.add(b.time); bars.push(b); }
+  }
+  bars.sort((a, b) => a.time.localeCompare(b.time));
+  return bars;
+}
+
 async function fetchTWIIHistory(months = 5) {
   const now = new Date();
   const parts = await Promise.all(
@@ -435,8 +475,10 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
   try { return await task; } finally { _ohlcvInflight.delete(ikey); }
 }
 
-// Fetch TWII (加權指數) for market overview
+// Fetch TWII (加權指數) for market overview — 官方優先，Yahoo 備援
 async function fetchTWII() {
+  const official = await fetchTWIIOHLC(2).catch(() => []);
+  if (official?.length >= 2) return official;
   return fetchYahooOHLCV('^TWII', '1d', '5d');
 }
 
