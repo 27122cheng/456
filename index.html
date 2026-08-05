@@ -213,6 +213,13 @@
         <div id="focus-body"><div class="adv-loading">掃描完成後產生每日 / 每週重點關注股...</div></div>
       </div>
 
+      <!-- 我的持倉：每日出場訊號檢查 -->
+      <div class="market-outlook-card">
+        <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📌 我的持倉</h3>
+        <span style="font-size:0.7rem;color:var(--text3)">每輪掃描自動檢查是否出現出場訊號，並每日推送 Telegram</span>
+        <div id="holdings-body" style="margin-top:10px"><p style="font-size:0.8rem;color:var(--text3)">尚無記錄。在個股分析頁按「📌 記錄我的持倉」即可加入。</p></div>
+      </div>
+
       <!-- 本週重點財經新聞 -->
       <div class="market-outlook-card">
         <div id="weekly-news-body"><div class="adv-loading">載入本週重點財經新聞...</div></div>
@@ -746,7 +753,7 @@
             <div style="display:flex;flex-direction:column;gap:8px;padding:10px 12px;background:rgba(255,255,255,0.02);border-radius:8px">
               <div style="font-size:0.72rem;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">推送內容</div>
               <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
-                <input type="checkbox" id="s-tg-sig" checked /> 強勢訊號提醒（評分突破門檻的個股）
+                <input type="checkbox" id="s-tg-sig" checked /> 進場訊號與每日持倉出場檢查
               </label>
               <label style="display:flex;align-items:center;gap:8px;font-size:0.82rem;color:var(--text2);cursor:pointer">
                 <input type="checkbox" id="s-tg-event" checked /> 重要數據公布倒數 + AI 方向預測（CPI、FOMC、非農…）
