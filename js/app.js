@@ -2656,7 +2656,8 @@ async function runDiagnostics() {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 12000);
         try {
-          res = await fetch(`/api/proxy?url=${encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/chart/2330.TW?range=5d&interval=1d')}`,
+          // 以證交所網址測試代理本身是否健康；若用 Yahoo 會測到對方的限流而非代理狀態
+          res = await fetch(`/api/proxy?url=${encodeURIComponent('https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date=' + new Date().toISOString().slice(0,7).replace('-','') + '01&response=json')}`,
             { signal: ctrl.signal });
         } catch { return { ok: false, msg: '連線失敗（本機 file:// 開啟時正常，須部署後測試）' }; }
         finally { clearTimeout(timer); }
@@ -2666,8 +2667,8 @@ async function runDiagnostics() {
         if (!res.ok) return { ok: false, msg: `HTTP ${res.status}｜${txt.slice(0, 80)}` };
         try {
           const j = JSON.parse(txt);
-          return j?.chart?.result?.[0]
-            ? { ok: true, msg: '正常，台積電 K 線可取得' }
+          return j?.data?.length
+            ? { ok: true, msg: `正常，代理可取得證交所資料（${j.data.length} 筆）` }
             : { ok: false, msg: `回應格式非預期：${txt.slice(0, 80)}` };
         } catch { return { ok: false, msg: `無法解析：${txt.slice(0, 80)}` }; }
       } },
@@ -2700,7 +2701,7 @@ async function runDiagnostics() {
         const t = analyzeTurnover(r);
         return t ? { ok: true, msg: `${t.date} 成交 ${(t.amount/1e8).toFixed(0)} 億｜${t.verdict.split(' —')[0]}` } : { ok: false, msg: '無資料' };
       } },
-    { name: '美股指數備援 (Stooq)', run: async () => {
+    { name: '美股指數備援 Stooq（非必要）', run: async () => {
         const c = await fetchStooqCloses('^GSPC');
         return c?.length ? { ok: true, msg: `S&P500 ${c.length} 筆，最新 ${c[c.length-1]}` } : { ok: false, msg: '無回應（Yahoo 正常時不影響）' };
       } },
@@ -2708,7 +2709,7 @@ async function runDiagnostics() {
         const m = await fetchMarginAll();
         return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔融資融券` } : { ok: false, msg: '無資料' };
       } },
-    { name: 'Yahoo 個股 K 線 (2330)', run: async () => {
+    { name: 'Yahoo 個股 K 線（非必要）', run: async () => {
         const b = await fetchYahooOHLCV('2330.TW', '1d', '1mo');
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
                          : { ok: false, msg: 'Yahoo 無回應（將改用證交所備援）' };
@@ -3502,11 +3503,11 @@ function calcReversalProb(ohlcv) {
 async function renderTopBottomReversal() {
   const el = document.getElementById('er-dashboard-body');
   if (!el) return;
-  const targets = [
-    { sym: '^TWII', label: '加權指數 TWII' },
-    { sym: '0050.TW', label: '元大台灣50 (0050)' },
-  ];
-  const results = await Promise.all(targets.map(async t => ({ ...t, r: calcReversalProb(await fetchYahooOHLCV(t.sym, '1d', '6mo')) })));
+  // 改用官方來源：Yahoo 對雲端 IP 限流，走 Yahoo 會讓整個面板開天窗
+  const results = await Promise.all([
+    fetchTWIIOHLC(6).then(b => ({ label: '加權指數 TWII', r: calcReversalProb(b) })).catch(() => ({ label: '加權指數 TWII', r: null })),
+    fetchStockOHLCV('0050', '1d', '6mo').then(b => ({ label: '元大台灣50 (0050)', r: calcReversalProb(b) })).catch(() => ({ label: '元大台灣50 (0050)', r: null })),
+  ]);
   const valid = results.filter(x => x.r);
   if (!valid.length) { el.innerHTML = '<div class="adv-loading">大盤數據暫時無法取得</div>'; return; }
 

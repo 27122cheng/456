@@ -65,7 +65,7 @@ function resetSourceState() {
   _t86Memo = null; _t86Promise = null; _t86Fields = null;
   _marginMemo = null; _marginPromise = null;
   _fundAllPromise = null; _revPromise = null; _finPromise = null;
-  _turnoverPromise = null;
+  _turnoverPromise = null; _bsPromise = null;
   Object.keys(_proxyFail).forEach(k => delete _proxyFail[k]);
   _ohlcvInflight.clear();
 }
@@ -94,11 +94,25 @@ function proxyOrder() {
   return arr;
 }
 
+// 取回原始 Response（含非 2xx），以便分辨「代理故障」與「上游拒絕」
+async function rawFetch(url, timeout) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try { const res = await fetch(url, { signal: controller.signal }); clearTimeout(timer); return res; }
+  catch { clearTimeout(timer); return null; }
+}
+
 async function proxyFetch(url, timeout = 5000) {
   const enc = encodeURIComponent(url);
   for (const p of proxyOrder()) {
-    const res = await fetchWithTimeout(p.wrap(enc), timeout);
-    if (!res) { _proxyMark(p, false); continue; }
+    const res = await rawFetch(p.wrap(enc), timeout);
+    if (!res) { _proxyMark(p, false); continue; }   // 連不上 = 代理本身有問題
+    // 上游拒絕（Yahoo 對雲端 IP 常回 429/403）不能算在代理頭上，
+    // 否則自家代理會被熔斷，連帶讓證交所等正常來源也被跳過
+    if (!res.ok) {
+      if (res.status !== 429 && res.status !== 403 && res.status !== 404) _proxyMark(p, false);
+      continue;
+    }
     try {
       const data = await p.json(res);
       if (data) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return data; }
@@ -112,8 +126,13 @@ async function proxyFetch(url, timeout = 5000) {
 async function proxyFetchText(url, timeout = 8000) {
   const enc = encodeURIComponent(url);
   for (const p of proxyOrder()) {
-    const res = await fetchWithTimeout(p.wrap(enc), timeout);
+    const res = await rawFetch(p.wrap(enc), timeout);
     if (!res) { _proxyMark(p, false); continue; }
+    // 同 proxyFetch：上游拒絕不算代理故障
+    if (!res.ok) {
+      if (res.status !== 429 && res.status !== 403 && res.status !== 404) _proxyMark(p, false);
+      continue;
+    }
     try {
       const txt = await p.text(res);
       if (txt && txt.length > 50) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return txt; }
@@ -182,6 +201,8 @@ function tsToLabel(ts, interval) {
 
 async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const key = `cache:ohlcv:${symbol}:${interval}:${range}`;
+  // Yahoo 整體被限流時直接跳過，不必每檔股票都重試（省下大量等待）
+  if (srcDead('yahoo')) return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
   // 日線盤中只有最後一根 K 會變 → 10 分鐘快取；分鐘級變動快 → 2 分鐘
   const ttl = isIntradayTF(interval) ? 2 * 60 * 1000
             : (interval === '1d' || interval === '1wk') ? 10 * 60 * 1000 : CACHE_TTL;
@@ -191,7 +212,11 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
   const data = await proxyFetch(url);
   const result = data?.chart?.result?.[0];
-  if (!result) return cacheGetStale(key, 72 * 60 * 60 * 1000) || []; // 全 proxy 失敗 → 72h 內舊資料頂著（官方源會補最新一根）
+  if (!result) {
+    srcMarkDead('yahoo', 10);   // 10 分鐘內不再嘗試 Yahoo
+    return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
+  }
+  srcMarkAlive('yahoo');
   const { timestamp, indicators } = result;
   const q = indicators.quote[0];
   const ohlcv = timestamp.map((ts, i) => ({
