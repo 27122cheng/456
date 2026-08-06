@@ -671,6 +671,17 @@
           </div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-name">跨裝置同步</div>
+              <div class="setting-desc">手機與電腦開同一個網址即可，但持倉、設定與累積歷史存在各自瀏覽器不會互通。匯出後在另一台裝置匯入即可同步</div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn-ghost" style="padding:8px 14px" onclick="exportSettings()">⬇ 匯出</button>
+              <button class="btn-ghost" style="padding:8px 14px" onclick="document.getElementById('sync-import-file').click()">⬆ 匯入</button>
+              <input type="file" id="sync-import-file" accept="application/json,.json" style="display:none" onchange="importSettings(event)" />
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-name">資料源診斷</div>
               <div class="setting-desc">逐一測試自家代理、證交所、櫃買、Yahoo 各資料源是否正常，找出資料載入失敗的環節</div>
             </div>

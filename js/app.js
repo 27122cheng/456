@@ -2646,6 +2646,58 @@ function getThreshold(type) {
   return parseInt(localStorage.getItem(`${type}-threshold`) || (type === 'bull' ? '60' : '40'));
 }
 
+// ── 跨裝置同步：匯出／匯入設定與累積資料 ─────────────────────────────────────
+// 同一個網址在手機與電腦都能開，但資料存在各自瀏覽器的 localStorage，
+// 不會自動互通。這裡提供打包匯出／匯入，讓兩邊保持一致。
+const SYNC_KEYS = [
+  'my-holdings', 'price-alerts', 'custom-stocks', 'pred-log',
+  'inst-hist', 'fin-hist',
+  'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
+  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe',
+  'notif-bull-thr', 'notif-bear-thr', 'signal-master',
+];
+
+function exportSettings() {
+  const data = {};
+  for (const k of SYNC_KEYS) {
+    const v = localStorage.getItem(k);
+    if (v != null) data[k] = v;
+  }
+  const payload = { app: '台股雷達', version: 1, exportedAt: new Date().toISOString(), data };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `taistock-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showToast(`已匯出 ${Object.keys(data).length} 項設定與資料`, 'success');
+}
+
+function importSettings(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const payload = JSON.parse(e.target.result);
+      const data = payload?.data;
+      if (!data || typeof data !== 'object') throw new Error('格式不符');
+      let n = 0;
+      for (const [k, v] of Object.entries(data)) {
+        if (!SYNC_KEYS.includes(k)) continue;   // 只還原白名單，避免匯入異常鍵值
+        localStorage.setItem(k, v);
+        n++;
+      }
+      showToast(`✅ 已匯入 ${n} 項設定，重新載入中...`, 'success');
+      setTimeout(() => location.reload(), 1200);
+    } catch (err) {
+      showToast('匯入失敗：檔案格式不正確', 'error');
+    }
+  };
+  reader.readAsText(file);
+  event.target.value = '';   // 允許重複選同一個檔案
+}
+
 // ── 資料源診斷：逐一測試各來源，找出資料載入失敗的環節 ──────────────────────
 async function runDiagnostics() {
   const el = document.getElementById('diag-body');
@@ -3369,17 +3421,38 @@ function isSignalMaster() {
   return localStorage.getItem('signal-master') !== 'false';
 }
 
+// Telegram 憑證單一來源：優先讀輸入框（使用者剛填但還沒儲存也能用），
+// 其次讀已儲存值。先前測試功能讀輸入框、其他功能只讀 localStorage，
+// 導致「測試成功但每日簡報說未設置 Bot」。
+function tgCreds() {
+  const el = id => document.getElementById(id)?.value?.trim() || '';
+  return {
+    token: el('s-tg-token') || localStorage.getItem('tg-token') || '',
+    chatId: el('s-tg-chatid') || localStorage.getItem('tg-chatid') || '',
+    enabled: document.getElementById('s-tg-toggle')?.checked ?? (localStorage.getItem('tg-enabled') === 'true'),
+  };
+}
+
+// 說明目前缺什麼，而不是籠統的「未設置」
+function tgMissingReason() {
+  const c = tgCreds();
+  if (!c.token && !c.chatId) return '尚未填寫 Bot Token 與 Chat ID';
+  if (!c.token) return '尚未填寫 Bot Token';
+  if (!c.chatId) return '尚未填寫 Chat ID';
+  if (!c.enabled) return 'Telegram 通知開關未啟用（請在設定頁開啟）';
+  return null;
+}
+
 // 檢查某類推送是否開啟（主機 + Telegram 開關 + 分類開關 + 憑證齊全）
 function tgWants(kind) {
   if (!isSignalMaster()) return false;
-  if (localStorage.getItem('tg-enabled') !== 'true') return false;
-  if (!localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) return false;
+  const c = tgCreds();
+  if (!c.enabled || !c.token || !c.chatId) return false;
   return localStorage.getItem(`tg-${kind}`) !== 'false';
 }
 
 function tgPush(text) {
-  const token  = localStorage.getItem('tg-token');
-  const chatId = localStorage.getItem('tg-chatid');
+  const { token, chatId } = tgCreds();
   if (token && chatId) return sendTelegram(token, chatId, text);
 }
 
@@ -3421,11 +3494,17 @@ function notifyDailyFocus() {
 }
 
 async function testTelegramNotif() {
-  const token  = document.getElementById('s-tg-token')?.value || localStorage.getItem('tg-token');
-  const chatId = document.getElementById('s-tg-chatid')?.value || localStorage.getItem('tg-chatid');
+  const { token, chatId } = tgCreds();
   if (!token || !chatId) { showToast('請先填寫 Bot Token 和 Chat ID', 'error'); return; }
-  const msg = '✅ 台股雷達測試訊息\n掃描器運作正常！';
-  await sendTelegram(token, chatId, msg);
+  const ok = await sendTelegram(token, chatId, '✅ 台股雷達測試訊息\n掃描器運作正常！');
+  if (!ok) return;
+  // 測試成功即自動儲存並啟用，否則使用者會遇到「測試成功但其他推送說未設置」
+  localStorage.setItem('tg-token', token);
+  localStorage.setItem('tg-chatid', chatId);
+  localStorage.setItem('tg-enabled', 'true');
+  const tgl = document.getElementById('s-tg-toggle');
+  if (tgl) tgl.checked = true;
+  showToast('✅ 測試成功，Telegram 設定已自動儲存並啟用', 'success');
 }
 
 async function sendTelegram(token, chatId, text) {
@@ -3823,8 +3902,9 @@ function renderFullRisk(s, inst) {
 // ── 每日市場簡報（手動觸發 Telegram）────────────────────────────────────────
 
 function manualSendDailyBriefing(silent = false) {
-  if (localStorage.getItem('tg-enabled') !== 'true' || !localStorage.getItem('tg-token') || !localStorage.getItem('tg-chatid')) {
-    if (!silent) showToast('請先啟用並設定 Telegram Bot', 'error');
+  const miss = tgMissingReason();
+  if (miss) {
+    if (!silent) showToast(`無法發送：${miss}`, 'error');
     return false;
   }
   if (!allStocks.some(s => s.analysis)) {
