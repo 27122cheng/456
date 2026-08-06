@@ -121,6 +121,10 @@ async function runScan() {
     allStocks.forEach(s => { if (m[s.id]) s._fin = m[s.id]; });
     renderFocusStocks();
   }).catch(() => {});
+  fetchBalanceSheetAll().then(m => {   // 財務體質（ROE／負債比）供研判使用
+    if (!m) return;
+    allStocks.forEach(s => { if (m[s.id] && s._fin) Object.assign(s._fin, m[s.id]); });
+  }).catch(() => {});
   fetchTWFundAll().then(m => {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
@@ -1051,6 +1055,8 @@ function buildManagerAnalysis(s) {
   if (fin) {
     if (fin.netMargin != null && fin.netMargin < 0) { dir -= 1; bear.push(`本業虧損（淨利率 ${fin.netMargin.toFixed(1)}%）`); }
     else if (fin.grossMargin != null && fin.grossMargin >= 35 && fin.netMargin > 8) { dir += 0.8; bull.push(`高獲利品質（毛利率 ${fin.grossMargin.toFixed(0)}%、淨利率 ${fin.netMargin.toFixed(0)}%）`); }
+    if (fin.roe >= 15) { dir += 0.5; bull.push(`ROE ${fin.roe.toFixed(0)}%（資本運用效率佳）`); }
+    if (fin.debtRatio >= 70) { dir -= 0.5; bear.push(`負債比 ${fin.debtRatio.toFixed(0)}% 偏高`); }
     else if (fin.grossMargin != null && fin.grossMargin < 10) notes.push(`毛利率僅 ${fin.grossMargin.toFixed(1)}%，缺乏定價能力`);
   }
 
@@ -1463,7 +1469,7 @@ async function openStock(stockId) {
   }).catch(() => renderOI(s, null));
   Promise.all([
     fetchRevenue(stockId).catch(() => null),
-    fetchFinancials(stockId).catch(() => null),
+    fetchFullFinancials(stockId).catch(() => null),
   ]).then(([rev, fin]) => {
     if (currentStockId !== stockId || (!rev && !fin)) return;
     if (rev) s.rev = rev;
@@ -1772,25 +1778,64 @@ async function renderAnalysisPanels(s, inst) {
       </div>`;
   })() : '';
 
-  // 季度財報（官方綜合損益表）：毛利率/營益率/淨利率是判斷獲利品質的核心
-  if (s._fin === undefined) { s._fin = await fetchFinancials(s.id).catch(() => null); }
+  // 公司發布的季度財報：損益表 + 資產負債表 + 逐季歷史比較
+  if (s._fin === undefined) { s._fin = await fetchFullFinancials(s.id).catch(() => null); }
   const fin = s._fin;
   const finHtml = fin ? (() => {
     const pct = (v, good, bad) => v == null ? '<span style="color:var(--text3)">--</span>'
       : `<span style="color:${v >= good ? 'var(--bull)' : v <= bad ? 'var(--bear)' : 'var(--text2)'};font-weight:600">${v.toFixed(1)}%</span>`;
     const q = fin.year && fin.quarter ? `${+fin.year + 1911 || fin.year} 年 Q${fin.quarter}` : '最新季度';
     const money = v => v == null ? '--' : Math.abs(v) >= 1e8 ? (v/1e8).toFixed(2) + ' 兆' : Math.abs(v) >= 1e4 ? (v/1e4).toFixed(1) + ' 億' : (v/1e3).toFixed(1) + ' 百萬';
+
+    // 與前一季／去年同季比較（需已累積歷史）
+    const h = fin.history || [];
+    const cur = h[h.length - 1];
+    const prevQ = h.length >= 2 ? h[h.length - 2] : null;
+    const yoyQ = cur ? h.find(x => x.period === `${+cur.period.slice(0, -2) - 1}${cur.period.slice(-2)}`) : null;
+    const cmp = (now, before, label) => {
+      if (now == null || before == null || before === 0) return '';
+      const d = (now - before) / Math.abs(before) * 100;
+      return `<span style="font-size:0.68rem;color:${d >= 0 ? 'var(--bull)' : 'var(--bear)'};margin-left:6px">${label} ${d >= 0 ? '+' : ''}${d.toFixed(1)}%</span>`;
+    };
+
     return `
       <div class="fund-block" style="margin-top:10px">
-        <div class="fund-block-ttl">季度財報（${q}）<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方</span></div>
+        <div class="fund-block-ttl">公司財報（${q}）<span style="font-size:0.62rem;padding:1px 7px;border-radius:10px;background:rgba(34,197,94,0.15);color:var(--bull)">● 官方公告</span></div>
         <table class="qt-table"><tbody>
-          <tr><td style="color:var(--text3)">營業收入</td><td>${money(fin.revenue)}</td></tr>
+          <tr><td style="color:var(--text3)">營業收入</td><td>${money(fin.revenue)}
+            ${prevQ ? cmp(cur?.revenue, prevQ.revenue, 'QoQ') : ''}${yoyQ ? cmp(cur?.revenue, yoyQ.revenue, 'YoY') : ''}</td></tr>
           <tr><td style="color:var(--text3)">毛利率</td><td>${pct(fin.grossMargin, 30, 10)}</td></tr>
           <tr><td style="color:var(--text3)">營益率</td><td>${pct(fin.opMargin, 15, 0)}</td></tr>
           <tr><td style="color:var(--text3)">淨利率</td><td>${pct(fin.netMargin, 10, 0)}</td></tr>
-          <tr><td style="color:var(--text3)">單季 EPS</td><td class="${fin.eps > 0 ? 'qt-pos' : fin.eps < 0 ? 'qt-neg' : ''}">${fin.eps != null ? fin.eps.toFixed(2) + ' 元' : '--'}</td></tr>
+          <tr><td style="color:var(--text3)">稅後淨利</td><td>${money(fin.netInc)}
+            ${prevQ ? cmp(cur?.netInc, prevQ.netInc, 'QoQ') : ''}</td></tr>
+          <tr><td style="color:var(--text3)">單季 EPS</td><td class="${fin.eps > 0 ? 'qt-pos' : fin.eps < 0 ? 'qt-neg' : ''}">${fin.eps != null ? fin.eps.toFixed(2) + ' 元' : '--'}
+            ${prevQ ? cmp(cur?.eps, prevQ.eps, 'QoQ') : ''}</td></tr>
         </tbody></table>
-      </div>`;
+      </div>
+      ${(fin.roe != null || fin.debtRatio != null || fin.bps != null) ? `
+      <div class="fund-block" style="margin-top:10px">
+        <div class="fund-block-ttl">財務體質</div>
+        <table class="qt-table"><tbody>
+          ${fin.roe != null ? `<tr><td style="color:var(--text3)">ROE（單季年化）</td><td>${pct(fin.roe, 15, 5)}</td></tr>` : ''}
+          ${fin.debtRatio != null ? `<tr><td style="color:var(--text3)">負債比率</td><td><span style="color:${fin.debtRatio <= 40 ? 'var(--bull)' : fin.debtRatio >= 70 ? 'var(--bear)' : 'var(--text2)'};font-weight:600">${fin.debtRatio.toFixed(1)}%</span></td></tr>` : ''}
+          ${fin.bps != null ? `<tr><td style="color:var(--text3)">每股淨值</td><td>${fin.bps.toFixed(2)} 元</td></tr>` : ''}
+          ${fin.equity != null ? `<tr><td style="color:var(--text3)">股東權益</td><td>${money(fin.equity)}</td></tr>` : ''}
+        </tbody></table>
+      </div>` : ''}
+      ${h.length >= 2 ? `
+      <div class="fund-block" style="margin-top:10px">
+        <div class="fund-block-ttl">逐季趨勢（本站自動累積 ${h.length} 季）</div>
+        <div style="overflow-x:auto"><table class="qt-table" style="min-width:100%">
+          <thead><tr><th>季別</th><th>EPS</th><th>毛利率</th><th>淨利率</th></tr></thead>
+          <tbody>${h.slice(-6).map(x => `<tr>
+            <td style="color:var(--text3)">${x.period}</td>
+            <td class="${x.eps > 0 ? 'qt-pos' : x.eps < 0 ? 'qt-neg' : ''}">${x.eps != null ? x.eps.toFixed(2) : '--'}</td>
+            <td>${x.grossMargin != null ? x.grossMargin.toFixed(1) + '%' : '--'}</td>
+            <td>${x.netMargin != null ? x.netMargin.toFixed(1) + '%' : '--'}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+      </div>` : ''}`;
   })() : '';
 
   const keyStatsHtml = `
@@ -2576,6 +2621,10 @@ async function runDiagnostics() {
     { name: '季度財報 (t187ap06)', run: async () => {
         const m = await fetchFinancialsAll();
         return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔綜合損益表` } : { ok: false, msg: '無資料（端點格式可能已變更）' };
+      } },
+    { name: '資產負債表 (t187ap07)', run: async () => {
+        const m = await fetchBalanceSheetAll();
+        return m && Object.keys(m).length ? { ok: true, msg: `${Object.keys(m).length} 檔財務體質` } : { ok: false, msg: '無資料' };
       } },
     { name: '大盤量能 (FMTQIK)', run: async () => {
         const r = await fetchMarketTurnover();
