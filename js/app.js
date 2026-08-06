@@ -1011,88 +1011,141 @@ function buildManagerAnalysis(s) {
   const macdBull = a.macd?.macd > a.macd?.signal;
   const mtf = s._mtf, oi = s._oi, foreign = s.foreign;
 
-  // ── 多空證據加權（模擬經理人的權衡過程）──
-  const bull = [], bear = [], notes = [];
-  let dir = 0; // 正=偏多、負=偏空
-  if (a.ema20 > a.ema50 && price > a.ema20) { dir += 2; bull.push('均線多頭排列且站穩 EMA20'); }
-  else if (price < a.ema20) { dir -= 1.5; bear.push('跌破 EMA20 短均'); }
-  if (a.ema200 && price > a.ema200) { dir += 1; bull.push('股價在年線 EMA200 之上（長多結構）'); }
-  else if (a.ema200 && price < a.ema200) { dir -= 1; bear.push('股價在年線之下（長空結構）'); }
-  if (macdBull && a.macd?.hist > 0) { dir += 1; bull.push('MACD 金叉且動能柱擴張'); }
-  else if (!macdBull) { dir -= 1; bear.push('MACD 死叉'); }
-  if (a.adx >= 30) { dir += (dir >= 0 ? 1 : -1); notes.push(`ADX ${a.adx.toFixed(0)} 趨勢強勁`); }
-  else if (a.adx < 20) { notes.push(`ADX ${a.adx.toFixed(0)} 無明確趨勢（盤整）`); }
-  if (a.rsi >= 50 && a.rsi < 68) { dir += 0.5; bull.push(`RSI ${a.rsi.toFixed(0)} 健康多方`); }
-  else if (a.rsi >= 72) { dir -= 0.5; bear.push(`RSI ${a.rsi.toFixed(0)} 過熱，追高風險`); }
-  else if (a.rsi < 32) { notes.push(`RSI ${a.rsi.toFixed(0)} 超賣，可能技術反彈`); }
-  if (volR >= 1.3 && volR <= 3 && ret5 > 0) { dir += 0.5; bull.push(`量增價漲（量比 ${volR.toFixed(1)}）`); }
-  else if (volR > 3.5) { dir -= 0.3; bear.push('爆量，慎防出貨'); }
-  else if (volR < 0.6) { notes.push('量能萎縮，追價意願低'); }
-  if (foreign != null && foreign > 1000) { dir += 1; bull.push(`外資買超 ${foreign.toLocaleString()} 張`); }
-  else if (foreign != null && foreign < -1000) { dir -= 1; bear.push(`外資賣超 ${Math.abs(foreign).toLocaleString()} 張`); }
+  // ── 證據加權評估 ──
+  // 每項證據記錄權重與方向，最後才彙總。這樣可以同時得到：
+  //   dir  = 淨方向（多空相抵後的傾向）
+  //   agr  = 一致性（證據是否彼此矛盾）→ 用於信心度，避免「+3 分」
+  //          在「三項全多」與「六項互抵」兩種情況被當成同一回事
+  const ev = [];            // { w, d, txt, kind }
+  const notes = [];
+  const add = (w, d, txt, kind = 'tech') => ev.push({ w, d, txt, kind });
 
-  // 量價背離：最能識破假突破的訊號，權重高
-  if (a.diverg?.type === 'bear') { dir -= 1.5; bear.push(a.diverg.txt); }
-  else if (a.diverg?.type === 'bull') { dir += 1; bull.push(a.diverg.txt); }
-  else if (a.diverg?.type === 'confirm') { dir += 0.5; bull.push(a.diverg.txt); }
-  // 波動狀態
-  if (a.squeeze?.state === 'squeeze') notes.push(a.squeeze.txt);
-  else if (a.squeeze?.state === 'expansion') notes.push(a.squeeze.txt);
+  // ① 均線結構
+  if (a.ema20 > a.ema50 && price > a.ema20) add(2, 1, '均線多頭排列且站穩 EMA20');
+  else if (price < a.ema20) add(1.5, -1, '跌破 EMA20 短均');
+  if (a.ema200 && price > a.ema200) add(1, 1, '股價在年線 EMA200 之上（長多結構）');
+  else if (a.ema200 && price < a.ema200) add(1, -1, '股價在年線之下（長空結構）');
 
-  // 月營收年增率（台股最重要的即時基本面指標：營收翻揚常領先股價）
-  const rev = s.rev;
+  // ② 動能指標
+  if (macdBull && a.macd?.hist > 0) add(1, 1, 'MACD 金叉且動能柱擴張');
+  else if (!macdBull) add(1, -1, 'MACD 死叉');
+  if (a.rsi >= 50 && a.rsi < 68) add(0.5, 1, `RSI ${a.rsi.toFixed(0)} 健康多方`);
+  else if (a.rsi >= 72) add(0.5, -1, `RSI ${a.rsi.toFixed(0)} 過熱，追高風險`);
+  else if (a.rsi < 32) notes.push(`RSI ${a.rsi.toFixed(0)} 超賣，可能技術反彈`);
+
+  // ③ 波動率調整後的中期動能
+  // 同樣漲 10%，低波動股代表穩健趨勢、高波動股可能只是雜訊 → 以 ATR 標準化
+  const ret20Z = atrPct > 0 ? ret20 / (atrPct * Math.sqrt(20)) : 0;
+  if (ret20Z > 1.2) add(1, 1, `20日動能 +${ret20.toFixed(1)}%（波動調整後仍顯著）`);
+  else if (ret20Z > 0.5) add(0.5, 1, `20日動能 +${ret20.toFixed(1)}%`);
+  else if (ret20Z < -1.2) add(1, -1, `20日下跌 ${ret20.toFixed(1)}%（波動調整後顯著轉弱）`);
+  else if (ret20 !== 0) notes.push(`20日${ret20 >= 0 ? '漲' : '跌'} ${Math.abs(ret20).toFixed(1)}%，未超出正常波動範圍`);
+
+  // ④ 量能與量價確認
+  if (volR >= 1.3 && volR <= 3 && ret5 > 0) add(0.5, 1, `量增價漲（量比 ${volR.toFixed(1)}）`);
+  else if (volR > 3.5) add(0.3, -1, '爆量，慎防出貨');
+  else if (volR < 0.6) notes.push('量能萎縮，追價意願低');
+  if (a.diverg?.type === 'bear') add(1.5, -1, a.diverg.txt);
+  else if (a.diverg?.type === 'bull') add(1, 1, a.diverg.txt);
+  else if (a.diverg?.type === 'confirm') add(0.5, 1, a.diverg.txt);
+
+  // ⑤ 法人籌碼 —— 以「佔該股日均量的比例」衡量，而非絕對張數
+  // 2,000 張對小型股是巨量、對台積電只是雜訊，用絕對值會嚴重誤判
+  const flowPct = (foreign != null && a.volMA > 0) ? (foreign * 1000) / a.volMA * 100 : null;
+  if (flowPct != null) {
+    const mag = Math.abs(flowPct);
+    const lbl = `外資${flowPct > 0 ? '買' : '賣'}超 ${Math.abs(foreign).toLocaleString()} 張（${mag.toFixed(0)}% 日均量）`;
+    if (mag >= 15) add(1.2, flowPct > 0 ? 1 : -1, lbl, 'chip');
+    else if (mag >= 5) add(0.6, flowPct > 0 ? 1 : -1, lbl, 'chip');
+    else notes.push(`外資買賣超僅 ${mag.toFixed(1)}% 日均量，影響有限`);
+  } else if (foreign != null && Math.abs(foreign) > 1000) {
+    add(0.6, foreign > 0 ? 1 : -1, `外資${foreign > 0 ? '買' : '賣'}超 ${Math.abs(foreign).toLocaleString()} 張`, 'chip');
+  }
+
+  const streak = instStreak(s.id);
+  if (streak && streak.days >= 3) {
+    add(1, streak.dir > 0 ? 1 : -1,
+        `法人連續 ${streak.days} 日${streak.dir > 0 ? '買' : '賣'}超（累計 ${Math.abs(streak.total).toLocaleString()} 張）`, 'chip');
+  }
+
+  if (oi) {
+    if (oi.dFin > 0 && flowPct != null && flowPct < -3) add(0.5, -1, '散戶融資加碼但外資站賣方（籌碼對作）', 'chip');
+    if (oi.shortFinRatio >= 30) notes.push(`券資比 ${oi.shortFinRatio.toFixed(0)}%，具軋空題材`);
+    if (oi.dShort > 0) notes.push('融券增溫，若持續走強有軋空助攻');
+  }
+
+  // ⑥ 基本面
+  const rev = s.rev, fin = s._fin;
   if (rev?.yoy != null) {
-    if (rev.yoy >= 30) { dir += 1.5; bull.push(`月營收年增 +${rev.yoy.toFixed(1)}%（高成長）`); }
-    else if (rev.yoy >= 10) { dir += 0.8; bull.push(`月營收年增 +${rev.yoy.toFixed(1)}%`); }
-    else if (rev.yoy <= -20) { dir -= 1.5; bear.push(`月營收年減 ${rev.yoy.toFixed(1)}%（衰退）`); }
-    else if (rev.yoy <= -5) { dir -= 0.8; bear.push(`月營收年減 ${rev.yoy.toFixed(1)}%`); }
+    if (rev.yoy >= 30) add(1.5, 1, `月營收年增 +${rev.yoy.toFixed(1)}%（高成長）`, 'fund');
+    else if (rev.yoy >= 10) add(0.8, 1, `月營收年增 +${rev.yoy.toFixed(1)}%`, 'fund');
+    else if (rev.yoy <= -20) add(1.5, -1, `月營收年減 ${rev.yoy.toFixed(1)}%（衰退）`, 'fund');
+    else if (rev.yoy <= -5) add(0.8, -1, `月營收年減 ${rev.yoy.toFixed(1)}%`, 'fund');
     if (rev.cumYoy != null && rev.yoy > 0 && rev.cumYoy < 0)
       notes.push('單月轉正但累計仍負 — 復甦初期，續航待觀察');
   }
-
-  // 獲利品質（官方季報）：高毛利＋正淨利 = 有本質支撐，虧損股追高風險高
-  const fin = s._fin;
   if (fin) {
-    if (fin.netMargin != null && fin.netMargin < 0) { dir -= 1; bear.push(`本業虧損（淨利率 ${fin.netMargin.toFixed(1)}%）`); }
-    else if (fin.grossMargin != null && fin.grossMargin >= 35 && fin.netMargin > 8) { dir += 0.8; bull.push(`高獲利品質（毛利率 ${fin.grossMargin.toFixed(0)}%、淨利率 ${fin.netMargin.toFixed(0)}%）`); }
-    if (fin.roe >= 15) { dir += 0.5; bull.push(`ROE ${fin.roe.toFixed(0)}%（資本運用效率佳）`); }
-    if (fin.debtRatio >= 70) { dir -= 0.5; bear.push(`負債比 ${fin.debtRatio.toFixed(0)}% 偏高`); }
+    if (fin.netMargin != null && fin.netMargin < 0) add(1, -1, `本業虧損（淨利率 ${fin.netMargin.toFixed(1)}%）`, 'fund');
+    else if (fin.grossMargin >= 35 && fin.netMargin > 8) add(0.8, 1, `高獲利品質（毛利率 ${fin.grossMargin.toFixed(0)}%、淨利率 ${fin.netMargin.toFixed(0)}%）`, 'fund');
     else if (fin.grossMargin != null && fin.grossMargin < 10) notes.push(`毛利率僅 ${fin.grossMargin.toFixed(1)}%，缺乏定價能力`);
+    if (fin.roe >= 15) add(0.5, 1, `ROE ${fin.roe.toFixed(0)}%（資本運用效率佳）`, 'fund');
+    if (fin.debtRatio >= 70) add(0.5, -1, `負債比 ${fin.debtRatio.toFixed(0)}% 偏高`, 'fund');
   }
 
-  // 法人連續買/賣超天數（用逐日累積的真實歷史，連續性比單日更有意義）
-  const streak = instStreak(s.id);
-  if (streak) {
-    if (streak.dir > 0 && streak.days >= 3) { dir += 1; bull.push(`法人連續 ${streak.days} 日買超（累計 ${streak.total.toLocaleString()} 張）`); }
-    else if (streak.dir < 0 && streak.days >= 3) { dir -= 1; bear.push(`法人連續 ${streak.days} 日賣超（累計 ${Math.abs(streak.total).toLocaleString()} 張）`); }
-  }
-  if (oi) {
-    if (oi.dFin > 0 && foreign != null && foreign < -500) { dir -= 0.5; bear.push('散戶融資加碼但外資站賣方（籌碼對作）'); }
-    if (oi.shortFinRatio >= 30) { notes.push(`券資比 ${oi.shortFinRatio.toFixed(0)}%，具軋空題材`); }
-    if (oi.dShort > 0 && dir > 0) notes.push('融券增溫，若持續走強有軋空助攻');
-  }
-  const mktNorm = outlookData.norm ?? 0;
-  if (mktNorm >= 15) { dir += 0.5; notes.push('大盤環境偏多'); }
-  else if (mktNorm <= -15) { dir -= 1; bear.push('大盤環境偏空，做多逆風'); }
+  // ⑦ 多週期一致性
   let mtfAligned = null;
   if (mtf?.length) {
     const dirs = mtf.map(m => m.score == null ? 0 : m.score > 55 ? 1 : m.score < 45 ? -1 : 0);
     const bn = dirs.filter(d => d === 1).length, sn = dirs.filter(d => d === -1).length;
-    if (bn === 3) { dir += 1; mtfAligned = 'bull'; bull.push('60分/日/週三週期同步偏多'); }
-    else if (sn === 3) { dir -= 1; mtfAligned = 'bear'; bear.push('三週期同步偏空'); }
+    if (bn === 3) { mtfAligned = 'bull'; add(1, 1, '日線／週線／月線同步偏多'); }
+    else if (sn === 3) { mtfAligned = 'bear'; add(1, -1, '三週期同步偏空'); }
     else if (bn >= 2) notes.push('多數週期偏多，短週期待確認');
     else if (sn >= 2) notes.push('多數週期偏空');
     else notes.push('各週期分歧，方向未明');
   }
 
+  // ── 彙總：淨方向、一致性、信心度 ──
+  let dir = ev.reduce((acc, e) => acc + e.w * e.d, 0);
+  const totalW = ev.reduce((acc, e) => acc + e.w, 0);
+  const agr = totalW > 0 ? Math.abs(dir) / totalW : 0;   // 0=完全矛盾, 1=完全一致
+
+  // ADX 於最後才放大方向：它衡量「趨勢強度」而非方向，
+  // 必須在所有證據彙總後才知道要放大哪一邊（先前寫在中段會依程式碼順序誤判）
+  if (a.adx >= 30 && Math.abs(dir) > 0.5) {
+    const amp = Math.sign(dir) * (agr >= 0.5 ? 1 : 0.5);   // 證據矛盾時不宜全力放大
+    dir += amp;
+    notes.push(`ADX ${a.adx.toFixed(0)} 趨勢強勁，強化既有方向`);
+  } else if (a.adx != null && a.adx < 20) {
+    dir *= 0.8;    // 無趨勢盤整期，任何方向的訊號都應打折
+    notes.push(`ADX ${a.adx.toFixed(0)} 無明確趨勢（盤整），訊號可信度降低`);
+  }
+
+  // ⑧ 大盤環境：作為調節係數而非單純加減分
+  // 空頭market做多本質上勝率較低，應整體壓抑而非扣固定分數
+  const mktNorm = outlookData.norm ?? 0;
+  if (mktNorm >= 15) { if (dir > 0) dir *= 1.15; notes.push(`大盤偏多（${Math.round(mktNorm)}），順風`); }
+  else if (mktNorm <= -15) {
+    if (dir > 0) dir *= 0.7;      // 逆風時多方訊號打折
+    else dir *= 1.1;              // 空方訊號則被強化
+    notes.push(`大盤偏空（${Math.round(mktNorm)}），做多逆風、訊號打折`);
+  }
+
+  // 信心度：一致性 × 證據充分度（證據太少也不該有高信心）
+  const coverage = Math.min(1, totalW / 8);
+  const conf = Math.round(agr * coverage * 100);
+
+  const bull = ev.filter(e => e.d > 0).sort((x, y) => y.w - x.w).map(e => e.txt);
+  const bear = ev.filter(e => e.d < 0).sort((x, y) => y.w - x.w).map(e => e.txt);
+
   // ── 綜合裁決 ──
   const nearHigh = price >= hi20 * 0.985;
   const nearSup = price <= sup * 1.03;
-  let stance, stanceColor, headline;
-  if (dir >= 4) { stance = '強勢偏多'; stanceColor = 'var(--bull)'; }
-  else if (dir >= 2) { stance = '偏多'; stanceColor = 'var(--bull)'; }
-  else if (dir <= -3) { stance = '明顯偏空'; stanceColor = 'var(--bear)'; }
-  else if (dir <= -1) { stance = '轉弱'; stanceColor = 'var(--yellow)'; }
+  // 立場需同時看方向與一致性：證據互相矛盾時（agr 低）不給極端結論
+  let stance, stanceColor;
+  if (dir >= 4 && agr >= 0.5) { stance = '強勢偏多'; stanceColor = 'var(--bull)'; }
+  else if (dir >= 2) { stance = agr >= 0.35 ? '偏多' : '偏多（訊號分歧）'; stanceColor = 'var(--bull)'; }
+  else if (dir <= -3 && agr >= 0.5) { stance = '明顯偏空'; stanceColor = 'var(--bear)'; }
+  else if (dir <= -1) { stance = agr >= 0.35 ? '轉弱' : '轉弱（訊號分歧）'; stanceColor = 'var(--yellow)'; }
   else { stance = '中性觀望'; stanceColor = 'var(--text2)'; }
 
   // ── 建議持有期 ──
@@ -1104,8 +1157,8 @@ function buildManagerAnalysis(s) {
 
 
   return {
-    dir, stance, stanceColor, bull, bear, notes,
-    horizon, horizonDays, atr, atrPct,
+    dir, conf, agr, evidence: ev, stance, stanceColor, bull, bear, notes,
+    horizon, horizonDays, atr, atrPct, ret20Z, flowPct,
     sup: +sup.toFixed(2), res: +res.toFixed(2), hi20: +hi20.toFixed(2), lo20: +lo20.toFixed(2),
     ret5, ret20, mtfAligned, oi, price,
   };
@@ -1125,7 +1178,9 @@ function renderManagerVerdict(s) {
   el.innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
       <span style="font-size:1.05rem;font-weight:800;color:${m.stanceColor}">${m.stance}</span>
-      <span style="font-size:0.7rem;color:var(--text3)">多空傾向指數 ${conf}/100</span>
+      <span style="font-size:0.7rem;color:var(--text3)">多空傾向 ${conf}/100</span>
+      <span style="font-size:0.7rem;color:${m.agr >= 0.6 ? 'var(--bull)' : m.agr >= 0.4 ? 'var(--yellow)' : 'var(--bear)'}">
+        訊號一致性 ${(m.agr * 100).toFixed(0)}%${m.agr < 0.4 ? '（證據分歧）' : ''}</span>
     </div>
     <div style="height:8px;border-radius:4px;background:linear-gradient(90deg,var(--bear),var(--yellow),var(--bull));position:relative;margin-bottom:14px">
       <div style="position:absolute;top:-3px;left:${conf}%;width:4px;height:14px;background:var(--text1);border-radius:2px;transform:translateX(-50%)"></div>
@@ -1171,6 +1226,11 @@ function buildEntryPlan(s, m) {
     return { ok: false, why: m.dir <= -1
       ? '目前為偏空/轉弱結構，不建議做多進場。待站回均線且動能轉正後再評估。'
       : '多空拉鋸、方向未明，勝率不足。建議等待突破區間或回測支撐止穩後再評估。' };
+  }
+  // 證據互相矛盾時，方向分數再高也不宜進場（避免「多空各半但淨值偏多」的假訊號）
+  if (m.agr < 0.3) {
+    return { ok: false, why: `多空證據高度分歧（一致性僅 ${(m.agr * 100).toFixed(0)}%），` +
+      `雖然淨方向偏多，但看多與看空理由勢均力敵，此時進場等同賭方向。建議等訊號收斂後再評估。` };
   }
 
   // 進場區間：理想為回踩支撐/EMA20，上緣不追過現價太多
@@ -1279,8 +1339,15 @@ function buildEntryPlan(s, m) {
   // 續抱時的移動停利基準（隨股價墊高，鎖住獲利）
   const trail = +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2);
 
+  const rrVal = r > 0 && t1 ? (t1 - lo) / r : null;
+  // 風報比低於 1.5 的交易長期期望值差，明確標示而非默默給建議
+  const rrWarn = (!holdOn && rrVal != null && rrVal < 1.5)
+    ? `風險報酬比僅 1:${rrVal.toFixed(1)}，距離第一壓力太近，勝算需超過 ${(100 / (1 + rrVal)).toFixed(0)}% 才划算 — 建議等回檔擴大空間`
+    : null;
+
   return {
-    ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail,
+    ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn,
+    conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
     rewardPct2: t2 ? (t2 - lo) / lo * 100 : null,
     rr: r > 0 && t1 ? (t1 - lo) / r : null,
@@ -1339,8 +1406,10 @@ function entryPlanHtml(s, m) {
       </div>
       <div style="margin-top:9px;display:flex;gap:14px;flex-wrap:wrap;font-size:0.75rem;color:var(--text3)">
         ${p.rr ? `<span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr.toFixed(1)}</strong></span>` : ''}
+        <span>訊號一致性 <strong style="color:${p.agr >= 0.6 ? 'var(--bull)' : p.agr >= 0.4 ? 'var(--yellow)' : 'var(--bear)'}">${(p.agr * 100).toFixed(0)}%</strong></span>
         <span>參考持有 ${p.horizon}</span>
       </div>
+      ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
 
       <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
         <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">📊 進場依據</div>
