@@ -742,15 +742,24 @@ async function fetchMarketTurnover() {
     const key = 'cache:turnover';
     const cached = cacheGet(key, 30 * 60 * 1000);
     if (cached) return cached;
-    const rows = await officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK', 'twse-turnover', 7000).catch(() => null);
-    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    // openapi 無此端點（診斷實測「無資料」）→ 改用 rwd 按月版，
+    // 欄位：日期,成交股數,成交金額,成交筆數,發行量加權股價指數,漲跌點數
     const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const now = new Date();
+    const months = await Promise.all([1, 0].map(back => {
+      const d = new Date(now.getFullYear(), now.getMonth() - back, 1);
+      const ym = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
+      return proxyFetch(`https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?date=${ym}01&response=json`, 7000).catch(() => null);
+    }));
+    const rows = months.filter(Boolean).flatMap(j => j?.data || []);
+    if (!rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
     const parsed = rows.map(r => ({
-      date: String(r['日期'] ?? '').trim(),
-      amount: num(r['成交金額']),
-      index: num(r['發行量加權股價指數']),
-      chg: num(r['漲跌點數']),
-    })).filter(r => r.amount != null);
+      date: rocToISO(r[0]) || String(r[0] ?? '').trim(),
+      amount: num(r[2]),
+      index: num(r[4]),
+      chg: num(r[5]),
+    })).filter(r => r.amount != null && r.index != null)
+      .sort((a, b) => a.date.localeCompare(b.date));
     if (!parsed.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
     cacheSet(key, parsed);
     return parsed;
@@ -842,13 +851,19 @@ async function fetchFinancialsAll() {
     const cached = cacheGet(key, 12 * 60 * 60 * 1000); // 季報更新頻率低，快取 12 小時
     if (cached) return cached;
 
-    const [twse, tpex] = await Promise.all([
-      officialJSON('https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci', 'twse-fin', 9000).catch(() => null),
-      officialJSON('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci', 'tpex-fin', 9000).catch(() => null),
-    ]);
+    // 綜合損益表依產業別分為多支端點，僅抓「一般業」會漏掉金融/保險/證券等
+    // （先前只有 89 檔即為此故）。逐一嘗試，不存在的端點靜默略過。
+    const IND = ['ci', 'basi', 'bd', 'fh', 'ins', 'mim'];
+    const reqs = [];
+    for (const g of IND) {
+      reqs.push(officialJSON(`https://openapi.twse.com.tw/v1/opendata/t187ap06_L_${g}`, `twse-fin-${g}`, 9000).catch(() => null));
+      reqs.push(officialJSON(`https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_${g}`, `tpex-fin-${g}`, 9000).catch(() => null));
+    }
+    const parts = await Promise.all(reqs);
+    const rows = parts.filter(Array.isArray).flat();
 
     const map = {};
-    for (const r of [...(twse || []), ...(tpex || [])]) {
+    for (const r of rows) {
       const id = String(r['公司代號'] ?? r['SecuritiesCompanyCode'] ?? '').trim();
       if (!/^\d{4,6}$/.test(id)) continue;
       const revenue = pickNum(r, '營業收入');
@@ -877,6 +892,79 @@ async function fetchFinancialsAll() {
 async function fetchFinancials(stockId) {
   const all = await fetchFinancialsAll();
   return all?.[stockId] || null;
+}
+
+// ── 資產負債表（ROE、負債比、每股淨值等財務體質指標）────────────────────────
+let _bsPromise = null;
+
+async function fetchBalanceSheetAll() {
+  if (_bsPromise) return _bsPromise;
+  _bsPromise = (async () => {
+    const key = 'cache:bsall';
+    const cached = cacheGet(key, 12 * 60 * 60 * 1000);
+    if (cached) return cached;
+
+    const IND = ['ci', 'basi', 'bd', 'fh', 'ins', 'mim'];
+    const reqs = [];
+    for (const g of IND) {
+      reqs.push(officialJSON(`https://openapi.twse.com.tw/v1/opendata/t187ap07_L_${g}`, `twse-bs-${g}`, 9000).catch(() => null));
+      reqs.push(officialJSON(`https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_${g}`, `tpex-bs-${g}`, 9000).catch(() => null));
+    }
+    const rows = (await Promise.all(reqs)).filter(Array.isArray).flat();
+
+    const map = {};
+    for (const r of rows) {
+      const id = String(r['公司代號'] ?? r['SecuritiesCompanyCode'] ?? '').trim();
+      if (!/^\d{4,6}$/.test(id)) continue;
+      const assets = pickNum(r, '資產總額', '資產總計');
+      const liab   = pickNum(r, '負債總額', '負債總計');
+      const equity = pickNum(r, '權益總額', '權益總計', '股東權益總額');
+      const bps    = pickNum(r, '每股參考淨值', '每股淨值');
+      if (assets == null && equity == null) continue;
+      map[id] = {
+        year: String(r['年度'] ?? '').trim(),
+        quarter: String(r['季別'] ?? '').trim(),
+        assets, liab, equity, bps,
+        debtRatio: assets > 0 && liab != null ? liab / assets * 100 : null,
+      };
+    }
+    if (Object.keys(map).length) { cacheSet(key, map); return map; }
+    return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+  })();
+  const r = await _bsPromise;
+  if (!r) _bsPromise = null;
+  return r;
+}
+
+// 合併損益表 + 資產負債表，並累積季度歷史（官方每次僅提供最新一季）
+async function fetchFullFinancials(stockId) {
+  const [fin, bs] = await Promise.all([
+    fetchFinancials(stockId).catch(() => null),
+    fetchBalanceSheetAll().then(m => m?.[stockId] || null).catch(() => null),
+  ]);
+  if (!fin && !bs) return null;
+
+  const out = { ...(fin || {}), ...(bs ? { assets: bs.assets, liab: bs.liab, equity: bs.equity, bps: bs.bps, debtRatio: bs.debtRatio } : {}) };
+  // 單季 ROE 年化（×4）—— 反映當前獲利效率
+  if (out.netInc != null && out.equity > 0) out.roe = out.netInc / out.equity * 100 * 4;
+
+  // 逐季累積歷史，供 QoQ / YoY 比較（官方端點只給最新一季）
+  const period = out.year && out.quarter ? `${out.year}Q${out.quarter}` : null;
+  if (period) {
+    try {
+      const hist = JSON.parse(localStorage.getItem('fin-hist') || '{}');
+      const arr = hist[stockId] = hist[stockId] || [];
+      const i = arr.findIndex(x => x.period === period);
+      const rec = { period, revenue: out.revenue, netInc: out.netInc, eps: out.eps,
+                    grossMargin: out.grossMargin, opMargin: out.opMargin, netMargin: out.netMargin, roe: out.roe };
+      if (i >= 0) arr[i] = rec; else arr.push(rec);
+      arr.sort((a, b) => a.period.localeCompare(b.period));
+      hist[stockId] = arr.slice(-12); // 最多 3 年
+      localStorage.setItem('fin-hist', JSON.stringify(hist));
+      out.history = hist[stockId];
+    } catch {}
+  }
+  return out;
 }
 
 // ── 盤中分鐘 K：以證交所即時報價自行累積 ───────────────────────────────────
