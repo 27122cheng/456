@@ -879,6 +879,89 @@ async function fetchFinancials(stockId) {
   return all?.[stockId] || null;
 }
 
+// ── 盤中分鐘 K：以證交所即時報價自行累積 ───────────────────────────────────
+// 台灣官方不提供免費的「歷史」分鐘 K，Yahoo 對雲端限流，TradingView 免費版
+// 亦不含台股（會跳「此商品僅在 TradingView 上可用」）。
+// 唯一可行路徑：輪詢證交所 MIS 即時報價，自行分桶累積成分鐘 K 並存本機。
+// 特性：盤中逐步建立，開盤初期根數少；收盤後保留當日完整分鐘 K。
+
+async function fetchRealtimeQuote(stockId) {
+  const isOTC = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO';
+  const ch = `${isOTC ? 'otc' : 'tse'}_${stockId}.tw`;
+  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(ch)}&json=1&delay=0&_=${Date.now()}`;
+  const j = await proxyFetch(url, 6000).catch(() => null);
+  const m = j?.msgArray?.[0];
+  if (!m) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const price = num(m.z) ?? num(m.b?.split('_')[0]) ?? num(m.a?.split('_')[0]);
+  if (price == null) return null;
+  return {
+    price, open: num(m.o), high: num(m.h), low: num(m.l),
+    cumVol: num(m.v) ?? 0,       // 當日累積成交量（張）
+    time: String(m.t || ''),      // HH:MM:SS
+    date: String(m.d || ''),      // YYYYMMDD
+    name: m.n,
+  };
+}
+
+function intradayKey(stockId, mins) { return `intra:${stockId}:${mins}`; }
+
+function getIntradayBars(stockId, mins) {
+  try {
+    const o = JSON.parse(localStorage.getItem(intradayKey(stockId, mins)) || '{}');
+    return Array.isArray(o.bars) ? o.bars : [];
+  } catch { return []; }
+}
+
+// 把一筆即時報價併入對應的分鐘桶
+function pushIntradayQuote(stockId, mins, q) {
+  if (!q?.time || !q.date) return getIntradayBars(stockId, mins);
+  const [hh, mm] = q.time.split(':').map(Number);
+  if (!isFinite(hh) || !isFinite(mm)) return getIntradayBars(stockId, mins);
+  const slot = Math.floor((hh * 60 + mm) / mins) * mins;
+  const label = `${q.date.slice(0,4)}-${q.date.slice(4,6)}-${q.date.slice(6,8)} ` +
+                `${String(Math.floor(slot/60)).padStart(2,'0')}:${String(slot%60).padStart(2,'0')}`;
+
+  let bars = getIntradayBars(stockId, mins);
+  const last = bars[bars.length - 1];
+  if (last && last.time === label) {
+    last.high = Math.max(last.high, q.price);
+    last.low = Math.min(last.low, q.price);
+    last.close = q.price;
+    last.volume = Math.max(0, q.cumVol - (last._vBase ?? q.cumVol));
+  } else {
+    bars.push({ time: label, open: q.price, high: q.price, low: q.price, close: q.price,
+                volume: 0, _vBase: q.cumVol });
+  }
+  // 只保留最近 3 個交易日，避免 localStorage 膨脹
+  const days = [...new Set(bars.map(b => b.time.slice(0, 10)))].slice(-3);
+  bars = bars.filter(b => days.includes(b.time.slice(0, 10)));
+  try { localStorage.setItem(intradayKey(stockId, mins), JSON.stringify({ bars })); } catch {}
+  return bars;
+}
+
+// 台北時間是否在交易時段（09:00–13:30 平日）
+function isMarketOpen() {
+  const t = twNow();
+  const dow = t.getDay();
+  if (dow === 0 || dow === 6) return false;
+  const m = t.getHours() * 60 + t.getMinutes();
+  return m >= 9 * 60 && m <= 13 * 60 + 35;
+}
+
+// 取分鐘 K：優先 Yahoo（有完整歷史），失敗則用自行累積的資料
+async function fetchIntradayBars(stockId, mins) {
+  const yahoo = await fetchStockOHLCV(stockId, `${mins}m`, '1mo').catch(() => []);
+  if (yahoo?.length >= 20) return { bars: yahoo, source: 'yahoo' };
+
+  let bars = getIntradayBars(stockId, mins);
+  if (isMarketOpen()) {
+    const q = await fetchRealtimeQuote(stockId).catch(() => null);
+    if (q) bars = pushIntradayQuote(stockId, mins, q);
+  }
+  return { bars, source: 'local' };
+}
+
 // ── TWSE 融資融券餘額（台股版未平倉 O.I：融資=槓桿多單、融券=空單未平倉）────
 
 let _marginMemo = null;

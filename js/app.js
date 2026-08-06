@@ -1257,8 +1257,13 @@ function buildEntryPlan(s, m) {
   let t1 = null, t2 = null, targetNote = '', holdOn = false;
   if (hasResistance) {
     t1 = +resList[0].v.toFixed(2);
-    t2 = resList[1] ? +resList[1].v.toFixed(2) : +(lo + r * 3).toFixed(2);
-    targetNote = `第一目標為${resList[0].why} ${t1}${resList[1] ? `，其上為${resList[1].why} ${t2}` : ''}`;
+    // 目標二必須高於目標一：只有單一壓力時，用 3R 與「突破後延伸 4%」取較高者，
+    // 否則遠壓力（如 +16%）搭配較小的 3R 會算出比目標一還低的目標二
+    t2 = resList[1] ? +resList[1].v.toFixed(2) : +Math.max(lo + r * 3, t1 * 1.04).toFixed(2);
+    if (t2 <= t1) t2 = +(t1 * 1.04).toFixed(2);
+    targetNote = resList[1]
+      ? `第一目標為${resList[0].why} ${t1}，其上為${resList[1].why} ${t2}`
+      : `第一目標為${resList[0].why} ${t1}；上方已無其他壓力，突破後延伸看 ${t2}`;
   } else {
     holdOn = true;
     targetNote = nearHigh
@@ -2099,74 +2104,29 @@ async function renderAnalysisPanels(s, inst) {
     </div>`;
 }
 
-// ── TradingView Chart ─────────────────────────────────────────────────────
+// ── K 線圖表 ───────────────────────────────────────────────────────────────
 
-// 自繪 Canvas K 線圖：用已抓到的真實 OHLCV 繪製，不依賴 TradingView
-// （TradingView 免費小工具對台股代碼常顯示「無法顯示」並跳去預設的 AAPL）
+// 全部週期皆為自繪 Canvas，資料來源：
+//   日/週/月 → 掃描已抓好的日線（週月由日線聚合），零額外請求
+//   5分/15分 → Yahoo 分鐘資料，取不到時改以證交所即時報價自行累積
+// 不使用 TradingView 嵌入：其免費版不含台股，會跳出
+// 「此商品僅在 TradingView 上可用」的錯誤對話框。
 const CHART_TF = {
   'D': { tf: '1d',  range: '6mo', label: '日線' },
   'W': { tf: '1wk', range: '2y',  label: '週線' },
   'M': { tf: '1mo', range: '5y',  label: '月線' },
-  // 分鐘級：優先自繪（與其他週期一致），Yahoo 分鐘資料取不到才退回 TradingView
-  '5':  { tf: '5m',  range: '1mo', label: '5分',  intraday: true, tv: '5' },
-  '15': { tf: '15m', range: '1mo', label: '15分', intraday: true, tv: '15' },
+  // 分鐘級：Yahoo 優先（有歷史），否則以證交所即時報價盤中累積
+  '5':  { mins: 5,  label: '5分',  intraday: true },
+  '15': { mins: 15, label: '15分', intraday: true },
 };
 let _chartToken = 0;
+let _intraTimer = null;
 
-// ── TradingView 嵌入圖表（分鐘級資料唯一可行來源）──────────────────────────
+
 // 由 TradingView 在瀏覽器端載入自家資料，完全繞過我方代理與 Yahoo 封鎖。
 // 注意：舊版失敗是因為 <script> 被直接塞進容器，缺少官方要求的
 // tradingview-widget-container / __widget 巢狀結構，小工具找不到掛載點
 // 便以預設商品（AAPL）初始化 —— 此處依官方格式正確建構。
-function renderTradingViewChart(container, stockId, tvInterval, label) {
-  const ex = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO' ? 'TPEX' : 'TWSE';
-  container.innerHTML = '';
-  container.style.position = 'relative';
-
-  const wrap = document.createElement('div');
-  wrap.className = 'tradingview-widget-container';
-  wrap.style.cssText = 'height:100%;width:100%';
-  const inner = document.createElement('div');
-  inner.className = 'tradingview-widget-container__widget';
-  inner.style.cssText = 'height:calc(100% - 22px);width:100%';
-  wrap.appendChild(inner);
-
-  const script = document.createElement('script');
-  script.type = 'text/javascript';
-  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-  script.async = true;
-  script.innerHTML = JSON.stringify({
-    autosize: true,
-    symbol: `${ex}:${stockId}`,
-    interval: tvInterval,
-    timezone: 'Asia/Taipei',
-    theme: 'dark',
-    style: '1',
-    locale: 'zh_TW',
-    backgroundColor: '#070b12',
-    gridColor: 'rgba(255,255,255,0.05)',
-    hide_side_toolbar: true,
-    allow_symbol_change: false,
-    save_image: false,
-    studies: ['STD;EMA'],
-    support_host: 'https://www.tradingview.com',
-  });
-  wrap.appendChild(script);
-  container.appendChild(wrap);
-
-  // 圖表載不出來時（商品不存在／腳本被擋）給出路，不留空白
-  const notice = document.createElement('div');
-  notice.style.cssText = 'position:absolute;left:8px;bottom:4px;font-size:0.62rem;color:var(--text3);pointer-events:none';
-  notice.textContent = `${label} · TradingView 提供（免費版為延遲報價）`;
-  container.appendChild(notice);
-  setTimeout(() => {
-    if (!container.querySelector('iframe')) {
-      container.innerHTML = `<div class="adv-loading" style="padding-top:180px;text-align:center;line-height:1.8">
-        TradingView 圖表載入失敗<br><span style="font-size:0.78rem">可能為網路阻擋或該商品不支援</span><br>
-        <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','D')">改看日線</button></div>`;
-    }
-  }, 6000);
-}
 
 async function initTVChart(stockId, interval = 'D') {
   const container = document.getElementById('tv-chart-container');
@@ -2179,21 +2139,43 @@ async function initTVChart(stockId, interval = 'D') {
 
   // 日線用掃描已抓好的資料；週/月由日線聚合 → 三者皆零額外請求
   const daily = allStocks.find(x => x.id === stockId)?.ohlcv;
-  let bars = null;
-  if (cfg.tf === '1d')       bars = daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo');
+  let bars = null, intraSource = null;
+  if (cfg.intraday) {
+    const r = await fetchIntradayBars(stockId, cfg.mins);
+    bars = r.bars; intraSource = r.source;
+  }
+  else if (cfg.tf === '1d')       bars = daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo');
   else if (cfg.tf === '1wk') bars = aggregateWeekly(daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo'));
   else if (cfg.tf === '1mo') bars = aggregateMonthly(daily?.length ? daily : await fetchStockOHLCV(stockId, '1d', '6mo'));
   else                       bars = await fetchStockOHLCV(stockId, cfg.tf, cfg.range);
   if (token !== _chartToken || currentStockId !== stockId) return; // 已切換股票/週期
 
-  if (!bars?.length) {
-    // 分鐘資料取不到 → 自動改用 TradingView 嵌入，仍看得到分鐘 K
-    if (cfg.tv) { renderTradingViewChart(container, stockId, cfg.tv, cfg.label); return; }
-    container.innerHTML = `<div class="adv-loading" style="padding-top:190px;text-align:center">K 線資料載入失敗（資料源逾時）<br>
-      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button></div>`;
+  if (!bars?.length || (cfg.intraday && bars.length < 2)) {
+    container.innerHTML = `<div class="adv-loading" style="padding-top:170px;text-align:center;line-height:1.9">
+      ${cfg.intraday ? `尚未累積足夠的 ${cfg.label} K 棒<br>
+        <span style="font-size:0.76rem">台灣官方不提供免費歷史分鐘資料，本站於盤中（09:00–13:30）<br>
+        以證交所即時報價逐步累積，開盤後會持續增加</span>`
+        : 'K 線資料載入失敗（資料源逾時）'}<br>
+      <button class="btn-ghost" style="margin-top:10px;padding:5px 16px" onclick="initTVChart('${stockId}','${interval}')">🔄 重試</button>
+      ${cfg.intraday ? `<button class="btn-ghost" style="margin-top:10px;margin-left:6px;padding:5px 16px" onclick="initTVChart('${stockId}','D')">改看日線</button>` : ''}
+    </div>`;
     return;
   }
-  drawCandleChart(container, bars, cfg.label, stockId);
+  drawCandleChart(container, bars, cfg.label + (intraSource === 'local' ? '（即時累積）' : ''), stockId);
+
+  // 分鐘圖開啟期間，盤中每 30 秒補抓一次即時報價並重繪
+  clearInterval(_intraTimer);
+  if (cfg.intraday && intraSource === 'local' && isMarketOpen()) {
+    _intraTimer = setInterval(async () => {
+      if (token !== _chartToken || currentStockId !== stockId || !isMarketOpen()) { clearInterval(_intraTimer); return; }
+      try {
+        const q = await fetchRealtimeQuote(stockId);
+        if (!q) return;
+        const nb = pushIntradayQuote(stockId, cfg.mins, q);
+        if (nb.length >= 2 && token === _chartToken) drawCandleChart(container, nb, cfg.label + '（即時累積）', stockId);
+      } catch {}
+    }, 30000);
+  }
 }
 
 function drawCandleChart(container, allBars, tfLabel, stockId) {
