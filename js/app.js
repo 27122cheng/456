@@ -1574,6 +1574,63 @@ async function openStock(stockId) {
 }
 
 // ── 未平倉部位 O.I（融資融券餘額）───────────────────────────────────────────
+// ── 技術型態與結構面板 ─────────────────────────────────────────────────────
+function renderPatterns(s) {
+  const el = document.getElementById('pattern-body');
+  if (!el) return;
+  const a = s.analysis;
+  if (!a) { el.innerHTML = '<p style="color:var(--text3);font-size:0.85rem">資料不足</p>'; return; }
+
+  const card = (title, body, tone = 'var(--text2)') => `
+    <div style="padding:10px 12px;border-radius:8px;background:${tone}0d;border-left:3px solid ${tone};margin-bottom:8px">
+      <div style="font-size:0.72rem;color:var(--text3);margin-bottom:3px">${title}</div>
+      <div style="font-size:0.82rem;color:var(--text1);line-height:1.6">${body}</div>
+    </div>`;
+  const tone = d => d > 0 ? 'var(--bull)' : d < 0 ? 'var(--bear)' : 'var(--yellow)';
+  const parts = [];
+
+  if (a.structure) parts.push(card('📐 趨勢結構（道氏理論）',
+    `${a.structure.txt}<br><span style="font-size:0.75rem;color:var(--text3)">前波高點 ${a.structure.lastSwingHigh}｜前波低點 ${a.structure.lastSwingLow}</span>` +
+    (a.structure.brokenTxt ? `<br><span style="color:var(--bear);font-size:0.78rem">⚠ ${a.structure.brokenTxt}</span>` : ''),
+    tone(a.structure.dir)));
+
+  if (a.pattern) parts.push(card(`📊 圖表型態：${a.pattern.name}`, a.pattern.txt, tone(a.pattern.dir)));
+  if (a.rsiDiv) parts.push(card('🔀 動能背離', a.rsiDiv.txt, tone(a.rsiDiv.type === 'bull' ? 1 : -1)));
+  if (a.diverg) parts.push(card('📉 量價背離', a.diverg.txt,
+    tone(a.diverg.type === 'bear' ? -1 : a.diverg.type === 'bull' ? 1 : 0)));
+  if (a.candles?.length) parts.push(card('🕯 K 棒訊號',
+    a.candles.map(c => `<strong style="color:${tone(c.dir)}">${c.name}</strong> — ${c.txt}`).join('<br>'),
+    tone(a.candles.reduce((n, c) => n + c.dir, 0))));
+  if (a.vpRegime) parts.push(card('📶 量價關係', `<strong>${a.vpRegime.k}</strong> — ${a.vpRegime.txt}`, tone(a.vpRegime.dir)));
+  if (a.squeeze) parts.push(card('🎚 波動狀態', a.squeeze.txt, 'var(--blue)'));
+
+  if (a.fib) {
+    const lv = a.fib.levels.map(x =>
+      `<span style="display:inline-block;margin:2px 5px 0 0;padding:2px 8px;border-radius:8px;font-size:0.72rem;font-family:var(--mono);${x.v === a.fib.near.v ? 'background:rgba(0,212,255,0.18);color:var(--blue);font-weight:700' : 'background:rgba(255,255,255,0.04);color:var(--text3)'}">${(x.r*100).toFixed(1)}% ${x.v}</span>`).join('');
+    parts.push(card('🔢 費波那契回撤', `${a.fib.txt}<div style="margin-top:5px">${lv}</div>`, 'var(--text2)'));
+  }
+
+  if (a.risk) {
+    const r = a.risk;
+    const sharpeTone = r.sharpe >= 1 ? 'var(--bull)' : r.sharpe >= 0 ? 'var(--yellow)' : 'var(--bear)';
+    parts.push(`
+      <div style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.02)">
+        <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">⚖️ 風險指標（近半年）</div>
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;font-size:0.78rem">
+          <div><span style="color:var(--text3)">最大回撤</span> <strong style="color:${r.mdd <= -25 ? 'var(--bear)' : 'var(--text1)'};font-family:var(--mono)">${r.mdd}%</strong></div>
+          <div><span style="color:var(--text3)">年化波動</span> <strong style="font-family:var(--mono)">${r.annVol}%</strong></div>
+          <div><span style="color:var(--text3)">年化報酬</span> <strong style="color:${r.annRet >= 0 ? 'var(--bull)' : 'var(--bear)'};font-family:var(--mono)">${r.annRet >= 0 ? '+' : ''}${r.annRet}%</strong></div>
+          <div><span style="color:var(--text3)">報酬波動比</span> <strong style="color:${sharpeTone};font-family:var(--mono)">${r.sharpe ?? '--'}</strong></div>
+        </div>
+        <div style="font-size:0.72rem;color:var(--text3);margin-top:6px">報酬波動比 ≥1 代表每承擔 1 單位波動可換得 1 單位以上報酬；下檔波動 ${r.downVol}%</div>
+      </div>`);
+  }
+
+  el.innerHTML = parts.length ? parts.join('')
+    : '<p style="color:var(--text3);font-size:0.85rem">目前無明顯型態訊號（趨勢結構需至少 40 根 K 棒）</p>';
+}
+
+// ── 未平倉部位 O.I（融資融券）───────────────────────────────────────────────
 function renderOI(s, oi) {
   const el = document.getElementById('oi-body');
   if (!el) return;

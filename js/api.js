@@ -352,7 +352,7 @@ async function fetchTWSEMonth(stockId, year, month) {
 }
 
 // 抓最近 N 個月併成連續日線（預設 7 個月 ≈ 140 根，足夠 EMA50/RSI/MACD/ADX）
-async function fetchTWSEHistory(stockId, months = 7) {
+async function fetchTWSEHistory(stockId, months = 14) {
   const now = new Date();
   const reqs = [];
   for (let i = months - 1; i >= 0; i--) {
@@ -1168,13 +1168,17 @@ function aggregateWeekly(daily) {
 // （原本的 60 分 K 只有 Yahoo 提供，Yahoo 一掛就永遠顯示「--」）
 async function fetchMTFSignals(stockId, dailyBars = null) {
   const daily = dailyBars?.length ? dailyBars : await fetchStockOHLCV(stockId, '1d', '6mo');
-  const score = bars => (bars?.length >= 20
-    ? (b => ({ score: b.score, signal: b.signal }))(calculateScore(bars))
-    : { score: null, signal: '--' });
+  // calculateScore 需 60 根才完整；根數較少時改用精簡版趨勢評分，
+  // 否則週線／月線會永遠顯示「--」（月線要 60 根 = 5 年資料，不切實際）
+  const score = (bars, min = 20) => {
+    if (!bars?.length || bars.length < min) return { score: null, signal: '--' };
+    if (bars.length >= 60) { const b = calculateScore(bars); return { score: b.score, signal: b.signal }; }
+    return lightScore(bars);
+  };
   return [
-    { label: '日線', ...score(daily) },
-    { label: '週線', ...score(aggregateWeekly(daily)) },
-    { label: '月線', ...score(aggregateMonthly(daily)) },
+    { label: '日線', ...score(daily, 20) },
+    { label: '週線', ...score(aggregateWeekly(daily), 12) },
+    { label: '月線', ...score(aggregateMonthly(daily), 6) },
   ];
 }
 
