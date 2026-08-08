@@ -159,6 +159,245 @@ function detectSqueeze(closes, period = 20, lookback = 60) {
   return null;
 }
 
+// ── 擺盪點與趨勢結構（道氏理論）─────────────────────────────────────────────
+// 專業分析的起點不是指標，而是「高低點結構」：
+// 高點越墊越高 + 低點越墊越高 = 上升趨勢；反之為下降趨勢。
+function findSwings(ohlcv, span = 3) {
+  const hi = [], lo = [];
+  for (let i = span; i < ohlcv.length - span; i++) {
+    const h = ohlcv[i].high, l = ohlcv[i].low;
+    let isH = true, isL = true;
+    for (let k = 1; k <= span; k++) {
+      if (ohlcv[i-k].high >= h || ohlcv[i+k].high >= h) isH = false;
+      if (ohlcv[i-k].low  <= l || ohlcv[i+k].low  <= l) isL = false;
+    }
+    if (isH) hi.push({ i, v: h, t: ohlcv[i].time });
+    if (isL) lo.push({ i, v: l, t: ohlcv[i].time });
+  }
+  return { hi, lo };
+}
+
+function analyzeStructure(ohlcv) {
+  if (!ohlcv || ohlcv.length < 40) return null;
+  const { hi, lo } = findSwings(ohlcv.slice(-90));
+  if (hi.length < 2 || lo.length < 2) return null;
+  const h2 = hi.slice(-2), l2 = lo.slice(-2);
+  const hh = h2[1].v > h2[0].v;   // higher high
+  const hl = l2[1].v > l2[0].v;   // higher low
+
+  let type, txt, dir;
+  if (hh && hl)        { type = 'uptrend';   dir = 1;  txt = '高點與低點同步墊高 — 標準上升趨勢結構'; }
+  else if (!hh && !hl) { type = 'downtrend'; dir = -1; txt = '高點與低點同步下移 — 標準下降趨勢結構'; }
+  else if (hh && !hl)  { type = 'expanding'; dir = 0;  txt = '高點墊高但低點下移 — 擴散喇叭型，波動放大且方向未定'; }
+  else                 { type = 'contract';  dir = 0;  txt = '高點下移但低點墊高 — 收斂三角，隨時可能選擇方向'; }
+
+  // 結構是否被破壞：跌破前一個擺盪低點 = 上升結構失效
+  const last = ohlcv[ohlcv.length - 1].close;
+  const brokeUp = type === 'uptrend' && last < l2[1].v;
+  const brokeDn = type === 'downtrend' && last > h2[1].v;
+
+  return {
+    type, dir, txt,
+    lastSwingHigh: +h2[1].v.toFixed(2), lastSwingLow: +l2[1].v.toFixed(2),
+    broken: brokeUp || brokeDn,
+    brokenTxt: brokeUp ? `已跌破前低 ${l2[1].v.toFixed(2)}，上升結構遭破壞`
+             : brokeDn ? `已突破前高 ${h2[1].v.toFixed(2)}，下降結構出現轉機` : null,
+  };
+}
+
+// ── K 棒型態（單根與雙根，只看最近 3 根以確保時效性）────────────────────────
+function detectCandlePatterns(ohlcv) {
+  if (!ohlcv || ohlcv.length < 3) return [];
+  const out = [];
+  const n = ohlcv.length;
+  const b = ohlcv[n-1], p = ohlcv[n-2];
+  const body = Math.abs(b.close - b.open);
+  const range = b.high - b.low;
+  if (range <= 0) return out;
+  const upperWick = b.high - Math.max(b.open, b.close);
+  const lowerWick = Math.min(b.open, b.close) - b.low;
+  const bodyPct = body / range;
+
+  // 影線與實體一律以「整根區間」為基準判定。
+  // 若用 body 當基準，實體極小（開收同價）時 body×2 = 0，
+  // 會讓錘子/流星的條件失效並被誤判為十字星。
+  const lowPct = lowerWick / range, upPct = upperWick / range;
+
+  // 錘子：下影至少佔整根 55%、上影極短 → 低檔有買盤強力承接
+  if (lowPct >= 0.55 && upPct <= 0.15)
+    out.push({ name: '錘子線', dir: 1, txt: '長下影線，低檔遭遇買盤強力承接' });
+  // 流星：上影至少佔整根 55%、下影極短 → 高檔賣壓沉重
+  else if (upPct >= 0.55 && lowPct <= 0.15)
+    out.push({ name: '流星線', dir: -1, txt: '長上影線，高檔賣壓沉重' });
+  // 十字星：實體極小且上下影相當（否則屬錘子/流星）
+  else if (bodyPct < 0.1 && Math.abs(lowPct - upPct) < 0.3)
+    out.push({ name: '十字星', dir: 0, txt: '開收盤幾乎相同，多空陷入平衡，留意變盤' });
+  // 吞噬型態：當根實體完全包住前一根且方向相反
+  const pBody = Math.abs(p.close - p.open);
+  if (body > pBody * 1.1 && pBody > 0) {
+    if (b.close > b.open && p.close < p.open && b.close >= p.open && b.open <= p.close)
+      out.push({ name: '多頭吞噬', dir: 1, txt: '陽線完全吞噬前一根陰線，買方奪回主導' });
+    if (b.close < b.open && p.close > p.open && b.open >= p.close && b.close <= p.open)
+      out.push({ name: '空頭吞噬', dir: -1, txt: '陰線完全吞噬前一根陽線，賣方轉強' });
+  }
+  // 長紅/長黑：實體佔比高且波動大
+  const atrApprox = ohlcv.slice(-14).reduce((s, x) => s + (x.high - x.low), 0) / 14;
+  if (bodyPct > 0.7 && range > atrApprox * 1.3) {
+    out.push(b.close > b.open
+      ? { name: '長紅棒', dir: 1, txt: '大實體陽線，買盤一路推升無明顯抵抗' }
+      : { name: '長黑棒', dir: -1, txt: '大實體陰線，賣壓一路傾洩' });
+  }
+  return out.slice(0, 3);
+}
+
+// ── RSI 背離（價格創新高/低但動能未跟上）────────────────────────────────────
+function calcRSISeries(closes, period = 14) {
+  if (closes.length < period + 2) return [];
+  const out = new Array(closes.length).fill(null);
+  let g = 0, l = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i-1];
+    if (d > 0) g += d; else l -= d;
+  }
+  let ag = g / period, al = l / period;
+  out[period] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i-1];
+    ag = (ag * (period - 1) + (d > 0 ? d : 0)) / period;
+    al = (al * (period - 1) + (d < 0 ? -d : 0)) / period;
+    out[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+  }
+  return out;
+}
+
+function detectRSIDivergence(ohlcv, lookback = 60) {
+  if (!ohlcv || ohlcv.length < lookback) return null;
+  // RSI 必須用「完整序列」計算後再取視窗 —— 若先切片再算，
+  // 前 14 根暖身期會是 null，導致視窗內較早的波峰被濾除而漏判背離
+  const rsiFull = calcRSISeries(ohlcv.map(d => d.close));
+  const start = ohlcv.length - lookback;
+  const seg = ohlcv.slice(start);
+  const rsi = rsiFull.slice(start);
+  const { hi, lo } = findSwings(seg, 3);
+  const valid = s => s.filter(x => rsi[x.i] != null).slice(-2);
+  const H = valid(hi), L = valid(lo);
+
+  // 價格須「明顯」創高/破低（≥0.8%）才算背離，避免微幅新高就誤判
+  const SIG = 0.008;
+  if (H.length === 2 && H[1].v > H[0].v * (1 + SIG) && rsi[H[1].i] < rsi[H[0].i] - 3)
+    return { type: 'bear', txt: `RSI 頂背離：股價創新高（${H[0].v.toFixed(2)}→${H[1].v.toFixed(2)}）但 RSI 反而走弱（${rsi[H[0].i].toFixed(0)}→${rsi[H[1].i].toFixed(0)}），上漲動能衰竭` };
+  if (L.length === 2 && L[1].v < L[0].v * (1 - SIG) && rsi[L[1].i] > rsi[L[0].i] + 3)
+    return { type: 'bull', txt: `RSI 底背離：股價破新低（${L[0].v.toFixed(2)}→${L[1].v.toFixed(2)}）但 RSI 已轉強（${rsi[L[0].i].toFixed(0)}→${rsi[L[1].i].toFixed(0)}），下跌動能衰竭` };
+  return null;
+}
+
+// ── 圖表型態：雙底/雙頂、收斂突破 ────────────────────────────────────────────
+function detectChartPattern(ohlcv) {
+  if (!ohlcv || ohlcv.length < 50) return null;
+  const seg = ohlcv.slice(-90);
+  const { hi, lo } = findSwings(seg, 3);
+  const price = seg[seg.length - 1].close;
+
+  // 雙底（W）：兩個相近低點且已回升
+  if (lo.length >= 2) {
+    const [a, b] = lo.slice(-2);
+    const diff = Math.abs(a.v - b.v) / a.v;
+    if (diff < 0.04 && b.i - a.i >= 8) {
+      const neck = Math.max(...seg.slice(a.i, b.i + 1).map(x => x.high));
+      if (price > b.v * 1.02)
+        return { name: '雙底 W 型', dir: 1, neck: +neck.toFixed(2),
+          txt: `兩次於 ${a.v.toFixed(2)} 附近測試不破形成雙底，頸線 ${neck.toFixed(2)}，突破頸線為型態完成訊號` };
+    }
+  }
+  // 雙頂（M）：兩個相近高點且已回落
+  if (hi.length >= 2) {
+    const [a, b] = hi.slice(-2);
+    const diff = Math.abs(a.v - b.v) / a.v;
+    if (diff < 0.04 && b.i - a.i >= 8) {
+      const neck = Math.min(...seg.slice(a.i, b.i + 1).map(x => x.low));
+      if (price < b.v * 0.98)
+        return { name: '雙頂 M 型', dir: -1, neck: +neck.toFixed(2),
+          txt: `兩次於 ${a.v.toFixed(2)} 附近受阻形成雙頂，頸線 ${neck.toFixed(2)}，跌破頸線確認轉弱` };
+    }
+  }
+  // 收斂三角：高點下移、低點墊高
+  if (hi.length >= 2 && lo.length >= 2) {
+    const h2 = hi.slice(-2), l2 = lo.slice(-2);
+    if (h2[1].v < h2[0].v && l2[1].v > l2[0].v) {
+      const rangePct = (h2[1].v - l2[1].v) / price * 100;
+      return { name: '收斂三角', dir: 0, upper: +h2[1].v.toFixed(2), lower: +l2[1].v.toFixed(2),
+        txt: `高點下移、低點墊高形成收斂（區間 ${l2[1].v.toFixed(2)}~${h2[1].v.toFixed(2)}，寬度 ${rangePct.toFixed(1)}%），突破方向常決定下一波` };
+    }
+  }
+  return null;
+}
+
+// ── 費波那契回撤（由最近一段主要波段計算）────────────────────────────────────
+function fibLevels(ohlcv) {
+  if (!ohlcv || ohlcv.length < 30) return null;
+  const seg = ohlcv.slice(-90);
+  const highs = seg.map(d => d.high), lows = seg.map(d => d.low);
+  const hiIdx = highs.indexOf(Math.max(...highs));
+  const loIdx = lows.indexOf(Math.min(...lows));
+  const hi = highs[hiIdx], lo = lows[loIdx];
+  if (hi <= lo) return null;
+  const up = hiIdx > loIdx;   // 低點在前 = 上漲波段，回撤由上往下量
+  const price = seg[seg.length - 1].close;
+  const lv = r => +(up ? hi - (hi - lo) * r : lo + (hi - lo) * r).toFixed(2);
+  const levels = [
+    { r: 0.236, v: lv(0.236) }, { r: 0.382, v: lv(0.382) },
+    { r: 0.5,   v: lv(0.5)   }, { r: 0.618, v: lv(0.618) },
+  ];
+  // 目前價格落在哪一段
+  const near = levels.reduce((best, x) =>
+    Math.abs(price - x.v) < Math.abs(price - best.v) ? x : best, levels[0]);
+  return { up, hi: +hi.toFixed(2), lo: +lo.toFixed(2), levels, near,
+    txt: up ? `本波自 ${lo.toFixed(2)} 漲至 ${hi.toFixed(2)}，回撤 ${(near.r*100).toFixed(1)}% 位於 ${near.v}`
+            : `本波自 ${hi.toFixed(2)} 跌至 ${lo.toFixed(2)}，反彈 ${(near.r*100).toFixed(1)}% 位於 ${near.v}` };
+}
+
+// ── 風險指標：最大回撤、報酬波動比、下檔風險 ────────────────────────────────
+function riskMetrics(ohlcv) {
+  if (!ohlcv || ohlcv.length < 30) return null;
+  const closes = ohlcv.slice(-120).map(d => d.close);
+  let peak = closes[0], mdd = 0;
+  for (const c of closes) { if (c > peak) peak = c; mdd = Math.min(mdd, (c - peak) / peak); }
+  const rets = [];
+  for (let i = 1; i < closes.length; i++) rets.push(closes[i] / closes[i-1] - 1);
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const sd = Math.sqrt(rets.reduce((s, r) => s + (r - mean) ** 2, 0) / rets.length);
+  const down = rets.filter(r => r < 0);
+  const dsd = down.length ? Math.sqrt(down.reduce((s, r) => s + r * r, 0) / down.length) : 0;
+  const annRet = mean * 252 * 100;
+  const annVol = sd * Math.sqrt(252) * 100;
+  return {
+    mdd: +(mdd * 100).toFixed(1),                 // 最大回撤 %
+    annRet: +annRet.toFixed(1),                    // 年化報酬 %
+    annVol: +annVol.toFixed(1),                    // 年化波動 %
+    sharpe: annVol > 0 ? +(annRet / annVol).toFixed(2) : null,   // 報酬波動比
+    downVol: +(dsd * Math.sqrt(252) * 100).toFixed(1),           // 下檔波動 %
+  };
+}
+
+// ── 量價關係矩陣（四象限）─────────────────────────────────────────────────────
+function volumePriceRegime(ohlcv) {
+  if (!ohlcv || ohlcv.length < 25) return null;
+  const recent = ohlcv.slice(-5);
+  const prev = ohlcv.slice(-25, -5);
+  const vNow = recent.reduce((s, b) => s + (b.volume || 0), 0) / recent.length;
+  const vPrev = prev.reduce((s, b) => s + (b.volume || 0), 0) / prev.length;
+  if (!vPrev) return null;
+  const volUp = vNow > vPrev * 1.15, volDn = vNow < vPrev * 0.85;
+  const pChg = (recent[recent.length-1].close - prev[prev.length-1].close) / prev[prev.length-1].close * 100;
+  const priceUp = pChg > 1, priceDn = pChg < -1;
+
+  if (volUp && priceUp)  return { k: '量增價漲', dir: 1,  txt: '價漲量增，買盤積極承接，趨勢健康' };
+  if (volUp && priceDn)  return { k: '量增價跌', dir: -1, txt: '價跌量增，賣壓宣洩中，需留意是否為出貨' };
+  if (volDn && priceUp)  return { k: '量縮價漲', dir: 0,  txt: '價漲量縮，追價意願不足，漲勢基礎薄弱' };
+  if (volDn && priceDn)  return { k: '量縮價跌', dir: 0,  txt: '價跌量縮，賣壓減輕，可能接近打底階段' };
+  return { k: '量價持平', dir: 0, txt: '量能與價格皆無明顯變化，觀望氣氛濃厚' };
+}
+
 // ── Master Score & Signal ─────────────────────────────────────────────────
 
 function calculateScore(ohlcv) {
@@ -184,6 +423,13 @@ function calculateScore(ohlcv) {
   const stoch = calcStoch(highs, lows, closes);
   const diverg = detectDivergence(closes, volumes);
   const squeeze = detectSqueeze(closes);
+  const structure = analyzeStructure(ohlcv);
+  const candles = detectCandlePatterns(ohlcv);
+  const rsiDiv = detectRSIDivergence(ohlcv);
+  const pattern = detectChartPattern(ohlcv);
+  const fib = fibLevels(ohlcv);
+  const risk = riskMetrics(ohlcv);
+  const vpRegime = volumePriceRegime(ohlcv);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -262,6 +508,26 @@ function calculateScore(ohlcv) {
   // 波動擴張且順勢 → 趨勢加速；壓縮則不加減分（方向未定）
   if (squeeze?.state === 'expansion' && price > (ema20 || 0)) { score += 3; reasons.push('波動擴張且站上均線'); }
 
+  // 趨勢結構（道氏理論）—— 高低點結構比任何指標都根本
+  if (structure) {
+    if (structure.type === 'uptrend') { score += 6; reasons.push('高低點同步墊高（上升結構）'); }
+    else if (structure.type === 'downtrend') { score -= 6; reasons.push('高低點同步下移（下降結構）'); }
+    if (structure.broken) { score -= 4; reasons.push('趨勢結構遭破壞'); }
+  }
+  // RSI 背離：動能衰竭的領先訊號，權重高於一般指標
+  if (rsiDiv?.type === 'bear') { score -= 8; reasons.push('RSI 頂背離，上漲動能衰竭'); }
+  else if (rsiDiv?.type === 'bull') { score += 6; reasons.push('RSI 底背離，下跌動能衰竭'); }
+  // 圖表型態
+  if (pattern?.dir === 1) { score += 4; reasons.push(pattern.name); }
+  else if (pattern?.dir === -1) { score -= 4; reasons.push(pattern.name); }
+  // K 棒型態（取方向一致的最強一項，避免多根型態重複加分）
+  const cDir = candles.reduce((acc, c) => acc + c.dir, 0);
+  if (cDir > 0) { score += 2; reasons.push(candles.find(c => c.dir > 0).name); }
+  else if (cDir < 0) { score -= 2; reasons.push(candles.find(c => c.dir < 0).name); }
+  // 量價關係
+  if (vpRegime?.dir === 1) score += 2;
+  else if (vpRegime?.dir === -1) score -= 2;
+
   score = Math.max(0, Math.min(100, Math.round(score)));
 
   let signal;
@@ -274,7 +540,8 @@ function calculateScore(ohlcv) {
   else signal = '中性';
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
-           diverg, squeeze, price, prevClose, lastVol };
+           diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
+           price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────
