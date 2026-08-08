@@ -398,6 +398,39 @@ function volumePriceRegime(ohlcv) {
   return { k: '量價持平', dir: 0, txt: '量能與價格皆無明顯變化，觀望氣氛濃厚' };
 }
 
+// 精簡趨勢評分：資料根數不足 60 時使用（週線／月線常見）。
+// 只用不需長期暖身的指標：均線位置、動能、連續性。
+function lightScore(bars) {
+  const closes = bars.map(d => d.close);
+  const n = closes.length;
+  const price = closes[n - 1];
+  let score = 50;
+  const ma = (p) => n >= p ? closes.slice(-p).reduce((a, b) => a + b, 0) / p : null;
+  const ma5 = ma(5), ma10 = ma(10);
+  if (ma5 && price > ma5) score += 10;
+  else if (ma5) score -= 10;
+  if (ma5 && ma10) score += ma5 > ma10 ? 10 : -10;
+  // 期間報酬
+  const back = Math.min(n - 1, 6);
+  const ret = (price - closes[n - 1 - back]) / closes[n - 1 - back] * 100;
+  score += Math.max(-15, Math.min(15, ret * 1.2));
+  // 連續同向根數（趨勢延續性）
+  let streak = 0;
+  for (let i = n - 1; i > 0 && i > n - 6; i--) {
+    const up = closes[i] > closes[i - 1];
+    if (streak === 0) streak = up ? 1 : -1;
+    else if ((streak > 0) === up) streak += up ? 1 : -1;
+    else break;
+  }
+  score += Math.max(-8, Math.min(8, streak * 2.5));
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const bull = parseInt(localStorage.getItem('bull-threshold') || '60');
+  const bear = parseInt(localStorage.getItem('bear-threshold') || '40');
+  const signal = score >= bull + 15 ? '強勢多頭' : score >= bull ? '多頭'
+               : score <= bear - 10 ? '強勢空頭' : score <= bear ? '空頭' : '中性';
+  return { score, signal };
+}
+
 // ── Master Score & Signal ─────────────────────────────────────────────────
 
 function calculateScore(ohlcv) {
