@@ -1092,6 +1092,30 @@ function buildManagerAnalysis(s) {
     if (fin.debtRatio >= 70) add(0.5, -1, `負債比 ${fin.debtRatio.toFixed(0)}% 偏高`, 'fund');
   }
 
+  // ⑦ 趨勢結構、型態與動能背離（專業分析的核心判斷）
+  if (a.structure) {
+    if (a.structure.type === 'uptrend') add(1.8, 1, a.structure.txt);
+    else if (a.structure.type === 'downtrend') add(1.8, -1, a.structure.txt);
+    else notes.push(a.structure.txt);
+    if (a.structure.broken) add(1.2, a.structure.type === 'uptrend' ? -1 : 1, a.structure.brokenTxt);
+  }
+  if (a.rsiDiv?.type === 'bear') add(1.5, -1, a.rsiDiv.txt);
+  else if (a.rsiDiv?.type === 'bull') add(1.2, 1, a.rsiDiv.txt);
+  if (a.pattern) {
+    if (a.pattern.dir === 1) add(1, 1, a.pattern.txt);
+    else if (a.pattern.dir === -1) add(1, -1, a.pattern.txt);
+    else notes.push(a.pattern.txt);
+  }
+  const cSum = (a.candles || []).reduce((n, c) => n + c.dir, 0);
+  if (cSum > 0) { const c = a.candles.find(x => x.dir > 0); add(0.5, 1, `${c.name}：${c.txt}`); }
+  else if (cSum < 0) { const c = a.candles.find(x => x.dir < 0); add(0.5, -1, `${c.name}：${c.txt}`); }
+  if (a.vpRegime) {
+    if (a.vpRegime.dir === 1) add(0.5, 1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
+    else if (a.vpRegime.dir === -1) add(0.5, -1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
+    else notes.push(`${a.vpRegime.k}：${a.vpRegime.txt}`);
+  }
+  if (a.risk?.mdd <= -30) notes.push(`近半年最大回撤 ${a.risk.mdd}%，屬高波動標的`);
+
   // ⑦ 多週期一致性
   let mtfAligned = null;
   if (mtf?.length) {
@@ -1460,7 +1484,7 @@ async function openStock(stockId) {
   document.getElementById('stock-change').textContent = 'TWD';
 
   // Reset sections
-  ['inst-body','setup-body','mtf-body','fund-body','chip-body','oi-body','sr-body','mkt-body','ind-body','ai-anal-body','situation-body','of-body','vp-body'].forEach(id => {
+  ['inst-body','setup-body','mtf-body','fund-body','chip-body','oi-body','pattern-body','sr-body','mkt-body','ind-body','ai-anal-body','situation-body','of-body','vp-body'].forEach(id => {
     const e = document.getElementById(id); if (e) e.innerHTML = '<div class="adv-loading">載入中...</div>';
   });
   const frb = document.getElementById('full-risk-body'); if (frb) frb.innerHTML = '';
@@ -1506,6 +1530,7 @@ async function openStock(stockId) {
 
   s._mtf = null; s._oi = null;
   renderStockDetail(s);
+  renderPatterns(s);
   renderAnalysisPanels(s, null);
   renderSituation(s, null);
   renderOrderFlow(s);
