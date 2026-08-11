@@ -235,6 +235,7 @@ async function runScan() {
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
   after('我的持倉', renderHoldings);
+  after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
   after('價格警報', checkAlerts);
   after('Telegram 推送', () => {
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
@@ -2896,8 +2897,7 @@ function navigateTo(page, opts = {}) {
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
   if (page === 'holdings') renderHoldings();
-  if (page === 'journal') renderJournal();
-  if (page === 'report') renderPredAccuracy();
+  if (page === 'journal') { renderJournal(); renderAiSignals(); renderPredAccuracy(); }
 
   // Apply filter from opts
   if (opts.filter) {
@@ -3330,6 +3330,102 @@ function renderCustomStocksList() {
   if (cnt) cnt.textContent = `共 ${list.length} 檔`;
 }
 
+// ── AI 訊號自動紙上追蹤 ─────────────────────────────────────────────────────
+// 每個推薦交易自動建檔追蹤到停損/停利，不用手動操作 —
+// 讓系統累積「自己的訊號實際表現」與止損原因，回饋教訓學習。
+function getAiSignals() {
+  try { return JSON.parse(localStorage.getItem('ai-signals') || '[]'); } catch { return []; }
+}
+function saveAiSignals(list) { localStorage.setItem('ai-signals', JSON.stringify(list.slice(-300))); }
+
+function recordAiSignals() {
+  const picks = computeEntrySignals();
+  if (!picks.length) return;
+  const list = getAiSignals();
+  const today = new Date().toISOString().slice(0, 10);
+  let added = 0;
+  for (const { s, m, p } of picks) {
+    // 同檔已有追蹤中訊號、或今天已建檔 → 不重複
+    if (list.some(x => x.id === s.id && (x.status === 'open' || x.date === today))) continue;
+    list.push({
+      id: s.id, name: s.name, date: today,
+      entry: p.lo, hi: p.hi, stop: p.stop, t1: p.t1, holdOn: !!p.holdOn,
+      status: 'open',
+      ctx: {
+        score: s.analysis.score, rsi: s.analysis.rsi != null ? +s.analysis.rsi.toFixed(1) : null,
+        agr: +m.agr.toFixed(2), pctile: s.analysis.pctile?.zone ?? null,
+        mktNorm: Math.round(outlookData.norm ?? 0),
+        sector: getStockList().find(x => x.id === s.id)?.sector ?? null,
+      },
+    });
+    added++;
+  }
+  if (added) saveAiSignals(list);
+}
+
+// 用後續 K 棒結算追蹤中的訊號（保守規則：同日觸及停損與停利判停損）
+function updateAiSignals() {
+  const list = getAiSignals();
+  let changed = false;
+  for (const t of list) {
+    if (t.status !== 'open') continue;
+    const s = allStocks.find(x => x.id === t.id);
+    if (!s?.ohlcv?.length) continue;
+    const after = s.ohlcv.filter(b => b.time > t.date);
+    for (const b of after) {
+      if (b.low <= t.stop) {
+        Object.assign(t, { status: 'loss', exitDate: b.time, exitPrice: t.stop,
+          retPct: +((t.stop - t.entry) / t.entry * 100).toFixed(2), exitReason: '跌破停損' });
+        changed = true; break;
+      }
+      if (!t.holdOn && t.t1 && b.high >= t.t1) {
+        Object.assign(t, { status: 'win', exitDate: b.time, exitPrice: t.t1,
+          retPct: +((t.t1 - t.entry) / t.entry * 100).toFixed(2), exitReason: '達目標停利' });
+        changed = true; break;
+      }
+    }
+    if (t.status === 'open' && after.length >= 20) {
+      const c = after[19].close;
+      const ret = +((c - t.entry) / t.entry * 100).toFixed(2);
+      Object.assign(t, { status: ret >= 0 ? 'win' : 'loss', exitDate: after[19].time,
+        exitPrice: c, retPct: ret, exitReason: '20 日到期結算' });
+      changed = true;
+    }
+  }
+  if (changed) saveAiSignals(list);
+}
+
+function renderAiSignals() {
+  const el = document.getElementById('ai-signals-body');
+  if (!el) return;
+  const list = getAiSignals();
+  const done = list.filter(t => t.status !== 'open');
+  const open = list.filter(t => t.status === 'open');
+  if (!list.length) {
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">尚無訊號記錄。推薦交易出現時會自動建檔追蹤，無需手動操作。</p>';
+    return;
+  }
+  const wins = done.filter(t => t.status === 'win');
+  const reasons = {};
+  done.filter(t => t.status === 'loss').forEach(t => { reasons[t.exitReason] = (reasons[t.exitReason] || 0) + 1; });
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px">
+      <div class="inst-card"><div class="inst-card-lbl">追蹤中</div><div class="inst-card-val" style="color:var(--blue)">${open.length}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">已結算</div><div class="inst-card-val">${done.length}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">訊號勝率</div><div class="inst-card-val" style="color:${done.length && wins.length / done.length >= 0.5 ? 'var(--bull)' : done.length ? 'var(--bear)' : 'var(--text3)'}">${done.length ? (wins.length / done.length * 100).toFixed(0) + '%' : '--'}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">平均報酬</div><div class="inst-card-val">${done.length ? (done.reduce((n, t) => n + (t.retPct || 0), 0) / done.length).toFixed(2) + '%' : '--'}</div></div>
+    </div>
+    ${Object.keys(reasons).length ? `<div style="font-size:0.78rem;color:var(--text2);margin-bottom:8px">
+      虧損原因分佈：${Object.entries(reasons).map(([r, n]) => `${r} ×${n}`).join('、')}</div>` : ''}
+    ${done.slice(-5).reverse().map(t => `
+      <div style="display:flex;align-items:center;gap:8px;font-size:0.76rem;padding:5px 0;border-bottom:1px solid var(--border)">
+        <span style="cursor:pointer" onclick="openStock('${t.id}')">${t.name}</span>
+        <span style="color:var(--text3);font-size:0.68rem">${t.date} → ${t.exitDate}</span>
+        <span style="color:var(--text3);font-size:0.68rem">${t.exitReason}</span>
+        <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${t.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${t.retPct >= 0 ? '+' : ''}${t.retPct}%</span>
+      </div>`).join('')}`;
+}
+
 // ── 交易紀錄（結案後的檢討資料庫）───────────────────────────────────────────
 function getJournal() {
   try { return JSON.parse(localStorage.getItem('trade-journal') || '[]'); } catch { return []; }
@@ -3345,7 +3441,45 @@ function classifyExit(h, exitPrice, s) {
   return exitPrice >= h.entry ? '獲利了結（手動）' : '停損出場（手動）';
 }
 
-// 結案：輸入實際出場價 → 寫入交易紀錄 → 移出持倉
+// 交易評分（1~5 星）：從紀律與品質面向給分，低於 3 星列出可改進重點
+function rateTrade(h, exit, retPct, reason, s) {
+  const notes = [];
+  let stars = 3; // 基準：有進場、有停損、正常出場
+  const risk = h.entry - h.stop;
+  const rMult = risk > 0 ? (exit - h.entry) / risk : null; // R 倍數
+
+  // ── 加分項 ──
+  if (rMult != null && rMult >= 2) stars += 1;                      // 抓到 2R 以上的行情
+  else if (rMult != null && rMult >= 1) stars += 0.5;
+  if (retPct < 0 && exit >= h.stop * 0.99) stars += 1;              // 虧損但紀律停損（在停損價附近出場）
+  if (h.t1 && exit >= h.t1 * 0.995) stars += 0.5;                   // 按計畫達目標出場
+
+  // ── 扣分項（每項附改進重點） ──
+  if (retPct < 0 && risk > 0 && exit < h.stop * 0.97) {
+    stars -= 1.5;
+    notes.push(`出場價 ${exit} 已低於停損 ${h.stop} 達 ${((h.stop - exit) / h.stop * 100).toFixed(1)}% — 凹單擴大虧損。改進：跌破停損當日就執行，不等反彈`);
+  }
+  if (h.planHi && h.entry > h.planHi * 1.01) {
+    stars -= 1;
+    notes.push(`進場價 ${h.entry} 高於建議區上緣 ${h.planHi} — 追價使停損距離變大。改進：只在建議區間內掛單，錯過就放掉`);
+  }
+  if (h.kind === 'day') {
+    const heldDays = Math.round((new Date(new Date().toISOString().slice(0, 10)) - new Date(h.addedAt)) / 86400000);
+    if (heldDays > 5) {
+      stars -= 1;
+      notes.push(`當沖單持有 ${heldDays} 天 — 當沖失敗轉存股是常見虧損放大來源。改進：當沖單收盤前未達預期就出場，不轉長線`);
+    }
+  }
+  if (retPct < 0 && h.ctx?.rsi >= 70) notes.push(`進場時 RSI ${h.ctx.rsi} 已過熱 — 高檔追多勝率偏低。改進：等 RSI 回落 60 以下再進場`);
+  if (retPct < 0 && h.ctx?.agr != null && h.ctx.agr < 0.4) notes.push(`進場時訊號一致性僅 ${(h.ctx.agr * 100).toFixed(0)}% — 多空分歧時進場等同賭方向。改進：等證據收斂`);
+  if (retPct < 0 && h.ctx?.mktNorm <= -15) notes.push(`進場時大盤偏空（${h.ctx.mktNorm}）— 逆風做多難度高。改進：空頭市場降低進場頻率與部位`);
+  if (retPct < 0 && !notes.length) notes.push('進場情境無明顯違規，屬正常停損 — 檢視是否單筆部位過大，虧損控制在總資金 2% 內即可');
+
+  stars = Math.max(1, Math.min(5, Math.round(stars)));
+  return { stars, notes };
+}
+
+// 結案：輸入實際出場價 → 評分 → 寫入交易紀錄 → 移出持倉
 function closeHolding(stockId) {
   const holdings = getHoldings();
   const h = holdings.find(x => x.id === stockId);
@@ -3359,15 +3493,19 @@ function closeHolding(stockId) {
 
   const retPct = +((exit - h.entry) / h.entry * 100).toFixed(2);
   const reason = classifyExit(h, exit, s);
+  const rating = rateTrade(h, exit, retPct, reason, s);
   const journal = getJournal();
   journal.push({
     id: stockId, name: h.name, entry: h.entry, exit: +exit.toFixed(2),
     entryDate: h.addedAt, exitDate: new Date().toISOString().slice(0, 10),
     retPct, reason, ctx: h.ctx ?? null, lesson: '',
+    src: h.src ?? 'ai', kind: h.kind ?? 'long',
+    stars: rating.stars, review: rating.notes,
   });
   saveJournal(journal);
   saveHoldings(holdings.filter(x => x.id !== stockId));
-  showToast(`已結案 ${h.name}：${retPct >= 0 ? '+' : ''}${retPct}%（${reason}）`, retPct >= 0 ? 'success' : 'error');
+  const starStr = '★'.repeat(rating.stars) + '☆'.repeat(5 - rating.stars);
+  showToast(`已結案 ${h.name}：${retPct >= 0 ? '+' : ''}${retPct}%（${reason}）評分 ${starStr}`, retPct >= 0 ? 'success' : 'error');
   renderHoldings(); renderJournal();
   if (tgWants('sig')) tgPush(`📒 交易結案\n\n${h.name}(${stockId}) ${reason}\n進場 ${h.entry} → 出場 ${exit}\n報酬 ${retPct >= 0 ? '+' : ''}${retPct}%`);
 }
@@ -3385,7 +3523,9 @@ function setLesson(idx) {
 
 // 教訓學習：從虧損交易的進場情境歸納重複犯的錯 → 回饋到進場建議
 function journalInsights() {
-  const losses = getJournal().filter(t => t.retPct < 0 && t.ctx);
+  const aiLosses = getAiSignals().filter(t => t.status === 'loss' && t.ctx)
+    .map(t => ({ ...t, retPct: t.retPct ?? -1 }));
+  const losses = [...getJournal().filter(t => t.retPct < 0 && t.ctx), ...aiLosses];
   const pat = [];
   const count = (label, fn, advice) => {
     const n = losses.filter(fn).length;
@@ -3429,6 +3569,8 @@ function addHolding(stockId) {
     id: stockId, name: s.name, entry: +entry.toFixed(2),
     stop: p?.ok ? p.stop : +(entry * 0.93).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
+    src: 'ai', kind: 'long',
+    planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
     addedAt: new Date().toISOString().slice(0, 10),
     // 進場情境快照 — 結案後檢討「當時憑什麼進場」的依據
     ctx: {
@@ -3450,6 +3592,150 @@ function addHolding(stockId) {
 function removeHolding(stockId) {
   saveHoldings(getHoldings().filter(h => h.id !== stockId));
   renderHoldings();
+}
+
+// ── 自行加入持倉（手動輸入：股票別／進場價／當沖或長線） ──────────────────
+function addManualHolding() {
+  const idEl = document.getElementById('mh-id');
+  const priceEl = document.getElementById('mh-price');
+  const kindEl = document.getElementById('mh-kind');
+  const id = (idEl?.value || '').trim();
+  const entry = parseFloat(priceEl?.value || '');
+  const kind = kindEl?.value === 'day' ? 'day' : 'long';
+  if (!/^\d{4,6}$/.test(id)) { showToast('請輸入 4~6 碼股票代號', 'error'); return; }
+  if (!isFinite(entry) || entry <= 0) { showToast('進場價格式不正確', 'error'); return; }
+  const holdings = getHoldings();
+  if (holdings.some(h => h.id === id)) { showToast('此股已在持倉清單中', 'info'); return; }
+
+  // 不在掃描清單的股票 → 自動加入自選股，下輪掃描即可取得分析資料
+  let addedToList = false;
+  const list = getStockList();
+  if (!list.find(x => x.id === id)) {
+    const full = list === DEFAULT_STOCKS ? [...DEFAULT_STOCKS] : list;
+    full.push({ id, name: id, sector: '自訂' });
+    localStorage.setItem('custom-stocks', JSON.stringify(full));
+    addedToList = true;
+  }
+
+  const s = allStocks.find(x => x.id === id);
+  const m = s?.analysis ? buildManagerAnalysis(s) : null;
+  const p = m ? buildEntryPlan(s, m) : null;
+  holdings.push({
+    id, name: s?.name || id, entry: +entry.toFixed(2),
+    // 停損：有進場計畫且其停損低於你的進場價就沿用；否則當沖 -3%、長線 -7%
+    stop: (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2),
+    t1: p?.ok && p.t1 ? p.t1 : null,
+    src: 'manual', kind,
+    planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
+    addedAt: new Date().toISOString().slice(0, 10),
+    ctx: s?.analysis ? {
+      score: s.analysis.score, rsi: s.analysis.rsi != null ? +s.analysis.rsi.toFixed(1) : null,
+      adx: s.analysis.adx != null ? +s.analysis.adx.toFixed(1) : null,
+      stance: m?.stance ?? null, agr: m ? +m.agr.toFixed(2) : null,
+      pctile: s.analysis.pctile?.zone ?? null,
+      sector: getStockList().find(x => x.id === id)?.sector ?? null,
+      mktNorm: Math.round(outlookData.norm ?? 0),
+      reasons: (m?.bull ?? []).slice(0, 3),
+      warns: (m?.bear ?? []).slice(0, 2),
+    } : null,
+  });
+  saveHoldings(holdings);
+  if (idEl) idEl.value = '';
+  if (priceEl) priceEl.value = '';
+  showToast(`已加入持倉：${s?.name || id}（${kind === 'day' ? '當沖單' : '長線單'}）${addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
+  renderHoldings();
+  if (s?.analysis) showHoldingView(id); // 立即顯示 AI 對此價位的看法
+  else if (addedToList) showToast('此股尚未掃描，下輪掃描後即可查看 AI 看法', 'info');
+}
+
+// ── 持倉檢視小頁面：AI 對此股與你的進場價的看法 ────────────────────────────
+function closeHoldingModal() {
+  const el = document.getElementById('holding-modal');
+  if (el) el.style.display = 'none';
+}
+
+function showHoldingView(stockId) {
+  const modal = document.getElementById('holding-modal');
+  const title = document.getElementById('holding-modal-title');
+  const body = document.getElementById('holding-modal-body');
+  if (!modal || !body) return;
+  const h = getHoldings().find(x => x.id === stockId);
+  if (!h) return;
+  const s = allStocks.find(x => x.id === stockId);
+  if (title) title.textContent = `${h.name}（${stockId}）${h.kind === 'day' ? '・當沖單' : '・長線單'}`;
+
+  if (!s?.analysis) {
+    body.innerHTML = `<div style="font-size:0.82rem;color:var(--text3);line-height:1.8">
+      此股尚未完成掃描分析。${getStockList().find(x => x.id === stockId) ? '請等待本輪掃描完成後再開啟。' : '已不在掃描清單，請至設定頁加入自選股。'}<br>
+      目前記錄：進場 ${h.entry}｜停損 ${h.stop}${h.t1 ? `｜目標 ${h.t1}` : ''}</div>`;
+    modal.style.display = 'flex';
+    return;
+  }
+
+  const a = s.analysis;
+  const price = a.price;
+  const m = buildManagerAnalysis(s);
+  const retPct = (price - h.entry) / h.entry * 100;
+  const ck = checkHoldingExit(h);
+
+  // 你的進場價位於什麼位置（相對支撐 / EMA20 / 現價）
+  const posNotes = [];
+  if (m?.sup) posNotes.push(h.entry >= m.sup ? `進場價高於支撐 ${m.sup}（支撐仍有效）` : `進場價已低於目前支撐 ${m.sup}`);
+  if (a.ema20) posNotes.push(h.entry <= a.ema20 * 1.02 ? `進場價貼近/低於 EMA20（${a.ema20.toFixed(2)}），非追高位` : `進場價高於 EMA20（${a.ema20.toFixed(2)}）約 ${((h.entry / a.ema20 - 1) * 100).toFixed(1)}%`);
+  if (h.planHi && h.entry > h.planHi) posNotes.push(`⚠ 進場價 ${h.entry} 高於當時建議區上緣 ${h.planHi}，屬追價進場`);
+
+  // 上方壓力位範圍（排除近 3 根 K 的自身高點，合併 <1% 重複區）
+  const highs = s.ohlcv.map(d => d.high);
+  const prior = highs.slice(0, -3);
+  const resSet = [];
+  for (const v of (calcSR(s.ohlcv).resistances || [])) if (v > price * 1.01) resSet.push({ v: +v.toFixed(2), why: '前波壓力區' });
+  const pHi20 = prior.length >= 20 ? Math.max(...prior.slice(-20)) : null;
+  const pHi60 = prior.length >= 60 ? Math.max(...prior.slice(-60)) : null;
+  if (pHi20 > price * 1.01) resSet.push({ v: +pHi20.toFixed(2), why: '前 20 日高點' });
+  if (pHi60 > price * 1.01) resSet.push({ v: +pHi60.toFixed(2), why: '前 3 個月高點' });
+  if (a.boll?.upper > price * 1.01) resSet.push({ v: +a.boll.upper.toFixed(2), why: '布林上軌' });
+  resSet.sort((x, y) => x.v - y.v);
+  const resMerged = [];
+  for (const r0 of resSet) {
+    const prev = resMerged[resMerged.length - 1];
+    if (prev && (r0.v - prev.v) / prev.v < 0.01) { prev.why += `／${r0.why}`; continue; }
+    resMerged.push({ ...r0 });
+  }
+
+  const stanceColor = m ? m.stanceColor : 'var(--text2)';
+  const retColor = retPct >= 0 ? 'var(--bull)' : 'var(--bear)';
+  const lvBadge = ck ? { exit: { t: '🔴 建議出場', c: 'var(--bear)' }, watch: { t: '🟡 留意', c: 'var(--yellow)' }, hold: { t: '🟢 續抱', c: 'var(--bull)' } }[ck.level] : null;
+
+  body.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+      <span style="font-size:0.82rem;font-weight:700;color:${stanceColor}">AI 研判：${m ? m.stance : '--'}</span>
+      ${m ? `<span style="font-size:0.72rem;color:var(--text3)">一致性 ${(m.agr * 100).toFixed(0)}%</span>` : ''}
+      ${lvBadge ? `<span style="font-size:0.72rem;font-weight:700;color:${lvBadge.c}">${lvBadge.t}</span>` : ''}
+      <span style="margin-left:auto;font-family:var(--mono);font-weight:800;color:${retColor}">${retPct >= 0 ? '+' : ''}${retPct.toFixed(2)}%</span>
+    </div>
+    <div style="font-size:0.74rem;color:var(--text3);font-family:var(--mono);margin-bottom:10px">
+      進場 ${h.entry}｜現價 ${price.toFixed(2)}｜停損 ${h.stop}（-${((h.entry - h.stop) / h.entry * 100).toFixed(1)}%）${h.t1 ? `｜目標 ${h.t1}` : ''}
+    </div>
+    ${posNotes.length ? `<div style="margin-bottom:10px"><div style="font-size:0.72rem;color:var(--text3);margin-bottom:4px">你的進場價位評估</div>
+      <div style="font-size:0.78rem;color:var(--text2);line-height:1.7">${posNotes.map(t => `・${t}`).join('<br>')}</div></div>` : ''}
+    <div style="margin-bottom:10px"><div style="font-size:0.72rem;color:var(--text3);margin-bottom:4px">🛑 止損價</div>
+      <div style="font-size:0.8rem;color:var(--text1);line-height:1.7">
+        目前設定 <b style="font-family:var(--mono)">${h.stop}</b>${m?.sup ? `；技術支撐位 ${m.sup}${a.ema20 ? `、EMA20 ${a.ema20.toFixed(2)}` : ''}` : ''}<br>
+        <span style="font-size:0.74rem;color:var(--text3)">${price <= h.stop ? '⚠ 現價已低於停損，建議立即處理' : `距現價 -${((price - h.stop) / price * 100).toFixed(1)}%，跌破代表進場邏輯失效`}</span>
+      </div></div>
+    <div style="margin-bottom:10px"><div style="font-size:0.72rem;color:var(--text3);margin-bottom:4px">⛰ 上方壓力位範圍</div>
+      ${resMerged.length ? `<div style="font-size:0.8rem;color:var(--text1);line-height:1.8">${resMerged.slice(0, 4).map(r0 =>
+        `<b style="font-family:var(--mono)">${r0.v}</b> <span style="font-size:0.72rem;color:var(--text3)">（${r0.why}，+${((r0.v / price - 1) * 100).toFixed(1)}%）</span>`).join('<br>')}</div>`
+        : '<div style="font-size:0.78rem;color:var(--bull)">上方無明顯壓力區 — 突破近期高點，可採移動停利續抱</div>'}</div>
+    ${ck ? `<div style="padding:9px 12px;border-radius:8px;background:rgba(255,255,255,0.03)">
+      <div style="font-size:0.72rem;color:var(--text3);margin-bottom:3px">AI 目前建議</div>
+      <div style="font-size:0.78rem;color:var(--text2);line-height:1.7">${ck.reasons.join('；')}${ck.trail ? `<br><span style="color:var(--text3);font-size:0.72rem">移動停利參考：${ck.trail}</span>` : ''}</div>
+    </div>` : ''}
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button class="btn-primary" style="padding:6px 16px;font-size:0.76rem" onclick="closeHoldingModal();closeHolding('${stockId}')">💰 已賣出（結案）</button>
+      <button class="btn-ghost" style="padding:6px 16px;font-size:0.76rem" onclick="closeHoldingModal();openStock('${stockId}')">查看完整分析</button>
+    </div>`;
+  modal.style.display = 'flex';
 }
 
 // 對單一持倉做出場研判
@@ -3493,25 +3779,29 @@ function checkHoldingExit(h) {
 function holdingsHTML() {
   const holdings = getHoldings();
   if (!holdings.length)
-    return '<p style="font-size:0.8rem;color:var(--text3)">尚無記錄。在個股分析頁按「📌 記錄我的持倉」即可加入，系統每輪掃描會自動檢查是否出現出場訊號。</p>';
-  const rows = holdings.map(checkHoldingExit).filter(Boolean);
-  if (!rows.length) return '<div class="adv-loading">等待掃描完成後評估持倉...</div>';
+    return '<p style="font-size:0.8rem;color:var(--text3)">尚無記錄。可在上方表單自行輸入持倉，或在個股分析頁按「📌 記錄我的持倉」，系統每輪掃描會自動檢查出場訊號。</p>';
+  // 未掃描到的股票（如剛加入的自選股）也要顯示，只是暫無 AI 評估
+  const rows = holdings.map(h => checkHoldingExit(h) ||
+    ({ h, price: null, retPct: null, level: 'hold', reasons: ['尚未取得分析資料，等待下輪掃描'], pending: true }));
 
   const badge = { exit: { t: '🔴 建議出場', c: 'var(--bear)' }, watch: { t: '🟡 留意', c: 'var(--yellow)' }, hold: { t: '🟢 續抱', c: 'var(--bull)' } };
   return rows.map(r => `
-    <div style="padding:10px 12px;border-radius:9px;background:${badge[r.level].c}0d;border-left:3px solid ${badge[r.level].c};margin-bottom:8px">
+    <div style="padding:10px 12px;border-radius:9px;background:${badge[r.level].c}0d;border-left:3px solid ${badge[r.level].c};margin-bottom:8px;cursor:pointer" onclick="showHoldingView('${r.h.id}')" title="點擊查看 AI 對此持倉的看法">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <strong style="font-size:0.86rem;cursor:pointer" onclick="openStock('${r.h.id}')">${r.h.name} <span style="color:var(--text3);font-size:0.74rem">${r.h.id}</span></strong>
-        <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${badge[r.level].t}</span>
-        <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${r.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%</span>
+        <strong style="font-size:0.86rem">${r.h.name} <span style="color:var(--text3);font-size:0.74rem">${r.h.id}</span></strong>
+        <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.07);color:var(--text2)">${r.h.kind === 'day' ? '當沖單' : '長線單'}</span>
+        <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:${r.h.src === 'manual' ? 'rgba(245,158,11,0.14)' : 'rgba(0,212,255,0.12)'};color:${r.h.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${r.h.src === 'manual' ? '自行購入' : 'AI 建議'}</span>
+        <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${r.pending ? '⏳ 待掃描' : badge[r.level].t}</span>
+        <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</span>
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
-        成本 ${r.h.entry}｜現價 ${r.price.toFixed(2)}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}
+        成本 ${r.h.entry}｜現價 ${r.price != null ? r.price.toFixed(2) : '--'}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}
       </div>
       <div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.6">${r.reasons.join('；')}</div>
       <div style="margin-top:7px;display:flex;gap:8px">
-        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem" onclick="closeHolding('${r.h.id}')">📒 結案（寫入交易紀錄）</button>
-        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem;color:var(--text3)" onclick="removeHolding('${r.h.id}')">移除（不記錄）</button>
+        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem" onclick="event.stopPropagation();closeHolding('${r.h.id}')">💰 已賣出</button>
+        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem" onclick="event.stopPropagation();showHoldingView('${r.h.id}')">🔍 AI 看法</button>
+        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem;color:var(--text3)" onclick="event.stopPropagation();removeHolding('${r.h.id}')">移除（不記錄）</button>
       </div>
     </div>`).join('');
 }
@@ -3786,11 +4076,18 @@ function renderJournalRecords() {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <strong style="font-size:0.86rem;cursor:pointer" onclick="openStock('${t.id}')">${t.name} <span style="color:var(--text3);font-size:0.72rem">${t.id}</span></strong>
         <span style="font-size:0.7rem;padding:1px 8px;border-radius:9px;background:${c}22;color:${c};font-weight:700">${t.reason}</span>
+        ${t.src ? `<span style="font-size:0.62rem;padding:1px 7px;border-radius:8px;background:${t.src === 'manual' ? 'rgba(245,158,11,0.14)' : 'rgba(0,212,255,0.12)'};color:${t.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${t.src === 'manual' ? '自行購入' : 'AI 建議'}</span>` : ''}
+        ${t.kind ? `<span style="font-size:0.62rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.07);color:var(--text2)">${t.kind === 'day' ? '當沖單' : '長線單'}</span>` : ''}
         <span style="margin-left:auto;font-family:var(--mono);font-weight:800;color:${c}">${win ? '+' : ''}${t.retPct}%</span>
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:4px;font-family:var(--mono)">
         ${t.entryDate} 進場 ${t.entry} → ${t.exitDate} 出場 ${t.exit}
+        ${t.stars ? `　<span style="color:var(--yellow);letter-spacing:1px">${'★'.repeat(t.stars)}${'☆'.repeat(5 - t.stars)}</span>` : ''}
       </div>
+      ${t.stars && t.stars < 3 && t.review?.length ? `<div style="margin-top:6px;padding:8px 11px;border-radius:8px;background:rgba(245,158,11,0.07);border-left:3px solid var(--yellow)">
+        <div style="font-size:0.7rem;font-weight:700;color:var(--yellow)">⚠ 評分低於 3 星 — 可改進重點</div>
+        <div style="font-size:0.74rem;color:var(--text2);margin-top:3px;line-height:1.7">${t.review.map(n => `・${n}`).join('<br>')}</div>
+      </div>` : ''}
       ${t.ctx ? `<div style="font-size:0.73rem;color:var(--text3);margin-top:5px;line-height:1.6">
         <span style="color:var(--text2)">進場時情境：</span>${t.ctx.stance ?? '--'}｜評分 ${t.ctx.score ?? '--'}｜RSI ${t.ctx.rsi ?? '--'}｜一致性 ${t.ctx.agr != null ? (t.ctx.agr * 100).toFixed(0) + '%' : '--'}｜大盤 ${t.ctx.mktNorm ?? '--'}
         ${t.ctx.reasons?.length ? `<br><span style="color:var(--bull)">當時看多：</span>${t.ctx.reasons.join('・')}` : ''}

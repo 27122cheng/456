@@ -67,10 +67,6 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
           交易總結
         </a>
-        <a class="nav-link" data-page="report" onclick="navigateTo('report')">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
-          預測準確度
-        </a>
         <a class="nav-link" data-page="settings" onclick="navigateTo('settings')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           設定
@@ -107,7 +103,6 @@
     <a class="mob-link" onclick="navigateTo('ranking');toggleMobileMenu()">市場排名</a>
     <a class="mob-link" onclick="navigateTo('holdings');toggleMobileMenu()">持有中</a>
     <a class="mob-link" onclick="navigateTo('journal');toggleMobileMenu()">交易總結</a>
-    <a class="mob-link" onclick="navigateTo('report');toggleMobileMenu()">預測準確度</a>
     <a class="mob-link" onclick="navigateTo('settings');toggleMobileMenu()">設定</a>
     <div class="mob-tf">
       <span class="mob-tf-label">時間週期</span>
@@ -658,6 +653,19 @@
         </div>
       </div>
       <div class="market-outlook-card" style="margin-bottom:16px">
+        <h3 style="font-size:0.9rem;font-weight:700">➕ 自行加入持倉</h3>
+        <span style="font-size:0.7rem;color:var(--text3)">輸入實際買進的股票，AI 會給出這個價格的看法、止損價與上方壓力區，並每輪檢查出場訊號</span>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+          <input type="text" id="mh-id" placeholder="股票代號（如 2330）" style="flex:1;min-width:120px;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.85rem" />
+          <input type="number" id="mh-price" placeholder="進場價" step="0.01" style="flex:1;min-width:100px;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.85rem" />
+          <select id="mh-kind" class="setting-select" style="min-width:96px">
+            <option value="long" selected>長線單</option>
+            <option value="day">當沖單</option>
+          </select>
+          <button class="btn-primary" style="padding:9px 18px" onclick="addManualHolding()">加入</button>
+        </div>
+      </div>
+      <div class="market-outlook-card" style="margin-bottom:16px">
         <h3 style="font-size:0.9rem;font-weight:700">📌 我的持倉</h3>
         <div id="holdings-page-body" style="margin-top:10px"><div class="adv-loading">等待掃描完成...</div></div>
       </div>
@@ -696,6 +704,15 @@
           <h3 style="font-size:0.9rem;font-weight:700" id="journal-period-title">📊 每月報告</h3>
           <div id="journal-stats-body" style="margin-top:10px"><div class="adv-loading">尚無已結案交易</div></div>
         </div>
+        <div class="market-outlook-card" style="margin-bottom:16px">
+          <h3 style="font-size:0.9rem;font-weight:700">🤖 AI 訊號成績單</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">每個推薦交易都自動紙上追蹤到停損/停利，統計實際勝率與止損原因 — AI 對自己誠實記分</span>
+          <div id="ai-signals-body" style="margin-top:10px"><div class="adv-loading">推薦訊號出現後自動開始追蹤</div></div>
+        </div>
+        <div class="market-outlook-card" style="margin-bottom:16px">
+          <h3 style="font-size:0.9rem;font-weight:700">🎯 大盤預測準確度</h3>
+          <div id="pred-acc-body" style="margin-top:10px"><div class="adv-loading">累積預測記錄中...</div></div>
+        </div>
         <div class="market-outlook-card">
           <h3 style="font-size:0.9rem;font-weight:700">🧠 教訓學習</h3>
           <span style="font-size:0.7rem;color:var(--text3)">從虧損交易的進場情境歸納重複犯的錯，並回饋到之後的進場建議</span>
@@ -710,28 +727,6 @@
           <div id="journal-records-body" style="margin-top:10px"><div class="adv-loading">尚無已結案交易</div></div>
         </div>
       </div>
-    </section>
-
-    <!-- ═══════════════════ AI 預測準確度頁面 ═══════════════════ -->
-    <section class="page" id="page-report">
-      <div class="page-header">
-        <div>
-          <h1 class="page-title">AI 預測準確度</h1>
-          <p class="page-subtitle">系統對自身多空判斷與選股推薦的誠實記分</p>
-        </div>
-      </div>
-
-      <!-- AI 預測準確度自我記分 -->
-      <div class="adv-section" style="margin-bottom:16px">
-        <div class="adv-section-hdr">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
-          AI 預測準確度
-          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">系統對自身預測的誠實記分</span>
-        </div>
-        <div class="adv-section-body" id="pred-acc-body"><div class="adv-loading">累積預測記錄中...</div></div>
-      </div>
-
-      
     </section>
 
     <!-- ═══════════════════ 設定頁面 ═══════════════════ -->
@@ -952,6 +947,17 @@
   <div class="toast-container" id="toast-container"></div>
 
   <!-- TradingView library -->
+  <!-- 持倉 AI 檢視小頁面 -->
+  <div id="holding-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:200;overflow-y:auto;padding:24px 12px" onclick="if(event.target===this)closeHoldingModal()">
+    <div style="max-width:560px;margin:0 auto;background:var(--card,#0d1220);border:1px solid rgba(0,212,255,0.2);border-radius:14px;padding:18px 18px 14px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <h3 id="holding-modal-title" style="font-size:0.95rem;font-weight:800">持倉檢視</h3>
+        <button class="del-trade-btn" onclick="closeHoldingModal()" style="font-size:1.1rem">×</button>
+      </div>
+      <div id="holding-modal-body" style="margin-top:10px"></div>
+    </div>
+  </div>
+
   <script src="js/indicators.js"></script>
   <script src="js/api.js"></script>
   <script src="js/app.js"></script>
