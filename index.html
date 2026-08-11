@@ -59,6 +59,14 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 7 13.5 15.5 8.5 10.5 1 18"/><polyline points="16 7 22 7 22 13"/></svg>
           個股分析
         </a>
+        <a class="nav-link" data-page="holdings" onclick="navigateTo('holdings')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7h-9M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+          持有中
+        </a>
+        <a class="nav-link" data-page="journal" onclick="navigateTo('journal')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          交易總結
+        </a>
         <a class="nav-link" data-page="report" onclick="navigateTo('report')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
           預測準確度
@@ -97,6 +105,8 @@
   <div class="mobile-drawer" id="mobile-drawer">
     <a class="mob-link" onclick="navigateTo('dashboard');toggleMobileMenu()">儀表板</a>
     <a class="mob-link" onclick="navigateTo('ranking');toggleMobileMenu()">市場排名</a>
+    <a class="mob-link" onclick="navigateTo('holdings');toggleMobileMenu()">持有中</a>
+    <a class="mob-link" onclick="navigateTo('journal');toggleMobileMenu()">交易總結</a>
     <a class="mob-link" onclick="navigateTo('report');toggleMobileMenu()">預測準確度</a>
     <a class="mob-link" onclick="navigateTo('settings');toggleMobileMenu()">設定</a>
     <div class="mob-tf">
@@ -381,6 +391,15 @@
         <div id="tv-chart-container" class="tv-chart"></div>
       </div>
 
+      <!-- 交易員視角 -->
+      <div class="market-outlook-card" style="margin-top:16px;border:1px solid rgba(0,212,255,0.15)">
+        <h3 style="font-size:0.92rem;font-weight:700;color:var(--text1);display:flex;align-items:center;gap:8px">
+          💼 交易員視角
+          <span style="font-size:0.68rem;font-weight:400;color:var(--text3)">綜合全部數據的專業判讀：注意事項・多空研判・操作模式</span>
+        </h3>
+        <div id="trader-view-body" style="margin-top:10px"><div class="adv-loading">彙整所有數據中...</div></div>
+      </div>
+
       <!-- 指標卡片 -->
       <div class="metrics-row">
         <div class="metric-card">
@@ -628,6 +647,69 @@
         </div>
       </div>
 
+    </section>
+
+    <!-- ═══════════════════ 持有中頁面 ═══════════════════ -->
+    <section class="page" id="page-holdings">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">持有中</h1>
+          <p class="page-subtitle">記錄實際持倉、每輪自動檢查出場訊號，並列出今日符合進場條件的推薦交易</p>
+        </div>
+      </div>
+      <div class="market-outlook-card" style="margin-bottom:16px">
+        <h3 style="font-size:0.9rem;font-weight:700">📌 我的持倉</h3>
+        <div id="holdings-page-body" style="margin-top:10px"><div class="adv-loading">等待掃描完成...</div></div>
+      </div>
+      <div class="market-outlook-card">
+        <h3 style="font-size:0.9rem;font-weight:700">🎯 今日推薦交易
+          <span style="font-size:0.68rem;font-weight:400;color:var(--text3);margin-left:6px">研判偏多 + 五維度綜合 ≥65 + 非追高 才會出現，寧缺勿濫</span></h3>
+        <div id="entry-signals-body" style="margin-top:10px"><div class="adv-loading">等待掃描完成...</div></div>
+      </div>
+    </section>
+
+    <!-- ═══════════════════ 交易總結頁面 ═══════════════════ -->
+    <section class="page" id="page-journal">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">交易總結</h1>
+          <p class="page-subtitle">績效報告與交易紀錄 — 記下每筆出場原因與教訓，讓之後的建議變得更好</p>
+        </div>
+        <div class="tf-group">
+          <button class="tf-btn active" id="jtab-summary" onclick="switchJournalTab('summary')">績效報告</button>
+          <button class="tf-btn" id="jtab-records" onclick="switchJournalTab('records')">交易紀錄</button>
+        </div>
+      </div>
+
+      <div id="journal-summary">
+        <div class="market-outlook-card" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+            <h3 style="font-size:0.9rem;font-weight:700">📈 帳戶成長曲線</h3>
+            <div class="tf-group">
+              <button class="tf-btn active" id="jp-month" onclick="switchJournalPeriod('month')">每月報告</button>
+              <button class="tf-btn" id="jp-year" onclick="switchJournalPeriod('year')">年度報告</button>
+            </div>
+          </div>
+          <div id="equity-chart" style="height:220px;margin-top:12px;background:#070b12;border-radius:10px"></div>
+        </div>
+        <div class="market-outlook-card" style="margin-bottom:16px">
+          <h3 style="font-size:0.9rem;font-weight:700" id="journal-period-title">📊 每月報告</h3>
+          <div id="journal-stats-body" style="margin-top:10px"><div class="adv-loading">尚無已結案交易</div></div>
+        </div>
+        <div class="market-outlook-card">
+          <h3 style="font-size:0.9rem;font-weight:700">🧠 教訓學習</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">從虧損交易的進場情境歸納重複犯的錯，並回饋到之後的進場建議</span>
+          <div id="journal-lessons-body" style="margin-top:10px"><div class="adv-loading">尚無資料</div></div>
+        </div>
+      </div>
+
+      <div id="journal-records" style="display:none">
+        <div class="market-outlook-card">
+          <h3 style="font-size:0.9rem;font-weight:700">📒 交易紀錄</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">每筆交易的出場原因與進場當下的情境快照。點「✎ 教訓」寫下你學到什麼</span>
+          <div id="journal-records-body" style="margin-top:10px"><div class="adv-loading">尚無已結案交易</div></div>
+        </div>
+      </div>
     </section>
 
     <!-- ═══════════════════ AI 預測準確度頁面 ═══════════════════ -->
