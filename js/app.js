@@ -237,6 +237,7 @@ async function runScan() {
   after('預測準確度', renderPredAccuracy);
   after('我的持倉', renderHoldings);
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
+  after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
   after('價格警報', checkAlerts);
   after('Telegram 推送', () => {
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
@@ -3432,6 +3433,141 @@ function renderAiSignals() {
         <span style="color:var(--text3);font-size:0.68rem">${t.exitReason}</span>
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${t.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${t.retPct >= 0 ? '+' : ''}${t.retPct}%</span>
       </div>`).join('')}`;
+}
+
+// ── 大戶動向偵測：大量買超/大單掛買 → 陷阱判斷 → Telegram ──────────────────
+// 「大量買入」以法人籌碼為準（買超量佔均量比、連續買超），盤中再輔以 MIS
+// 五檔委買掛單；每一筆偵測都先過陷阱檢查（誘多/出貨跡象），乾淨的才推送。
+
+let _whaleResults = [];
+
+function isMarketOpenTW() {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
+    const g = t => p.find(x => x.type === t)?.value;
+    const hm = +g('hour') * 60 + +g('minute');
+    return !['Sat', 'Sun'].includes(g('weekday')) && hm >= 540 && hm <= 810; // 09:00–13:30
+  } catch { return false; }
+}
+
+async function detectWhales() {
+  const ready = allStocks.filter(s => s.analysis && s.ohlcv?.length >= 20);
+  if (ready.length < 5) return;
+  const marketOpen = isMarketOpenTW();
+  const results = [];
+  let bookProbes = 0;
+
+  for (const s of ready) {
+    const a = s.analysis;
+    const bars = s.ohlcv;
+    const last = bars[bars.length - 1];
+    const vols = bars.map(b => b.volume);
+    const n = Math.min(20, vols.length - 1);
+    const avg20 = vols.slice(-n - 1, -1).reduce((x, y) => x + y, 0) / Math.max(1, n); // 股
+    const avgZ = avg20 / 1000; // 張
+    const net = (s.foreign ?? 0) + (s.investment ?? 0); // 張
+    const st = instStreak(s.id);
+
+    // ── 大量買入跡象（必須有法人籌碼證據，單純爆量不算大戶） ──
+    const sig = [];
+    if (net >= 500 && avgZ > 0 && net / avgZ >= 0.15)
+      sig.push(`法人買超 ${net.toLocaleString()} 張，約當近 20 日均量的 ${(net / avgZ * 100).toFixed(0)}%`);
+    else if (net >= 3000)
+      sig.push(`法人大量買超 ${net.toLocaleString()} 張`);
+    if (st?.dir > 0 && st.days >= 3)
+      sig.push(`法人連續 ${st.days} 日買超（累計 ${st.total.toLocaleString()} 張）`);
+    if (!sig.length) continue;
+    if (avg20 > 0 && last.volume >= avg20 * 2.2 && last.close > last.open)
+      sig.push(`今日量能為均量 ${(last.volume / avg20).toFixed(1)} 倍且收紅`);
+
+    // ── 盤中大單掛買（僅開盤時段；MIS 無五檔資料就跳過，偵測不到就算了） ──
+    let book = null;
+    if (marketOpen && bookProbes < 12) {
+      bookProbes++;
+      try {
+        const q = await fetchRealtimeQuote(s.id);
+        const bid = (q?.bidV || []).reduce((x, y) => x + y, 0);
+        const ask = (q?.askV || []).reduce((x, y) => x + y, 0);
+        if (bid && ask) {
+          book = { bid, ask, ratio: bid / ask, price: q.price, low: q.low };
+          if (bid >= ask * 2 && bid >= 300)
+            sig.push(`盤中五檔委買 ${bid.toLocaleString()} 張，為委賣的 ${(bid / ask).toFixed(1)} 倍（大單掛買）`);
+        }
+      } catch {}
+    }
+
+    // ── 陷阱判斷（誘多 / 拉高出貨跡象） ──
+    const m = buildManagerAnalysis(s);
+    const trap = [];
+    const range = last.high - last.low;
+    if (range > 0 && avg20 > 0 && last.volume >= avg20 * 2 && (last.high - Math.max(last.open, last.close)) / range >= 0.45)
+      trap.push('爆量收長上影線 — 高檔邊拉邊出，疑似出貨');
+    if (a.pctile?.zone === 'high' && a.rsi >= 75)
+      trap.push(`位於長期高位階且 RSI ${a.rsi.toFixed(0)} 過熱 — 此時的買超常是誘多`);
+    if (a.ema20 && last.close > a.ema20 * 1.12)
+      trap.push('股價乖離 EMA20 逾 12% — 短線過熱，大戶可能藉利多調節');
+    if (m && m.dir <= 0)
+      trap.push(`技術結構為「${m.stance}」— 買超與結構背離，可能是接刀或對倒`);
+    if (m?.oi?.dFin > 0 && avgZ > 0 && m.oi.dFin >= avgZ * 0.1)
+      trap.push(`融資單日大增 ${m.oi.dFin.toLocaleString()} 張 — 散戶跟風重，籌碼轉髒`);
+    if (s._alert?.level === 'punish') trap.push('處置股 — 分盤交易，流動性陷阱');
+    else if (s._alert) trap.push('注意股 — 波動異常已被交易所警示');
+    if (book && book.ratio >= 2 && book.price != null && book.low != null && book.price <= book.low * 1.005)
+      trap.push('大量掛買但股價貼盤中低點 — 掛單撐盤假象，慎防誘多掛單（掛單可隨時抽單）');
+
+    results.push({ s, m, sig, trap, book, net, mktBad: (outlookData.norm ?? 0) <= -15 });
+  }
+
+  results.sort((x, y) => y.net - x.net);
+  _whaleResults = results.slice(0, 10);
+  renderWhales();
+  notifyWhales();
+}
+
+function renderWhales() {
+  const el = document.getElementById('whale-body');
+  if (!el) return;
+  if (!_whaleResults.length) {
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">今日未偵測到大戶大量買入（法人買超佔均量 15% 以上或連 3 日買超）。掛單偵測僅盤中有效。</p>';
+    return;
+  }
+  el.innerHTML = _whaleResults.map(r => {
+    const clean = !r.trap.length;
+    const c = clean ? 'var(--bull)' : 'var(--yellow)';
+    return `
+    <div style="padding:10px 12px;border-radius:9px;background:${c}0a;border-left:3px solid ${c};margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:0.86rem;cursor:pointer" onclick="openStock('${r.s.id}')">${r.s.name} <span style="color:var(--text3);font-size:0.72rem">${r.s.id}</span></strong>
+        <span style="font-size:0.68rem;font-weight:700;color:${c}">${clean ? '✅ 陷阱檢查通過' : '⚠ 疑似陷阱，不推送'}</span>
+        ${r.m ? `<span style="margin-left:auto;font-size:0.7rem;color:${r.m.stanceColor}">${r.m.stance}</span>` : ''}
+      </div>
+      <div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.6">${r.sig.map(t => '・' + t).join('<br>')}</div>
+      ${r.trap.length ? `<div style="font-size:0.73rem;color:var(--yellow);margin-top:4px;line-height:1.6">${r.trap.map(t => '⚠ ' + t).join('<br>')}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// 通過陷阱檢查的大戶訊號 → Telegram（每檔每日一次），附交易分析
+function notifyWhales() {
+  if (!tgWants('sig')) return;
+  const today = new Date().toISOString().slice(0, 10);
+  let sent;
+  try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
+  if (sent.date !== today) sent = { date: today, ids: [] };
+  const clean = _whaleResults.filter(r => !r.trap.length && !sent.ids.includes(r.s.id));
+  if (!clean.length) return;
+
+  for (const r of clean.slice(0, 3)) {
+    const p = r.m ? buildEntryPlan(r.s, r.m) : null;
+    const anal = [
+      `研判：${r.m ? `${r.m.stance}（一致性 ${(r.m.agr * 100).toFixed(0)}%）` : '--'}`,
+      p?.ok ? `進場參考 ${p.lo} ~ ${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）｜${p.holdOn ? '上方無壓力，續抱看待' : `目標 ${p.t1}`}` : (p?.why ? `暫不建議進場：${p.why}` : ''),
+      r.mktBad ? '⚠ 大盤目前偏空，部位宜保守' : '',
+    ].filter(Boolean).join('\n');
+    tgPush(`🐋 大戶動向：${r.s.name}(${r.s.id})\n\n${r.sig.map(t => '・' + t).join('\n')}\n\n陷阱檢查：未發現誘多/出貨跡象 ✅\n\n📋 交易分析\n${anal}\n\n⚠ 僅供參考，非投資建議`);
+    sent.ids.push(r.s.id);
+  }
+  localStorage.setItem('whale-tg', JSON.stringify(sent));
 }
 
 // ── 交易紀錄（結案後的檢討資料庫）───────────────────────────────────────────
