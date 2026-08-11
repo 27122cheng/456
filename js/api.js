@@ -373,6 +373,55 @@ async function fetchTWSEHistory(stockId, months = 14) {
   return bars;
 }
 
+// 上櫃個股官方日線（櫃買中心 tradingStock 按月版）— 上櫃股在 Yahoo 限流時的唯一備援
+// 欄位：日期,成交仟股,成交仟元,開盤,最高,最低,收盤,漲跌,筆數（成交量單位為仟股 → ×1000 換算成股）
+async function fetchTPExMonth(stockId, year, month) {
+  const ym = `${year}${String(month).padStart(2, '0')}`;
+  const key = `cache:td:${stockId}:${ym}`;
+  const now = new Date();
+  const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
+  const cached = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const url = `https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=${stockId}&date=${year}/${String(month).padStart(2, '0')}/01&response=json`;
+  const j = await proxyFetch(url, 7000).catch(() => null);
+  // 新版 RWD 回 tables[0].data；舊版回 aaData — 兩種都接
+  const rows = j?.tables?.[0]?.data || j?.aaData || j?.data || null;
+  if (!rows?.length) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const bars = rows.map(r => {
+    const time = rocToISO(r[0]);
+    const close = num(r[6]);
+    if (!time || close == null) return null;
+    return { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
+             low: num(r[5]) ?? close, close, volume: (num(r[1]) ?? 0) * 1000 };
+  }).filter(Boolean);
+  if (!bars.length) return null;
+  cacheSet(key, bars);
+  return bars;
+}
+
+async function fetchTPExHistory(stockId, months = 14) {
+  const now = new Date();
+  const reqs = [];
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    reqs.push(fetchTPExMonth(stockId, d.getFullYear(), d.getMonth() + 1));
+  }
+  const parts = await Promise.all(reqs.map(p => p.catch(() => null)));
+  const seen = new Set();
+  const bars = [];
+  for (const part of parts) {
+    for (const b of part || []) {
+      if (seen.has(b.time)) continue;
+      seen.add(b.time);
+      bars.push(b);
+    }
+  }
+  bars.sort((a, b) => a.time.localeCompare(b.time));
+  return bars;
+}
+
 // 加權指數官方日線歷史（FMTQIK 按月版）— 供 Beta／相關性／相對強弱計算
 // 欄位：日期,成交股數,成交金額,成交筆數,發行量加權股價指數,漲跌點數
 async function fetchTWIIMonth(year, month) {
@@ -480,6 +529,7 @@ function yahooSymbol(stockId) {
 let _dayAllResolved = null;
 
 const _ohlcvInflight = new Map(); // 同一檔同時被多處請求時只發一次
+const ohlcvFailReason = {};       // 掃描失敗原因（stockId → 說明文字），供 UI 呈現
 
 async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
   const ikey = `${stockId}:${interval}:${range}`;
@@ -500,9 +550,31 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
         ohlcv = two;
       }
     }
-    // Yahoo 全掛時改用證交所官方日線（已證實可通），確保技術分析不中斷
+    // Yahoo 全掛時改用官方日線，確保技術分析不中斷：
+    // 上市走證交所 STOCK_DAY、上櫃走櫃買中心 tradingStock（先前只有上市備援 →
+    // Yahoo 被限流時上櫃自選股整檔掃不出來）。市場別確認一次後記住，下次直接走對的來源。
     if (!ohlcv.length && interval === '1d') {
-      ohlcv = await fetchTWSEHistory(stockId).catch(() => []);
+      const mkt = localStorage.getItem(`mkt:${stockId}`);
+      const tpexFirst = mkt === 'tpex' || knownSuffix === 'TWO';
+      const trySrc = tpexFirst
+        ? [['tpex', fetchTPExHistory], ['twse', fetchTWSEHistory]]
+        : [['twse', fetchTWSEHistory], ['tpex', fetchTPExHistory]];
+      for (const [name, fn] of trySrc) {
+        ohlcv = await fn(stockId).catch(() => []);
+        if (ohlcv.length) {
+          localStorage.setItem(`mkt:${stockId}`, name);
+          if (name === 'tpex') localStorage.setItem(suffixKey, 'TWO');
+          break;
+        }
+      }
+    }
+    // 記錄失敗原因，供掃描結果與個股頁說明「為什麼掃不出來」
+    if (!ohlcv.length && interval === '1d') {
+      ohlcvFailReason[stockId] = srcDead('yahoo')
+        ? 'Yahoo 行情被限流，且上市（證交所）與上櫃（櫃買中心）官方歷史日 K 均查無此代號 — 可能是興櫃、新上市未滿月或已下市股票，暫無日 K 可分析'
+        : 'Yahoo 與上市/上櫃官方歷史日 K 均查無此代號 — 請確認代號是否正確（興櫃與已下市股票無官方日 K）';
+    } else if (ohlcv.length) {
+      delete ohlcvFailReason[stockId];
     }
     // 日線：若官方當日行情「已就緒」才刷新最後一根 K 棒；尚未就緒就直接回傳，
     // 絕不等待（過去每檔都 await 全市場行情 → 整站卡死的主因）

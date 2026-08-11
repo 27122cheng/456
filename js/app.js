@@ -205,7 +205,8 @@ async function runScan() {
         const dayAll = await fetchTWDayAll();
         still.forEach(s => { if (dayAll?.[s.id]) s.official = dayAll[s.id]; });
       } catch {}
-      showToast(`⚠ ${still.length} 檔歷史資料載入失敗：${still.slice(0, 5).map(x => x.name).join('、')}${still.length > 5 ? '…' : ''}（價格改用官方行情，下輪自動重試）`, 'error');
+      const why = ohlcvFailReason[still[0].id];
+      showToast(`⚠ ${still.length} 檔歷史資料載入失敗：${still.slice(0, 5).map(x => x.name).join('、')}${still.length > 5 ? '…' : ''}${why ? `。原因：${why}` : '（價格改用官方行情，下輪自動重試）'}`, 'error');
     }
   }
 
@@ -1722,9 +1723,10 @@ async function openStock(stockId) {
       document.getElementById('stock-price').textContent = '無法載入';
     }
     const aab = document.getElementById('ai-anal-body');
+    const failWhy = (typeof ohlcvFailReason !== 'undefined' && ohlcvFailReason[stockId]) || null;
     if (aab) aab.innerHTML = `<div class="adv-loading">${q?.close
       ? '價格為官方當日行情（TWSE/TPEx）。歷史 K 線暫時無法取得，技術分析與圖表稍後重試。'
-      : '個股資料載入失敗（資料來源逾時，或代號不存在/已下市）'}<br>
+      : '個股資料載入失敗（資料來源逾時，或代號不存在/已下市）'}${failWhy ? `<br><span style="color:var(--yellow);font-size:0.78rem">診斷：${failWhy}</span>` : ''}<br>
       <button class="btn-ghost" style="margin-top:10px;padding:6px 16px" onclick="openStock('${stockId}')">🔄 重新載入</button></div>`;
     return;
   }
@@ -3246,6 +3248,12 @@ async function runDiagnostics() {
         const b = await fetchTWSEHistory('2330', 2);
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
                          : { ok: false, msg: '無資料' };
+      } },
+    { name: '櫃買日線備援 (tradingStock)', run: async () => {
+        // 5483 中美晶為上櫃指標股 — 此項失敗代表上櫃自選股在 Yahoo 限流時會掃不出來
+        const b = await fetchTPExHistory('5483', 2);
+        return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
+                         : { ok: false, msg: '無資料（上櫃股將只剩 Yahoo 來源）' };
       } },
   ];
   // 先清除熔斷與記憶體快取，否則測到的是「先前失敗的紀錄」而非資料源真實狀態
