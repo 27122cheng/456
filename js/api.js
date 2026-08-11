@@ -1091,12 +1091,15 @@ async function fetchRealtimeQuote(stockId) {
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
   const price = num(m.z) ?? num(m.b?.split('_')[0]) ?? num(m.a?.split('_')[0]);
   if (price == null) return null;
+  const nums = v => String(v || '').split('_').map(num).filter(x => x != null);
   return {
     price, open: num(m.o), high: num(m.h), low: num(m.l),
     cumVol: num(m.v) ?? 0,       // 當日累積成交量（張）
     time: String(m.t || ''),      // HH:MM:SS
     date: String(m.d || ''),      // YYYYMMDD
     name: m.n,
+    // 五檔掛單（張）— 供大戶掛單偵測；收盤後 MIS 可能回空
+    bidP: nums(m.b), bidV: nums(m.g), askP: nums(m.a), askV: nums(m.f),
   };
 }
 
