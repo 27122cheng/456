@@ -431,6 +431,48 @@ function lightScore(bars) {
   return { score, signal };
 }
 
+// ── 多空力道對比：上漲日與下跌日的量能結構 ─────────────────────────────────
+// 同樣的均量，若集中在上漲日代表買方主導；集中在下跌日則是賣壓宣洩。
+function volumeForce(ohlcv, lookback = 20) {
+  if (!ohlcv || ohlcv.length < lookback + 1) return null;
+  const seg = ohlcv.slice(-lookback);
+  let upVol = 0, dnVol = 0, upDays = 0, dnDays = 0;
+  for (let i = 1; i < seg.length; i++) {
+    const v = seg[i].volume || 0;
+    if (seg[i].close > seg[i-1].close) { upVol += v; upDays++; }
+    else if (seg[i].close < seg[i-1].close) { dnVol += v; dnDays++; }
+  }
+  const total = upVol + dnVol;
+  if (!total) return null;
+  const buyPct = upVol / total * 100;
+  const avgUp = upDays ? upVol / upDays : 0;
+  const avgDn = dnDays ? dnVol / dnDays : 0;
+  const ratio = avgDn > 0 ? avgUp / avgDn : null;
+  let txt, dir;
+  if (buyPct >= 60) { dir = 1; txt = `近${lookback}日成交量有 ${buyPct.toFixed(0)}% 集中在上漲日，買方主導明顯`; }
+  else if (buyPct <= 40) { dir = -1; txt = `近${lookback}日成交量有 ${(100-buyPct).toFixed(0)}% 集中在下跌日，賣壓主導`; }
+  else { dir = 0; txt = `上漲日與下跌日量能相當（買方 ${buyPct.toFixed(0)}%），多空拉鋸`; }
+  return { buyPct: +buyPct.toFixed(1), ratio: ratio ? +ratio.toFixed(2) : null, upDays, dnDays, dir, txt };
+}
+
+// ── 價格位階：現價位於歷史區間的百分位 ───────────────────────────────────────
+function pricePercentile(ohlcv, lookback = 250) {
+  if (!ohlcv || ohlcv.length < 40) return null;
+  const seg = ohlcv.slice(-lookback).map(d => d.close);
+  const price = seg[seg.length - 1];
+  const below = seg.filter(c => c < price).length;
+  const pct = below / seg.length * 100;
+  const days = seg.length;
+  let zone, txt;
+  if (pct >= 90) { zone = 'high'; txt = `位於近${days}日區間的高檔 ${pct.toFixed(0)}% 位階，追高需留意回檔風險`; }
+  else if (pct >= 70) { zone = 'upper'; txt = `位於近${days}日區間偏高的 ${pct.toFixed(0)}% 位階`; }
+  else if (pct <= 10) { zone = 'low'; txt = `位於近${days}日區間的低檔 ${pct.toFixed(0)}% 位階，接近長期底部區`; }
+  else if (pct <= 30) { zone = 'lower'; txt = `位於近${days}日區間偏低的 ${pct.toFixed(0)}% 位階`; }
+  else { zone = 'mid'; txt = `位於近${days}日區間中段 ${pct.toFixed(0)}% 位階`; }
+  return { pct: +pct.toFixed(0), zone, days, txt,
+           hi: +Math.max(...seg).toFixed(2), lo: +Math.min(...seg).toFixed(2) };
+}
+
 // ── Master Score & Signal ─────────────────────────────────────────────────
 
 function calculateScore(ohlcv) {
@@ -463,6 +505,8 @@ function calculateScore(ohlcv) {
   const fib = fibLevels(ohlcv);
   const risk = riskMetrics(ohlcv);
   const vpRegime = volumePriceRegime(ohlcv);
+  const vForce = volumeForce(ohlcv);
+  const pctile = pricePercentile(ohlcv);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -560,6 +604,12 @@ function calculateScore(ohlcv) {
   // 量價關係
   if (vpRegime?.dir === 1) score += 2;
   else if (vpRegime?.dir === -1) score -= 2;
+  // 多空力道：量能集中在上漲日或下跌日
+  if (vForce?.dir === 1) { score += 3; reasons.push(`量能 ${vForce.buyPct}% 集中在上漲日`); }
+  else if (vForce?.dir === -1) { score -= 3; reasons.push('量能集中在下跌日'); }
+  // 價格位階：極端高檔追價風險、極端低檔具反彈空間
+  if (pctile?.zone === 'high') score -= 3;
+  else if (pctile?.zone === 'low') score += 2;
 
   score = Math.max(0, Math.min(100, Math.round(score)));
 
@@ -574,7 +624,7 @@ function calculateScore(ohlcv) {
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
            diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
-           price, prevClose, lastVol };
+           vForce, pctile, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────

@@ -114,6 +114,19 @@ async function runScan() {
   fetchRevenueAll().then(m => {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s.rev = m[s.id]; });
+    // 逐月累積營收歷史，供「成長動能加速/減速」判斷（官方僅提供最新月）
+    try {
+      const h = JSON.parse(localStorage.getItem('rev-hist') || '{}');
+      allStocks.forEach(s => {
+        const r = m[s.id];
+        if (!r?.ym) return;
+        const arr = h[s.id] = h[s.id] || [];
+        if (!arr.some(x => x.ym === r.ym)) arr.push({ ym: r.ym, yoy: r.yoy, mom: r.mom });
+        arr.sort((a, b) => String(a.ym).localeCompare(String(b.ym)));
+        h[s.id] = arr.slice(-24);
+      });
+      localStorage.setItem('rev-hist', JSON.stringify(h));
+    } catch {}
     renderFocusStocks();
   }).catch(() => {});
   fetchFinancialsAll().then(m => {
@@ -819,7 +832,8 @@ async function loadInstitutionalOverview() {
       const m = instMap[s.id];
       if (!m) return;
       const arr = hist[s.id] = hist[s.id] || [];
-      if (!arr.some(r => r.d === dataDate)) arr.push({ d: dataDate, f: m.foreign, i: m.investment, dl: m.dealer });
+      if (!arr.some(r => r.d === dataDate))
+        arr.push({ d: dataDate, f: m.foreign, i: m.investment, dl: m.dealer, p: s.analysis?.price ?? null });
       if (arr.length > 10) hist[s.id] = arr.slice(-10);
     });
     localStorage.setItem('inst-hist', JSON.stringify(hist));
@@ -980,6 +994,95 @@ function instStreak(stockId) {
   return { dir, days, total };
 }
 
+// ── 同業比較：產業內相對強度 ────────────────────────────────────────────────
+// 先前 sector 欄位只用來顯示標籤，從未拿來比較 —— 但「同產業中誰最強」
+// 才是選股的核心：整個產業都漲時個股上漲不算本事，逆勢抗跌才是。
+function sectorComparison(stockId) {
+  const meta = getStockList();
+  const me = meta.find(m => m.id === stockId);
+  if (!me?.sector) return null;
+  const peers = allStocks.filter(s => {
+    const m = meta.find(x => x.id === s.id);
+    return m?.sector === me.sector && s.analysis && s.ohlcv?.length >= 21;
+  });
+  if (peers.length < 2) return null;
+
+  const ret20 = s => {
+    const c = s.ohlcv.map(d => d.close);
+    return c.length >= 21 ? (c[c.length-1] - c[c.length-21]) / c[c.length-21] * 100 : 0;
+  };
+  const rows = peers.map(s => ({
+    id: s.id, name: s.name, score: s.analysis.score, ret: ret20(s),
+    foreign: s.foreign ?? null,
+  })).sort((a, b) => b.score - a.score);
+
+  const rank = rows.findIndex(r => r.id === stockId) + 1;
+  const avgRet = rows.reduce((n, r) => n + r.ret, 0) / rows.length;
+  const avgScore = rows.reduce((n, r) => n + r.score, 0) / rows.length;
+  const mine = rows.find(r => r.id === stockId);
+  if (!mine) return null;
+  const excess = mine.ret - avgRet;
+
+  let txt;
+  if (rank === 1) txt = `${me.sector}族群中評分最高（共 ${rows.length} 檔），為族群領頭羊`;
+  else if (rank <= Math.ceil(rows.length / 3)) txt = `${me.sector}族群中排名第 ${rank}／${rows.length}，屬前段班`;
+  else if (rank > rows.length * 0.66) txt = `${me.sector}族群中排名第 ${rank}／${rows.length}，落後同業`;
+  else txt = `${me.sector}族群中排名第 ${rank}／${rows.length}，位居中段`;
+
+  return {
+    sector: me.sector, rank, total: rows.length, rows: rows.slice(0, 6),
+    excess: +excess.toFixed(1), avgRet: +avgRet.toFixed(1), avgScore: Math.round(avgScore),
+    myRet: +mine.ret.toFixed(1), txt,
+    // 族群整體是否走強 —— 個股再好，逆族群趨勢也吃力
+    sectorTrend: avgRet > 3 ? 'strong' : avgRet < -3 ? 'weak' : 'flat',
+  };
+}
+
+// ── 法人成本估算 ────────────────────────────────────────────────────────────
+// 用逐日累積的法人買賣超 × 當日收盤，估算法人的加權平均成本。
+// 現價低於法人成本 = 法人套牢（有解套賣壓）；高於則法人獲利（有支撐動機）。
+function institutionalCost(stockId) {
+  let hist = [];
+  try { hist = JSON.parse(localStorage.getItem('inst-hist') || '{}')[stockId] || []; } catch {}
+  const withPrice = hist.filter(r => r.p > 0 && (r.f + r.i + r.dl) > 0);
+  if (withPrice.length < 3) return null;
+  let qty = 0, cost = 0;
+  for (const r of withPrice) {
+    const net = r.f + r.i + r.dl;
+    qty += net; cost += net * r.p;
+  }
+  if (qty <= 0) return null;
+  const avg = cost / qty;
+  const s = allStocks.find(x => x.id === stockId);
+  const price = s?.analysis?.price;
+  if (!price) return null;
+  const diff = (price - avg) / avg * 100;
+  return {
+    avg: +avg.toFixed(2), days: withPrice.length, qty,
+    diff: +diff.toFixed(1),
+    txt: diff >= 3 ? `現價高於法人估算成本 ${avg.toFixed(2)} 約 ${diff.toFixed(1)}%，法人處於獲利狀態，回檔時有護盤動機`
+       : diff <= -3 ? `現價低於法人估算成本 ${avg.toFixed(2)} 約 ${Math.abs(diff).toFixed(1)}%，法人套牢中，反彈至成本區恐有解套賣壓`
+       : `現價貼近法人估算成本 ${avg.toFixed(2)}，此區為多空成本交界，突破與否具指標意義`,
+    dir: diff >= 3 ? 1 : diff <= -3 ? -1 : 0,
+  };
+}
+
+// ── 營收動能加速度：YoY 是在改善還是惡化 ────────────────────────────────────
+// 單看本月 YoY 不夠 —— 從 +30% 掉到 +10% 是減速，從 -20% 回到 -5% 是改善。
+function revenueMomentum(stockId) {
+  let hist = [];
+  try { hist = JSON.parse(localStorage.getItem('rev-hist') || '{}')[stockId] || []; } catch {}
+  if (hist.length < 2) return null;
+  const last = hist[hist.length - 1], prev = hist[hist.length - 2];
+  if (last.yoy == null || prev.yoy == null) return null;
+  const delta = last.yoy - prev.yoy;
+  let dir, txt;
+  if (delta >= 10) { dir = 1; txt = `營收年增率由 ${prev.yoy.toFixed(1)}% 加速至 ${last.yoy.toFixed(1)}%，成長動能轉強`; }
+  else if (delta <= -10) { dir = -1; txt = `營收年增率由 ${prev.yoy.toFixed(1)}% 減速至 ${last.yoy.toFixed(1)}%，成長動能轉弱`; }
+  else { dir = 0; txt = `營收年增率由 ${prev.yoy.toFixed(1)}% 變為 ${last.yoy.toFixed(1)}%，動能大致持平`; }
+  return { delta: +delta.toFixed(1), cur: last.yoy, prev: prev.yoy, months: hist.length, dir, txt };
+}
+
 // ── 資深股票經理人研判引擎 ───────────────────────────────────────────────────
 // 綜合技術、趨勢強度、動能、量能、法人籌碼、融資融券 O.I、多週期、波動、
 // 相對位置，輸出一位資深操盤手的完整決策：方向、當沖適配、進出場點位、
@@ -1115,6 +1218,39 @@ function buildManagerAnalysis(s) {
     else notes.push(`${a.vpRegime.k}：${a.vpRegime.txt}`);
   }
   if (a.risk?.mdd <= -30) notes.push(`近半年最大回撤 ${a.risk.mdd}%，屬高波動標的`);
+  if (a.vForce?.dir === 1) add(0.8, 1, a.vForce.txt);
+  else if (a.vForce?.dir === -1) add(0.8, -1, a.vForce.txt);
+  if (a.pctile?.zone === 'high') add(0.6, -1, a.pctile.txt);
+  else if (a.pctile?.zone === 'low') add(0.5, 1, a.pctile.txt);
+  else if (a.pctile) notes.push(a.pctile.txt);
+
+  // 同業比較：領先族群才是真強勢，落後族群代表資金不青睞
+  const sec = sectorComparison(s.id);
+  if (sec) {
+    if (sec.rank === 1 && sec.total >= 3) add(1, 1, `${sec.sector}族群評分第一，為領頭羊`);
+    else if (sec.rank <= Math.ceil(sec.total / 3)) add(0.6, 1, `${sec.sector}族群前段班（第 ${sec.rank}／${sec.total}）`);
+    else if (sec.rank > sec.total * 0.66) add(0.8, -1, `${sec.sector}族群落後（第 ${sec.rank}／${sec.total}）`);
+    if (sec.excess > 5) add(0.6, 1, `20日報酬超越同業平均 ${sec.excess.toFixed(1)}%`);
+    else if (sec.excess < -5) add(0.6, -1, `20日報酬落後同業平均 ${Math.abs(sec.excess).toFixed(1)}%`);
+    if (sec.sectorTrend === 'weak') notes.push(`${sec.sector}族群整體走弱（平均 ${sec.avgRet}%），逆勢做多較吃力`);
+    else if (sec.sectorTrend === 'strong') notes.push(`${sec.sector}族群整體走強（平均 +${sec.avgRet}%），資金聚焦此類股`);
+  }
+
+  // 法人成本：現價相對法人平均成本的位置
+  const icost = institutionalCost(s.id);
+  if (icost) {
+    if (icost.dir === 1) add(0.7, 1, icost.txt);
+    else if (icost.dir === -1) add(0.9, -1, icost.txt);
+    else notes.push(icost.txt);
+  }
+
+  // 營收動能加速度
+  const rmom = revenueMomentum(s.id);
+  if (rmom) {
+    if (rmom.dir === 1) add(1, 1, rmom.txt);
+    else if (rmom.dir === -1) add(1, -1, rmom.txt);
+    else notes.push(rmom.txt);
+  }
 
   // ⑦ 多週期一致性
   let mtfAligned = null;
@@ -1363,6 +1499,18 @@ function buildEntryPlan(s, m) {
   // 續抱時的移動停利基準（隨股價墊高，鎖住獲利）
   const trail = +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2);
 
+  // 部位規模：依「單筆最多虧損總資金 2%」與停損距離反推可買張數
+  const capital = parseFloat(localStorage.getItem('capital') || '1000000');
+  const riskPerShare = lo - stop;
+  const maxLossAmt = capital * 0.02;
+  const shares = riskPerShare > 0 ? Math.floor(maxLossAmt / riskPerShare / 1000) : 0;
+  const posValue = shares * 1000 * lo;
+  const sizing = shares > 0 ? {
+    shares, capital, posValue,
+    posPct: +(posValue / capital * 100).toFixed(1),
+    maxLoss: Math.round(shares * 1000 * riskPerShare),
+  } : null;
+
   const rrVal = r > 0 && t1 ? (t1 - lo) / r : null;
   // 風報比低於 1.5 的交易長期期望值差，明確標示而非默默給建議
   const rrWarn = (!holdOn && rrVal != null && rrVal < 1.5)
@@ -1370,7 +1518,7 @@ function buildEntryPlan(s, m) {
     : null;
 
   return {
-    ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn,
+    ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn, sizing,
     conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
     rewardPct2: t2 ? (t2 - lo) / lo * 100 : null,
@@ -1434,6 +1582,12 @@ function entryPlanHtml(s, m) {
         <span>參考持有 ${p.horizon}</span>
       </div>
       ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
+      ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
+        📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險上限 2% 計算，
+        可買 <strong style="color:var(--blue)">${p.sizing.shares} 張</strong>（約 ${(p.sizing.posValue/10000).toFixed(1)} 萬，佔 ${p.sizing.posPct}% 資金）；
+        若觸及停損，最大虧損約 <strong style="color:var(--bear)">${p.sizing.maxLoss.toLocaleString()} 元</strong>。
+        <span style="color:var(--text3);font-size:0.72rem">（可於設定頁調整資金規模）</span>
+      </div>` : ''}
 
       <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
         <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">📊 進場依據</div>
@@ -1484,7 +1638,7 @@ async function openStock(stockId) {
   document.getElementById('stock-change').textContent = 'TWD';
 
   // Reset sections
-  ['inst-body','setup-body','mtf-body','fund-body','chip-body','oi-body','pattern-body','sr-body','mkt-body','ind-body','ai-anal-body','situation-body','of-body','vp-body'].forEach(id => {
+  ['inst-body','setup-body','mtf-body','fund-body','chip-body','oi-body','pattern-body','peer-body','sr-body','mkt-body','ind-body','ai-anal-body','situation-body','of-body','vp-body'].forEach(id => {
     const e = document.getElementById(id); if (e) e.innerHTML = '<div class="adv-loading">載入中...</div>';
   });
   const frb = document.getElementById('full-risk-body'); if (frb) frb.innerHTML = '';
@@ -1531,6 +1685,7 @@ async function openStock(stockId) {
   s._mtf = null; s._oi = null;
   renderStockDetail(s);
   renderPatterns(s);
+  renderPeers(s);
   renderAnalysisPanels(s, null);
   renderSituation(s, null);
   renderOrderFlow(s);
@@ -1574,6 +1729,39 @@ async function openStock(stockId) {
 }
 
 // ── 未平倉部位 O.I（融資融券餘額）───────────────────────────────────────────
+// ── 同業比較面板 ───────────────────────────────────────────────────────────
+function renderPeers(s) {
+  const el = document.getElementById('peer-body');
+  if (!el) return;
+  const c = sectorComparison(s.id);
+  if (!c) { el.innerHTML = '<p style="color:var(--text3);font-size:0.85rem">同產業可比較個股不足（需股票池中至少 2 檔同業）</p>'; return; }
+
+  const trendTxt = { strong: { t: '族群走強', c: 'var(--bull)' }, weak: { t: '族群走弱', c: 'var(--bear)' }, flat: { t: '族群持平', c: 'var(--yellow)' } }[c.sectorTrend];
+  const rankColor = c.rank === 1 ? 'var(--bull)' : c.rank <= Math.ceil(c.total / 3) ? 'var(--blue)' : c.rank > c.total * 0.66 ? 'var(--bear)' : 'var(--text2)';
+
+  el.innerHTML = `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+      <strong style="font-size:0.9rem">${c.sector}</strong>
+      <span style="font-size:0.8rem;color:${rankColor};font-weight:700">族群排名 ${c.rank} / ${c.total}</span>
+      <span style="font-size:0.72rem;padding:2px 9px;border-radius:10px;background:${trendTxt.c}22;color:${trendTxt.c}">${trendTxt.t} ${c.avgRet >= 0 ? '+' : ''}${c.avgRet}%</span>
+    </div>
+    <div style="font-size:0.8rem;color:var(--text2);margin-bottom:10px;line-height:1.6">${c.txt}。
+      本股 20 日報酬 <strong style="color:${c.myRet >= 0 ? 'var(--bull)' : 'var(--bear)'}">${c.myRet >= 0 ? '+' : ''}${c.myRet}%</strong>，
+      ${c.excess >= 0 ? '超越' : '落後'}同業平均 <strong style="color:${c.excess >= 0 ? 'var(--bull)' : 'var(--bear)'}">${Math.abs(c.excess)}%</strong>。</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.76rem">
+      <thead><tr style="color:var(--text3);font-size:0.68rem;text-align:left">
+        <th style="padding:3px 6px">同業</th><th style="padding:3px 6px;text-align:right">評分</th>
+        <th style="padding:3px 6px;text-align:right">20日報酬</th><th style="padding:3px 6px;text-align:right">外資</th>
+      </tr></thead>
+      <tbody>${c.rows.map(r => `<tr style="${r.id === s.id ? 'background:rgba(0,212,255,0.07)' : ''};cursor:pointer" onclick="openStock('${r.id}')">
+        <td style="padding:4px 6px">${r.id === s.id ? '▶ ' : ''}${r.name} <span style="color:var(--text3);font-size:0.7rem">${r.id}</span></td>
+        <td style="padding:4px 6px;text-align:right;font-weight:700;color:${scoreToColor(r.score)}">${r.score}</td>
+        <td style="padding:4px 6px;text-align:right;font-family:var(--mono);color:${r.ret >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.ret >= 0 ? '+' : ''}${r.ret.toFixed(1)}%</td>
+        <td style="padding:4px 6px;text-align:right;font-family:var(--mono);color:${(r.foreign ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.foreign != null ? (r.foreign >= 0 ? '+' : '') + r.foreign.toLocaleString() : '--'}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>`;
+}
+
 // ── 技術型態與結構面板 ─────────────────────────────────────────────────────
 function renderPatterns(s) {
   const el = document.getElementById('pattern-body');
@@ -1602,6 +1790,17 @@ function renderPatterns(s) {
     a.candles.map(c => `<strong style="color:${tone(c.dir)}">${c.name}</strong> — ${c.txt}`).join('<br>'),
     tone(a.candles.reduce((n, c) => n + c.dir, 0))));
   if (a.vpRegime) parts.push(card('📶 量價關係', `<strong>${a.vpRegime.k}</strong> — ${a.vpRegime.txt}`, tone(a.vpRegime.dir)));
+  if (a.vForce) parts.push(card('⚔️ 多空力道', a.vForce.txt +
+    `<br><span style="font-size:0.75rem;color:var(--text3)">上漲 ${a.vForce.upDays} 日 / 下跌 ${a.vForce.dnDays} 日${a.vForce.ratio ? `｜漲日均量為跌日的 ${a.vForce.ratio} 倍` : ''}</span>`,
+    tone(a.vForce.dir)));
+  if (a.pctile) parts.push(card('📍 價格位階', a.pctile.txt +
+    `<br><span style="font-size:0.75rem;color:var(--text3);font-family:var(--mono)">區間 ${a.pctile.lo} ~ ${a.pctile.hi}</span>`,
+    a.pctile.zone === 'high' ? 'var(--bear)' : a.pctile.zone === 'low' ? 'var(--bull)' : 'var(--text2)'));
+  const _ic = institutionalCost(s.id);
+  if (_ic) parts.push(card('🏦 法人成本估算', _ic.txt +
+    `<br><span style="font-size:0.75rem;color:var(--text3)">依 ${_ic.days} 日累積買超加權計算</span>`, tone(_ic.dir)));
+  const _rm = revenueMomentum(s.id);
+  if (_rm) parts.push(card('🚀 營收動能', _rm.txt, tone(_rm.dir)));
   if (a.squeeze) parts.push(card('🎚 波動狀態', a.squeeze.txt, 'var(--blue)'));
 
   if (a.fib) {
@@ -2650,6 +2849,8 @@ function loadSettings() {
   const bull = localStorage.getItem('bull-threshold') || '60';
   const bear = localStorage.getItem('bear-threshold') || '40';
 
+  const sCap = document.getElementById('s-capital');
+  if (sCap) sCap.value = localStorage.getItem('capital') || '1000000';
   const sTF = document.getElementById('s-timeframe');
   if (sTF) sTF.value = tf;
   const sR  = document.getElementById('s-refresh');
@@ -2697,6 +2898,8 @@ function saveAllSettings() {
   if (ref)  localStorage.setItem('refresh-interval', ref);
   if (bull) localStorage.setItem('bull-threshold', bull);
   if (bear) localStorage.setItem('bear-threshold', bear);
+  const capEl = document.getElementById('s-capital');
+  if (capEl?.value) localStorage.setItem('capital', capEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
