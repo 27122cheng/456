@@ -65,7 +65,7 @@ function resetSourceState() {
   _t86Memo = null; _t86Promise = null; _t86Fields = null;
   _marginMemo = null; _marginPromise = null;
   _fundAllPromise = null; _revPromise = null; _finPromise = null;
-  _turnoverPromise = null; _bsPromise = null;
+  _turnoverPromise = null; _bsPromise = null; _alertPromise = null;
   Object.keys(_proxyFail).forEach(k => delete _proxyFail[k]);
   _ohlcvInflight.clear();
 }
@@ -694,6 +694,15 @@ async function fetchT86All() {
       return hit.rows;
     }
     srcMarkDead('t86', 10);
+    // 探測失敗 → 用 72 小時內的舊快取頂著（週末/來源暫時異常時面板不再開天窗）
+    for (const { ymd } of recentTradingDays(5)) {
+      const stale = cacheGetStale(`cache:t86:${ymd}`, 72 * 60 * 60 * 1000);
+      if (stale) {
+        _t86Memo = stale;
+        _t86Fields = cacheGetStale(`cache:t86f:${ymd}`, 72 * 60 * 60 * 1000) || null;
+        return stale;
+      }
+    }
     return null;
   })();
   const r = await _t86Promise;
@@ -1136,6 +1145,50 @@ async function fetchMargin(stockId) {
     dShort: m.shortBal - m.shortPrev, // 融券日增減（張）
     shortFinRatio: m.finBal > 0 ? m.shortBal / m.finBal * 100 : 0, // 券資比 %
   };
+}
+
+// ── 注意股／處置股警示（TWSE 公告）─────────────────────────────────────────
+// 處置股採分盤撮合（5～20 分鐘一盤），流動性受限且波動劇烈，
+// 進場前必查；注意股則是異常交易的前置警告。
+let _alertPromise = null;
+
+async function fetchMarketAlerts() {
+  if (_alertPromise) return _alertPromise;
+  _alertPromise = (async () => {
+    const key = 'cache:mktalerts';
+    const cached = cacheGet(key, 60 * 60 * 1000);
+    if (cached) return cached;
+
+    const pickId = r => {
+      for (const k of Object.keys(r)) {
+        if (/代號|Code/i.test(k)) {
+          const v = String(r[k] ?? '').trim();
+          if (/^\d{4,6}$/.test(v)) return v;
+        }
+      }
+      return null;
+    };
+    const [punish, notice] = await Promise.all([
+      officialJSON('https://openapi.twse.com.tw/v1/announcement/punish', 'twse-punish', 7000).catch(() => null),
+      officialJSON('https://openapi.twse.com.tw/v1/announcement/notice', 'twse-notice', 7000).catch(() => null),
+    ]);
+
+    const map = {};
+    for (const r of Array.isArray(punish) ? punish : []) {
+      const id = pickId(r);
+      if (id) map[id] = { level: 'punish', txt: '處置股：分盤撮合中，流動性受限且進出困難' };
+    }
+    for (const r of Array.isArray(notice) ? notice : []) {
+      const id = pickId(r);
+      if (id && !map[id]) map[id] = { level: 'notice', txt: '注意股：交易異常遭列注意，波動與監管風險升高' };
+    }
+    // 空結果也快取（多數日子沒有處置股，避免每輪重抓）
+    cacheSet(key, map);
+    return map;
+  })();
+  const r = await _alertPromise;
+  if (!r) _alertPromise = null;
+  return r;
 }
 
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────

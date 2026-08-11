@@ -110,6 +110,10 @@ async function runScan() {
   loadMarketOutlook();
   loadInstitutionalOverview();
   fetchTWDayAll().catch(() => {});   // 預熱官方全市場行情（不走 proxy，供全部個股合併最新價）
+  fetchMarketAlerts().then(m => {    // 注意股/處置股警示（進場前的必要風險檢查）
+    if (!m) return;
+    allStocks.forEach(s => { s._alert = m[s.id] || null; });
+  }).catch(() => {});
   // 預熱月營收與季報，掛到 allStocks 供推薦 AI 的基本面維度使用
   fetchRevenueAll().then(m => {
     if (!m) return;
@@ -213,12 +217,23 @@ async function runScan() {
   // 掃描後的收尾工作各自獨立，任一失敗都不影響其他項目
   const after = (label, fn) => { try { fn(); } catch (e) { console.warn(`${label} 失敗:`, e); } };
   after('市場多空總覽', renderMarketOutlook);   // 需等 breadth（多空家數）算完
+  // 回填今日法人歷史的收盤價（掃描開始時 analysis 尚未就緒，當時存的是 null）
+  after('法人價格回填', () => {
+    const hist = JSON.parse(localStorage.getItem('inst-hist') || '{}');
+    let changed = false;
+    allStocks.forEach(s => {
+      const arr = hist[s.id];
+      if (!arr?.length || !s.analysis?.price) return;
+      const last = arr[arr.length - 1];
+      if (last.p == null) { last.p = s.analysis.price; changed = true; }
+    });
+    if (changed) localStorage.setItem('inst-hist', JSON.stringify(hist));
+  });
   after('重點關注股', renderFocusStocks);
   // AI 預測準確度：先結算到期預測，再記錄今日預測（順序不可調換）
   after('結算預測', resolvePredictions);
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
-  after('機會實驗室', () => { if (currentPage === 'lab') renderLab(); });
   after('我的持倉', renderHoldings);
   after('價格警報', checkAlerts);
   after('Telegram 推送', () => {
@@ -834,6 +849,10 @@ async function loadInstitutionalOverview() {
       const arr = hist[s.id] = hist[s.id] || [];
       if (!arr.some(r => r.d === dataDate))
         arr.push({ d: dataDate, f: m.foreign, i: m.investment, dl: m.dealer, p: s.analysis?.price ?? null });
+      else {
+        const rec = arr.find(r => r.d === dataDate);
+        if (rec && rec.p == null && s.analysis?.price) rec.p = s.analysis.price;
+      }
       if (arr.length > 10) hist[s.id] = arr.slice(-10);
     });
     localStorage.setItem('inst-hist', JSON.stringify(hist));
@@ -1236,6 +1255,12 @@ function buildManagerAnalysis(s) {
     else if (sec.sectorTrend === 'strong') notes.push(`${sec.sector}族群整體走強（平均 +${sec.avgRet}%），資金聚焦此類股`);
   }
 
+  // 市場警示：處置股分盤交易，流動性風險凌駕一切技術訊號
+  if (s._alert) {
+    if (s._alert.level === 'punish') add(2.5, -1, s._alert.txt, 'risk');
+    else add(1, -1, s._alert.txt, 'risk');
+  }
+
   // 法人成本：現價相對法人平均成本的位置
   const icost = institutionalCost(s.id);
   if (icost) {
@@ -1387,6 +1412,11 @@ function buildEntryPlan(s, m) {
       ? '目前為偏空/轉弱結構，不建議做多進場。待站回均線且動能轉正後再評估。'
       : '多空拉鋸、方向未明，勝率不足。建議等待突破區間或回測支撐止穩後再評估。' };
   }
+  // 處置股採分盤撮合，進出困難且波動極端 — 不論技術面多強都不給進場建議
+  if (s._alert?.level === 'punish') {
+    return { ok: false, why: '此股目前為「處置股」，採分盤撮合交易，流動性受限且波動劇烈，不建議進場。待處置期滿恢復正常交易後再評估。' };
+  }
+
   // 證據互相矛盾時，方向分數再高也不宜進場（避免「多空各半但淨值偏多」的假訊號）
   if (m.agr < 0.3) {
     return { ok: false, why: `多空證據高度分歧（一致性僅 ${(m.agr * 100).toFixed(0)}%），` +
@@ -2716,7 +2746,6 @@ function navigateTo(page, opts = {}) {
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
   if (page === 'report') renderPredAccuracy();
-  if (page === 'lab') renderLab();
 
   // Apply filter from opts
   if (opts.filter) {
@@ -3041,6 +3070,12 @@ async function runDiagnostics() {
     { name: '美股指數備援 Stooq（非必要）', run: async () => {
         const c = await fetchStooqCloses('^GSPC');
         return c?.length ? { ok: true, msg: `S&P500 ${c.length} 筆，最新 ${c[c.length-1]}` } : { ok: false, msg: '無回應（Yahoo 正常時不影響）' };
+      } },
+    { name: '注意/處置股警示 (announcement)', run: async () => {
+        const m = await fetchMarketAlerts();
+        if (m == null) return { ok: false, msg: '無回應' };
+        const n = Object.keys(m).length;
+        return { ok: true, msg: n ? `目前 ${n} 檔列警示` : '目前無處置/注意股（正常）' };
       } },
     { name: '融資融券 O.I (MI_MARGN)', run: async () => {
         const m = await fetchMarginAll();
@@ -3555,7 +3590,8 @@ function scoreStockDimensions(s, mktRet20 = 0) {
               + volume * REC_WEIGHTS.volume;
 
   // 排除條件：任一觸發即不推薦（風險明顯大於機會）
-  const excluded = (a.diverg?.type === 'bear' && ret20 > 10) ? '量價頂背離且已大漲'
+  const excluded = s._alert?.level === 'punish' ? '處置股（分盤交易）'
+    : (a.diverg?.type === 'bear' && ret20 > 10) ? '量價頂背離且已大漲'
     : (rev?.yoy != null && rev.yoy <= -25) ? '營收嚴重衰退'
     : (fin?.netMargin != null && fin.netMargin < -5) ? '本業明顯虧損'
     : (a.rsi >= 85) ? 'RSI 極度超買'
@@ -3908,79 +3944,7 @@ async function renderTopBottomReversal() {
 
 // ── AI 機會實驗室 ───────────────────────────────────────────────────────────
 
-function detectLabOpportunities() {
-  const cats = [
-    { key: 'breakout', name: '🚀 突破在即', desc: '股價貼近 20 日高點、量能增溫，突破一觸即發', items: [] },
-    { key: 'oversold', name: '💎 超賣反彈', desc: 'RSI 進入超賣區或觸及布林下軌，短線反彈機會', items: [] },
-    { key: 'momentum', name: '⚡ 動能加速', desc: 'MACD 柱狀圖擴張 + 放量，趨勢正在加速', items: [] },
-    { key: 'accumulate', name: '🏦 主力吸貨', desc: '法人買超但股價尚未大漲，籌碼默默集中', items: [] },
-    { key: 'squeeze', name: '🌀 波動壓縮', desc: '布林通道極度收窄，即將選擇方向（變盤前夕）', items: [] },
-  ];
 
-  for (const s of allStocks) {
-    const a = s.analysis;
-    if (!a || !s.ohlcv?.length) continue;
-    const closes = s.ohlcv.map(d => d.close);
-    const volR = a.volMA ? a.lastVol / a.volMA : 1;
-    const hi20 = Math.max(...s.ohlcv.slice(-20).map(d => d.high));
-    const chg5 = closes.length >= 6 ? (a.price - closes[closes.length - 6]) / closes[closes.length - 6] * 100 : 0;
-
-    if (a.price >= hi20 * 0.98 && a.price < hi20 && volR > 1.1 && a.score >= 55)
-      cats[0].items.push({ s, note: `距 20 日高點 ${((hi20 - a.price) / a.price * 100).toFixed(1)}%｜量比 ${volR.toFixed(1)}` });
-
-    if ((a.rsi != null && a.rsi < 32) || (a.boll && a.price < a.boll.lower * 1.01 && a.rsi < 42))
-      cats[1].items.push({ s, note: `RSI ${a.rsi?.toFixed(0)}${a.boll && a.price < a.boll.lower * 1.01 ? '｜觸及布林下軌' : ''}` });
-
-    if (a.macd?.hist > 0 && volR > 1.5 && a.score >= 60)
-      cats[2].items.push({ s, note: `MACD 柱 +${a.macd.hist.toFixed(2)}｜量比 ${volR.toFixed(1)}` });
-
-    if (s.foreign != null && s.foreign > 500 && Math.abs(chg5) < 2.5)
-      cats[3].items.push({ s, note: `外資 +${s.foreign.toLocaleString()} 張｜5日僅 ${chg5 >= 0 ? '+' : ''}${chg5.toFixed(1)}%` });
-
-    if (a.boll && a.boll.middle && (a.boll.upper - a.boll.lower) / a.boll.middle < 0.055)
-      cats[4].items.push({ s, note: `通道寬 ${((a.boll.upper - a.boll.lower) / a.boll.middle * 100).toFixed(1)}%（極度壓縮）` });
-  }
-  cats.forEach(c => c.items.sort((x, y) => (y.s.analysis?.score || 0) - (x.s.analysis?.score || 0)));
-  return cats;
-}
-
-function renderLab() {
-  const el = document.getElementById('lab-content');
-  if (!el) return;
-  if (!allStocks.some(s => s.analysis)) {
-    el.innerHTML = '<div class="adv-loading">等待掃描完成後分析機會型態...</div>';
-    return;
-  }
-  const cats = detectLabOpportunities();
-  const total = cats.reduce((n, c) => n + c.items.length, 0);
-
-  el.innerHTML = `
-    <div style="margin-bottom:14px;padding:12px 16px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.12);border-radius:10px;font-size:0.84rem;color:var(--text2)">
-      本輪掃描共偵測到 <strong style="color:var(--blue)">${total}</strong> 個特殊型態機會。機會型態僅為技術特徵偵測，請點入個股查看完整分析。
-    </div>
-    ${cats.map(c => `
-      <div class="adv-section" style="margin-bottom:14px">
-        <div class="adv-section-hdr">
-          ${c.name}
-          <span style="font-size:0.7rem;font-weight:400;color:var(--text3);margin-left:6px">${c.desc}</span>
-          <span class="tbl-badge" style="margin-left:auto;background:rgba(0,212,255,0.1);color:var(--blue)">${c.items.length}</span>
-        </div>
-        <div class="adv-section-body">
-          ${c.items.length ? `<div class="lab-grid">${c.items.slice(0, 8).map(({ s, note }) => `
-            <div class="lab-card" onclick="openStock('${s.id}')">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
-                <strong style="font-size:0.85rem">${s.name} <span style="color:var(--text3);font-size:0.72rem">${s.id}</span></strong>
-                <span class="trend-badge trend-${signalClass(s.analysis.signal)}" style="font-size:0.62rem;padding:1px 7px">${s.analysis.signal}</span>
-              </div>
-              <div style="display:flex;justify-content:space-between;align-items:center">
-                <span style="font-size:0.73rem;color:var(--text3)">${note}</span>
-                <span style="font-family:var(--mono);font-weight:700;color:${scoreToColor(s.analysis.score)}">${s.analysis.score}</span>
-              </div>
-            </div>`).join('')}</div>`
-          : '<p style="font-size:0.8rem;color:var(--text3)">本輪未偵測到此型態</p>'}
-        </div>
-      </div>`).join('')}`;
-}
 
 
 
