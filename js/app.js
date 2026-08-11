@@ -3602,16 +3602,46 @@ function removeHolding(stockId) {
   renderHoldings();
 }
 
-// ── 自行加入持倉（手動輸入：股票別／進場價／當沖或長線） ──────────────────
-function addManualHolding() {
+// 輸入「代號或中文名稱」解析成 {id, name}：
+// 先查本地清單與已掃描股票，再查官方全市場行情（上市+上櫃皆有名稱）
+async function resolveStock(input) {
+  const q = String(input || '').trim();
+  if (!q) return null;
+  if (/^\d{4,6}[A-Z]?$/.test(q)) {
+    const local = getStockList().find(x => x.id === q) || allStocks.find(x => x.id === q);
+    if (local) return { id: q, name: local.name };
+    const all = await fetchTWDayAll().catch(() => null);
+    return { id: q, name: all?.[q]?.name || q };
+  }
+  // 中文名稱：本地精確 → 官方精確 → 官方部分符合（唯一才採用，多筆回列表請使用者選）
+  const local = getStockList().find(x => x.name === q) || allStocks.find(x => x.name === q);
+  if (local) return { id: local.id, name: local.name };
+  const all = await fetchTWDayAll().catch(() => null);
+  if (all) {
+    const entries = Object.entries(all).filter(([id, v]) => v.name && isRealStockId(id));
+    const exact = entries.find(([, v]) => v.name === q);
+    if (exact) return { id: exact[0], name: exact[1].name };
+    const partial = entries.filter(([, v]) => v.name.includes(q));
+    if (partial.length === 1) return { id: partial[0][0], name: partial[0][1].name };
+    if (partial.length > 1) return { ambiguous: partial.slice(0, 6).map(([id, v]) => `${v.name}(${id})`) };
+  }
+  return null;
+}
+
+// ── 自行加入持倉（手動輸入：股票代號或中文名稱／進場價／當沖或長線） ──────
+async function addManualHolding() {
   const idEl = document.getElementById('mh-id');
   const priceEl = document.getElementById('mh-price');
   const kindEl = document.getElementById('mh-kind');
-  const id = (idEl?.value || '').trim();
+  const raw = (idEl?.value || '').trim();
   const entry = parseFloat(priceEl?.value || '');
   const kind = kindEl?.value === 'day' ? 'day' : 'long';
-  if (!/^\d{4,6}$/.test(id)) { showToast('請輸入 4~6 碼股票代號', 'error'); return; }
+  if (!raw) { showToast('請輸入股票代號或中文名稱', 'error'); return; }
   if (!isFinite(entry) || entry <= 0) { showToast('進場價格式不正確', 'error'); return; }
+  const r = await resolveStock(raw);
+  if (r?.ambiguous) { showToast(`找到多檔符合「${raw}」：${r.ambiguous.join('、')} — 請輸入完整名稱或代號`, 'info'); return; }
+  if (!r) { showToast(`找不到「${raw}」— 請確認代號或中文名稱是否正確（需為上市/上櫃股票）`, 'error'); return; }
+  const id = r.id, resolvedName = r.name;
   const holdings = getHoldings();
   if (holdings.some(h => h.id === id)) { showToast('此股已在持倉清單中', 'info'); return; }
 
@@ -3620,7 +3650,7 @@ function addManualHolding() {
   const list = getStockList();
   if (!list.find(x => x.id === id)) {
     const full = list === DEFAULT_STOCKS ? [...DEFAULT_STOCKS] : list;
-    full.push({ id, name: id, sector: '自訂' });
+    full.push({ id, name: resolvedName, sector: '自訂' });
     localStorage.setItem('custom-stocks', JSON.stringify(full));
     addedToList = true;
   }
@@ -3629,7 +3659,7 @@ function addManualHolding() {
   const m = s?.analysis ? buildManagerAnalysis(s) : null;
   const p = m ? buildEntryPlan(s, m) : null;
   holdings.push({
-    id, name: s?.name || id, entry: +entry.toFixed(2),
+    id, name: s?.name || resolvedName, entry: +entry.toFixed(2),
     // 停損：有進場計畫且其停損低於你的進場價就沿用；否則當沖 -3%、長線 -7%
     stop: (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
@@ -3650,7 +3680,7 @@ function addManualHolding() {
   saveHoldings(holdings);
   if (idEl) idEl.value = '';
   if (priceEl) priceEl.value = '';
-  showToast(`已加入持倉：${s?.name || id}（${kind === 'day' ? '當沖單' : '長線單'}）${addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
+  showToast(`已加入持倉：${s?.name || resolvedName}（${id}・${kind === 'day' ? '當沖單' : '長線單'}）${addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
   renderHoldings();
   if (s?.analysis) showHoldingView(id); // 立即顯示 AI 對此價位的看法
   else if (addedToList) showToast('此股尚未掃描，下輪掃描後即可查看 AI 看法', 'info');

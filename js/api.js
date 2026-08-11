@@ -271,6 +271,7 @@ async function fetchTWDayAll() {
         open: num(r.OpeningPrice) ?? close, high: num(r.HighestPrice) ?? close,
         low: num(r.LowestPrice) ?? close, close,
         volume: num(r.TradeVolume) ?? 0, chg: num(r.Change),
+        name: r.Name || null, // 供「輸入中文名稱找代號」使用
       };
     }
     for (const r of tpex || []) {
@@ -280,6 +281,7 @@ async function fetchTWDayAll() {
         open: num(r.Open) ?? close, high: num(r.High) ?? close,
         low: num(r.Low) ?? close, close,
         volume: num(r.TradingShares) ?? 0, chg: num(r.Change),
+        name: r.CompanyName || null,
       };
     }
 
