@@ -209,7 +209,9 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   const cached = cacheGet(key, ttl);
   if (cached) return cached;
 
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
+  // events=div：取得除息事件（日期+金額），標記在對應 K 棒上 —
+  // 未還原股價在除息日會出現假跳空，停損判定與訊號結算需要跳過該缺口
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}&events=div`;
   const data = await proxyFetch(url);
   const result = data?.chart?.result?.[0];
   if (!result) {
@@ -219,14 +221,26 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
   srcMarkAlive('yahoo');
   const { timestamp, indicators } = result;
   const q = indicators.quote[0];
-  const ohlcv = timestamp.map((ts, i) => ({
-    time: tsToLabel(ts, interval),
-    open:   q.open[i]   ? +q.open[i].toFixed(2)   : null,
-    high:   q.high[i]   ? +q.high[i].toFixed(2)   : null,
-    low:    q.low[i]    ? +q.low[i].toFixed(2)     : null,
-    close:  q.close[i]  ? +q.close[i].toFixed(2)   : null,
-    volume: q.volume[i] || 0,
-  })).filter(d => d.open && d.close);
+  const divDates = new Map(); // 'YYYY-MM-DD' → 息值
+  if (interval === '1d' && result.events?.dividends) {
+    for (const d of Object.values(result.events.dividends)) {
+      const ts = d.date || d.timestamp;
+      if (ts) divDates.set(tsToLabel(ts, '1d'), d.amount ?? null);
+    }
+  }
+  const ohlcv = timestamp.map((ts, i) => {
+    const time = tsToLabel(ts, interval);
+    const bar = {
+      time,
+      open:   q.open[i]   ? +q.open[i].toFixed(2)   : null,
+      high:   q.high[i]   ? +q.high[i].toFixed(2)   : null,
+      low:    q.low[i]    ? +q.low[i].toFixed(2)     : null,
+      close:  q.close[i]  ? +q.close[i].toFixed(2)   : null,
+      volume: q.volume[i] || 0,
+    };
+    if (divDates.has(time)) { bar.exDiv = true; bar.divAmt = divDates.get(time); }
+    return bar;
+  }).filter(d => d.open && d.close);
   if (ohlcv.length) cacheSet(key, ohlcv);
   return ohlcv;
 }
@@ -341,12 +355,15 @@ async function fetchTWSEMonth(stockId, year, month) {
   if (!j?.data?.length) return null;
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
   // 欄位：日期,成交股數,成交金額,開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數
+  // 除權息日的「漲跌價差」帶 X 記號（官方標記）→ 標記該 K 棒，供缺口還原使用
   const bars = j.data.map(r => {
     const time = rocToISO(r[0]);
     const close = num(r[6]);
     if (!time || close == null) return null;
-    return { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
-             low: num(r[5]) ?? close, close, volume: num(r[1]) ?? 0 };
+    const bar = { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
+                  low: num(r[5]) ?? close, close, volume: num(r[1]) ?? 0 };
+    if (/X/i.test(String(r[7] ?? ''))) bar.exDiv = true;
+    return bar;
   }).filter(Boolean);
   if (!bars.length) return null;
   cacheSet(key, bars);
@@ -395,8 +412,11 @@ async function fetchTPExMonth(stockId, year, month) {
     const time = rocToISO(r[0]);
     const close = num(r[6]);
     if (!time || close == null) return null;
-    return { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
-             low: num(r[5]) ?? close, close, volume: (num(r[1]) ?? 0) * 1000 };
+    const bar = { time, open: num(r[3]) ?? close, high: num(r[4]) ?? close,
+                  low: num(r[5]) ?? close, close, volume: (num(r[1]) ?? 0) * 1000 };
+    // 櫃買的漲跌欄在除權息日顯示「除息/除權/X」字樣
+    if (/[X除]/i.test(String(r[7] ?? ''))) bar.exDiv = true;
+    return bar;
   }).filter(Boolean);
   if (!bars.length) return null;
   cacheSet(key, bars);

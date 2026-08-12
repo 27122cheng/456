@@ -225,6 +225,11 @@
         <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">🐋 大戶動向偵測</h3>
         <span style="font-size:0.7rem;color:var(--text3)">法人大量買超與盤中大單掛買偵測，先過陷阱判斷（誘多/出貨跡象）再推送 Telegram</span>
         <div id="whale-body" style="margin-top:10px"><div class="adv-loading">掃描完成後偵測大戶動向...</div></div>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+          <div style="font-size:0.78rem;font-weight:700;color:var(--text2)">🌐 全市場粗篩（掃描清單以外）</div>
+          <span style="font-size:0.68rem;color:var(--text3)">用官方全市場法人與行情資料，找出不在你清單裡、但法人買超佔成交比異常高的股票 — 按「加入」納入下輪完整分析</span>
+          <div id="whale-screen-body" style="margin-top:8px"><div class="adv-loading">載入全市場資料...</div></div>
+        </div>
       </div>
 
       <!-- 本週重點財經新聞 -->
@@ -715,6 +720,11 @@
           <h3 style="font-size:0.9rem;font-weight:700">🤖 AI 訊號成績單</h3>
           <span style="font-size:0.7rem;color:var(--text3)">每個推薦交易都自動紙上追蹤到停損/停利，統計實際勝率與止損原因 — AI 對自己誠實記分</span>
           <div id="ai-signals-body" style="margin-top:10px"><div class="adv-loading">推薦訊號出現後自動開始追蹤</div></div>
+        </div>
+        <div class="market-outlook-card" style="margin-bottom:16px">
+          <h3 style="font-size:0.9rem;font-weight:700">📐 技術訊號歷史回測</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">把進場規則的技術核心（多頭排列＋MACD＋RSI＋ADX）套回每檔 14 個月日 K，驗證這套條件過去到底有沒有優勢</span>
+          <div id="backtest-body" style="margin-top:10px"><button class="btn-primary" style="padding:7px 18px;font-size:0.78rem" onclick="runBacktest()">▶ 執行回測（掃描完成後可用）</button></div>
         </div>
         <div class="market-outlook-card" style="margin-bottom:16px">
           <h3 style="font-size:0.9rem;font-weight:700">🎯 大盤預測準確度</h3>
