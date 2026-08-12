@@ -238,6 +238,7 @@ async function runScan() {
   after('我的持倉', renderHoldings);
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
+  after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
   after('價格警報', checkAlerts);
   after('Telegram 推送', () => {
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
@@ -2900,7 +2901,7 @@ function navigateTo(page, opts = {}) {
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
   if (page === 'holdings') renderHoldings();
-  if (page === 'journal') { renderJournal(); renderAiSignals(); renderPredAccuracy(); }
+  if (page === 'journal') { renderJournal(); renderAiSignals(); renderPredAccuracy(); renderBacktest(); }
 
   // Apply filter from opts
   if (opts.filter) {
@@ -3380,25 +3381,30 @@ function updateAiSignals() {
     if (t.status !== 'open') continue;
     const s = allStocks.find(x => x.id === t.id);
     if (!s?.ohlcv?.length) continue;
-    const after = s.ohlcv.filter(b => b.time > t.date);
-    for (const b of after) {
-      if (b.low <= t.stop) {
-        Object.assign(t, { status: 'loss', exitDate: b.time, exitPrice: t.stop,
-          retPct: +((t.stop - t.entry) / t.entry * 100).toFixed(2), exitReason: '跌破停損' });
+    // 除息還原：缺口累計 cum，停損/目標隨之平移，報酬含息 — 除息跳空不是虧損
+    let cum = 0, seen = 0;
+    for (let i = 0; i < s.ohlcv.length; i++) {
+      const b = s.ohlcv[i];
+      if (!(b.time > t.date)) continue;
+      seen++;
+      if (b.exDiv && i > 0) cum += b.divAmt != null ? b.divAmt : Math.max(0, s.ohlcv[i - 1].close - b.open);
+      const stopAdj = t.stop - cum, t1Adj = t.t1 != null ? t.t1 - cum : null;
+      if (b.low <= stopAdj) {
+        Object.assign(t, { status: 'loss', exitDate: b.time, exitPrice: +stopAdj.toFixed(2),
+          retPct: +((stopAdj + cum - t.entry) / t.entry * 100).toFixed(2), exitReason: '跌破停損' });
         changed = true; break;
       }
-      if (!t.holdOn && t.t1 && b.high >= t.t1) {
-        Object.assign(t, { status: 'win', exitDate: b.time, exitPrice: t.t1,
-          retPct: +((t.t1 - t.entry) / t.entry * 100).toFixed(2), exitReason: '達目標停利' });
+      if (!t.holdOn && t1Adj != null && b.high >= t1Adj) {
+        Object.assign(t, { status: 'win', exitDate: b.time, exitPrice: +t1Adj.toFixed(2),
+          retPct: +((t1Adj + cum - t.entry) / t.entry * 100).toFixed(2), exitReason: '達目標停利' });
         changed = true; break;
       }
-    }
-    if (t.status === 'open' && after.length >= 20) {
-      const c = after[19].close;
-      const ret = +((c - t.entry) / t.entry * 100).toFixed(2);
-      Object.assign(t, { status: ret >= 0 ? 'win' : 'loss', exitDate: after[19].time,
-        exitPrice: c, retPct: ret, exitReason: '20 日到期結算' });
-      changed = true;
+      if (seen >= 20) {
+        const ret = +((b.close + cum - t.entry) / t.entry * 100).toFixed(2);
+        Object.assign(t, { status: ret >= 0 ? 'win' : 'loss', exitDate: b.time,
+          exitPrice: b.close, retPct: ret, exitReason: '20 日到期結算' });
+        changed = true; break;
+      }
     }
   }
   if (changed) saveAiSignals(list);
@@ -3433,6 +3439,191 @@ function renderAiSignals() {
         <span style="color:var(--text3);font-size:0.68rem">${t.exitReason}</span>
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${t.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${t.retPct >= 0 ? '+' : ''}${t.retPct}%</span>
       </div>`).join('')}`;
+}
+
+// ── 技術訊號歷史回測 ────────────────────────────────────────────────────────
+// 把進場規則的「技術核心」套回每檔手上的 14 個月日 K，驗證條件過去是否有優勢。
+// 誠實限制：法人買賣超/營收等歷史快照拿不到，所以只回測技術面條件 —
+// 實際系統還疊了籌碼與基本面過濾，實盤表現應優於（至少不同於）此結果。
+// 規則鏡射實盤：收盤>EMA20>EMA50、MACD>訊號、RSI 50~70、ADX≥20，
+// 次日開盤進場；停損=5日低*0.99（上限 min(8%,3ATR)）；目標 2R；
+// 連兩日收破 EMA20 出場；40 日時間停損；除息缺口全程還原。
+
+function btEMA(vals, n) {
+  const k = 2 / (n + 1); const out = []; let e = vals[0];
+  for (let i = 0; i < vals.length; i++) { e = i ? vals[i] * k + e * (1 - k) : vals[i]; out.push(e); }
+  return out;
+}
+function btRSI(closes, n = 14) {
+  const out = new Array(closes.length).fill(null);
+  let ag = 0, al = 0; // Wilder 平滑的平均漲/跌幅
+  for (let i = 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const up = Math.max(d, 0), dn = Math.max(-d, 0);
+    if (i <= n) { ag += up / n; al += dn / n; if (i === n) out[i] = 100 - 100 / (1 + ag / (al || 1e-9)); continue; }
+    ag = (ag * (n - 1) + up) / n; al = (al * (n - 1) + dn) / n;
+    out[i] = 100 - 100 / (1 + ag / (al || 1e-9));
+  }
+  return out;
+}
+function btMACD(closes) {
+  const e12 = btEMA(closes, 12), e26 = btEMA(closes, 26);
+  const macd = closes.map((_, i) => e12[i] - e26[i]);
+  const sig = btEMA(macd, 9);
+  return { macd, sig };
+}
+function btATR(highs, lows, closes, n = 14) {
+  const out = new Array(closes.length).fill(null);
+  let a = null;
+  for (let i = 1; i < closes.length; i++) {
+    const tr = Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+    a = a == null ? tr : (a * (n - 1) + tr) / n;
+    if (i >= n) out[i] = a;
+  }
+  return out;
+}
+function btADX(highs, lows, closes, n = 14) {
+  const len = closes.length;
+  const out = new Array(len).fill(null);
+  let trS = 0, pS = 0, mS = 0, adx = null;
+  for (let i = 1; i < len; i++) {
+    const up = highs[i] - highs[i - 1], dn = lows[i - 1] - lows[i];
+    const pDM = up > dn && up > 0 ? up : 0;
+    const mDM = dn > up && dn > 0 ? dn : 0;
+    const tr = Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+    if (i <= n) { trS += tr; pS += pDM; mS += mDM; if (i < n) continue; }
+    else { trS = trS - trS / n + tr; pS = pS - pS / n + pDM; mS = mS - mS / n + mDM; }
+    const pDI = 100 * pS / (trS || 1e-9), mDI = 100 * mS / (trS || 1e-9);
+    const dx = 100 * Math.abs(pDI - mDI) / ((pDI + mDI) || 1e-9);
+    adx = adx == null ? dx : (adx * (n - 1) + dx) / n;
+    if (i >= n * 2) out[i] = adx;
+  }
+  return out;
+}
+
+function backtestStock(s) {
+  const bars = s.ohlcv;
+  if (!bars || bars.length < 80) return [];
+  const closes = bars.map(b => b.close), highs = bars.map(b => b.high), lows = bars.map(b => b.low);
+  const e20 = btEMA(closes, 20), e50 = btEMA(closes, 50);
+  const rsi = btRSI(closes), { macd, sig } = btMACD(closes);
+  const adx = btADX(highs, lows, closes), atr = btATR(highs, lows, closes);
+  const trades = [];
+  let pos = null;
+  for (let i = 60; i < bars.length; i++) {
+    const b = bars[i];
+    if (pos) {
+      if (b.exDiv && i > 0) pos.cum += b.divAmt != null ? b.divAmt : Math.max(0, closes[i - 1] - b.open);
+      const stopAdj = pos.stop - pos.cum, tgtAdj = pos.t1 - pos.cum;
+      let exit = null, why = null;
+      if (b.low <= stopAdj) { exit = stopAdj; why = 'stop'; }
+      else if (b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
+      else if (closes[i] < e20[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
+      else pos.below = 0;
+      if (exit == null && i - pos.i >= 40) { exit = closes[i]; why = 'time'; }
+      if (exit != null) {
+        trades.push({
+          id: s.id, name: s.name, entryTime: bars[pos.i].time, exitTime: b.time, why,
+          r: +((exit + pos.cum - pos.entry) / pos.risk).toFixed(2),
+          retPct: +((exit + pos.cum - pos.entry) / pos.entry * 100).toFixed(2),
+          hold: i - pos.i,
+        });
+        pos = null;
+      }
+      continue;
+    }
+    if (i + 1 >= bars.length) break;
+    const c = closes[i];
+    if (!(c > e20[i] && e20[i] > e50[i])) continue;
+    if (!(macd[i] > sig[i])) continue;
+    if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < 70)) continue;
+    if (!(adx[i] != null && adx[i] >= 20)) continue;
+    const entry = bars[i + 1].open;
+    const a = atr[i] || entry * 0.02;
+    let stop = Math.min(Math.min(...lows.slice(i - 4, i + 1)) * 0.99, entry - a);
+    const maxRisk = Math.min(entry * 0.08, a * 3);
+    if (entry - stop > maxRisk) stop = entry - maxRisk;
+    if (stop >= entry) continue;
+    pos = { i: i + 1, entry, stop, risk: entry - stop, t1: entry + (entry - stop) * 2, cum: 0, below: 0 };
+  }
+  return trades;
+}
+
+function summarizeBacktest(trades) {
+  if (!trades.length) return { trades: 0 };
+  const wins = trades.filter(t => t.r > 0);
+  const posR = trades.filter(t => t.r > 0).reduce((x, t) => x + t.r, 0);
+  const negR = Math.abs(trades.filter(t => t.r <= 0).reduce((x, t) => x + t.r, 0));
+  let maxConsec = 0, cur = 0;
+  for (const t of trades) { cur = t.r <= 0 ? cur + 1 : 0; maxConsec = Math.max(maxConsec, cur); }
+  const byWhy = {};
+  trades.forEach(t => { byWhy[t.why] = (byWhy[t.why] || 0) + 1; });
+  const byStock = {};
+  trades.forEach(t => { (byStock[t.id] = byStock[t.id] || { name: t.name, rs: [] }).rs.push(t.r); });
+  const stockRank = Object.entries(byStock)
+    .map(([id, v]) => ({ id, name: v.name, n: v.rs.length, avgR: +(v.rs.reduce((x, y) => x + y, 0) / v.rs.length).toFixed(2) }))
+    .filter(x => x.n >= 3)
+    .sort((x, y) => y.avgR - x.avgR);
+  return {
+    trades: trades.length,
+    winRate: +(wins.length / trades.length * 100).toFixed(1),
+    avgR: +(trades.reduce((x, t) => x + t.r, 0) / trades.length).toFixed(2),
+    pf: negR > 0 ? +(posR / negR).toFixed(2) : null,
+    maxConsec,
+    avgHold: +(trades.reduce((x, t) => x + t.hold, 0) / trades.length).toFixed(1),
+    byWhy, best: stockRank.slice(0, 3), worst: stockRank.slice(-3).reverse(),
+  };
+}
+
+async function runBacktest() {
+  const el = document.getElementById('backtest-body');
+  if (!el) return;
+  const ready = allStocks.filter(s => s.ohlcv?.length >= 80);
+  if (ready.length < 5) { el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">歷史資料尚未就緒，請等掃描完成後再執行。</p>'; return; }
+  el.innerHTML = '<div class="adv-loading">回測中...</div>';
+  const all = [];
+  for (let k = 0; k < ready.length; k++) {
+    try { all.push(...backtestStock(ready[k])); } catch (e) { console.warn(`回測 ${ready[k].id} 失敗:`, e); }
+    if (k % 8 === 7) {
+      el.innerHTML = `<div class="adv-loading">回測中... ${k + 1}/${ready.length}</div>`;
+      await new Promise(r => setTimeout(r, 0)); // 讓出主執行緒，不凍結 UI
+    }
+  }
+  const res = summarizeBacktest(all);
+  try { localStorage.setItem('backtest-result', JSON.stringify({ at: new Date().toISOString().slice(0, 10), universe: ready.length, ...res })); } catch {}
+  renderBacktest();
+}
+
+function renderBacktest() {
+  const el = document.getElementById('backtest-body');
+  if (!el) return;
+  let r;
+  try { r = JSON.parse(localStorage.getItem('backtest-result') || 'null'); } catch { r = null; }
+  const btn = '<button class="btn-ghost" style="padding:5px 14px;font-size:0.74rem;margin-top:8px" onclick="runBacktest()">🔄 重新回測</button>';
+  if (!r) { el.innerHTML = '<button class="btn-primary" style="padding:7px 18px;font-size:0.78rem" onclick="runBacktest()">▶ 執行回測（掃描完成後可用）</button>'; return; }
+  if (!r.trades) { el.innerHTML = `<p style="font-size:0.8rem;color:var(--text3)">近 14 個月內沒有任何一天同時滿足全部進場條件 — 條件偏嚴屬正常，等市況轉多再驗證。</p>${btn}`; return; }
+  const whyName = { stop: '停損', target: '達 2R 目標', trail: '破 EMA20 出場', time: '時間停損' };
+  const verdict = r.pf == null || r.pf >= 1.5
+    ? { t: '✅ 此技術條件過去 14 個月具正期望值優勢', c: 'var(--bull)' }
+    : r.pf >= 1.0
+      ? { t: '🟡 邊際優勢 — 有賺但不厚，須靠籌碼/基本面過濾提升勝率', c: 'var(--yellow)' }
+      : { t: '🔴 此期間無優勢 — 純技術進場在近期市況下不賺錢，訊號僅供參考、倚重其他維度過濾', c: 'var(--bear)' };
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:10px;margin-bottom:10px">
+      <div class="inst-card"><div class="inst-card-lbl">交易次數</div><div class="inst-card-val">${r.trades}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">勝率</div><div class="inst-card-val" style="color:${r.winRate >= 50 ? 'var(--bull)' : 'var(--text1)'}">${r.winRate}%</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">平均 R</div><div class="inst-card-val" style="color:${r.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${r.avgR > 0 ? '+' : ''}${r.avgR}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">獲利因子</div><div class="inst-card-val">${r.pf ?? '∞'}</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">最大連虧</div><div class="inst-card-val">${r.maxConsec} 筆</div></div>
+      <div class="inst-card"><div class="inst-card-lbl">平均持有</div><div class="inst-card-val">${r.avgHold} 日</div></div>
+    </div>
+    <div style="padding:9px 12px;border-radius:8px;background:${verdict.c}0d;border-left:3px solid ${verdict.c};font-size:0.78rem;color:${verdict.c};font-weight:600;margin-bottom:8px">${verdict.t}</div>
+    <div style="font-size:0.74rem;color:var(--text2);line-height:1.7">
+      出場分佈：${Object.entries(r.byWhy).map(([w, n]) => `${whyName[w] || w} ${n} 筆`).join('・')}<br>
+      ${r.best?.length ? `此規則最適合：${r.best.map(x => `${x.name}（均 ${x.avgR > 0 ? '+' : ''}${x.avgR}R）`).join('、')}<br>` : ''}
+      ${r.worst?.length ? `最不適合：${r.worst.map(x => `${x.name}（均 ${x.avgR > 0 ? '+' : ''}${x.avgR}R）`).join('、')}<br>` : ''}
+      <span style="color:var(--text3);font-size:0.7rem">${r.at} 回測｜${r.universe} 檔｜僅回測技術核心（次日開盤進場、除息已還原）；實盤另有籌碼/基本面/大盤過濾，結果會不同</span>
+    </div>${btn}`;
 }
 
 // ── 大戶動向偵測：大量買超/大單掛買 → 陷阱判斷 → Telegram ──────────────────
@@ -3547,6 +3738,73 @@ function renderWhales() {
   }).join('');
 }
 
+// ── 全市場大戶粗篩：法人買超佔成交比異常高、但不在掃描清單的股票 ─────────
+// 深度分析需要 14 個月歷史（重），所以先用兩份「本來就在抓」的全市場快照粗篩：
+// T86 全市場法人買賣超 × STOCK_DAY_ALL 全市場行情 → 候選按一鍵加入自選深掃。
+
+let _screenResults = null;
+
+async function marketWideWhaleScreen() {
+  const [t86, day] = await Promise.all([
+    fetchT86Parsed().catch(() => null),
+    fetchTWDayAll().catch(() => null),
+  ]);
+  if (!t86 || !day) { _screenResults = null; renderMarketScreen(); return; }
+  const inList = new Set(getStockList().map(x => x.id));
+  const cands = [];
+  for (const r of t86) {
+    const net = r.foreign + r.investment;      // 張
+    if (net < 1000) continue;                  // 買超規模門檻
+    const q = day[r.id];
+    if (!q?.close || !q.volume) continue;
+    const volZ = q.volume / 1000;              // 股 → 張
+    if (volZ < 2000) continue;                 // 流動性門檻（太冷門不碰）
+    const ratio = net / volZ;
+    if (ratio < 0.10) continue;                // 法人買超 ≥ 當日成交量 10%
+    if (q.chg != null && q.chg < 0) continue;  // 收跌不追（避免接刀情境）
+    cands.push({ id: r.id, name: q.name || r.name || r.id, net, ratio,
+                 close: q.close, chg: q.chg, inList: inList.has(r.id) });
+  }
+  cands.sort((a, b) => b.ratio - a.ratio);
+  _screenResults = cands.filter(c => !c.inList).slice(0, 10);
+  renderMarketScreen();
+}
+
+function renderMarketScreen() {
+  const el = document.getElementById('whale-screen-body');
+  if (!el) return;
+  if (_screenResults == null) {
+    el.innerHTML = '<p style="font-size:0.76rem;color:var(--text3)">全市場法人資料暫時無法取得（非交易日或來源異常），下輪掃描自動重試。</p>';
+    return;
+  }
+  if (!_screenResults.length) {
+    el.innerHTML = '<p style="font-size:0.76rem;color:var(--text3)">今日清單外沒有「法人買超佔成交比 ≥10%」的標的（門檻：買超 ≥1000 張、成交 ≥2000 張、收紅）。</p>';
+    return;
+  }
+  el.innerHTML = _screenResults.map(c => `
+    <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;padding:6px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
+      <strong>${c.name} <span style="color:var(--text3);font-size:0.7rem">${c.id}</span></strong>
+      <span style="color:var(--text3);font-size:0.72rem;font-family:var(--mono)">收 ${c.close}${c.chg != null ? `（${c.chg >= 0 ? '+' : ''}${c.chg}）` : ''}</span>
+      <span style="color:var(--blue);font-size:0.72rem">法人買超 ${c.net.toLocaleString()} 張・佔成交 ${(c.ratio * 100).toFixed(0)}%</span>
+      <button class="btn-ghost" style="margin-left:auto;padding:3px 12px;font-size:0.7rem" onclick="addWatchStock('${c.id}','${c.name}')">＋ 加入掃描</button>
+    </div>`).join('') +
+    '<div style="font-size:0.68rem;color:var(--text3);margin-top:6px">粗篩僅用單日快照，未過陷阱檢查 — 加入掃描清單後，下輪會做完整技術/籌碼/陷阱分析</div>';
+}
+
+function addWatchStock(id, name) {
+  const list = getStockList();
+  if (list.find(x => x.id === id)) { showToast('已在掃描清單中', 'info'); return; }
+  const full = list === DEFAULT_STOCKS ? [...DEFAULT_STOCKS] : list;
+  full.push({ id, name, sector: '自訂' });
+  localStorage.setItem('custom-stocks', JSON.stringify(full));
+  const c = (_screenResults || []).find(x => x.id === id);
+  if (c) c.inList = true;
+  showToast(`已加入 ${name}(${id})，下輪掃描納入完整分析`, 'success');
+  _screenResults = (_screenResults || []).filter(x => x.id !== id);
+  renderMarketScreen();
+  try { renderCustomStocksList(); } catch {}
+}
+
 // 通過陷阱檢查的大戶訊號 → Telegram（每檔每日一次），附交易分析
 function notifyWhales() {
   if (!tgWants('sig')) return;
@@ -3635,9 +3893,12 @@ function closeHolding(stockId) {
   const exit = parseFloat(input);
   if (!isFinite(exit) || exit <= 0) { showToast('出場價格式不正確', 'error'); return; }
 
-  const retPct = +((exit - h.entry) / h.entry * 100).toFixed(2);
-  const reason = classifyExit(h, exit, s);
-  const rating = rateTrade(h, exit, retPct, reason, s);
+  // 除息還原：報酬含息、停損基準平移，除息缺口不算虧損也不算凹單
+  const div = s ? exDivAdjust(s.ohlcv, h.addedAt) : 0;
+  const hAdj = div > 0 ? { ...h, stop: +(h.stop - div).toFixed(2), t1: h.t1 ? +(h.t1 - div).toFixed(2) : null } : h;
+  const retPct = +((exit + div - h.entry) / h.entry * 100).toFixed(2);
+  const reason = classifyExit(hAdj, exit, s);
+  const rating = rateTrade(hAdj, exit, retPct, reason, s);
   const journal = getJournal();
   journal.push({
     id: stockId, name: h.name, entry: h.entry, exit: +exit.toFixed(2),
@@ -3645,6 +3906,7 @@ function closeHolding(stockId) {
     retPct, reason, ctx: h.ctx ?? null, lesson: '',
     src: h.src ?? 'ai', kind: h.kind ?? 'long',
     stars: rating.stars, review: rating.notes,
+    ...(div > 0 ? { divAdj: div } : {}),
   });
   saveJournal(journal);
   saveHoldings(holdings.filter(x => x.id !== stockId));
@@ -3912,6 +4174,19 @@ function showHoldingView(stockId) {
   modal.style.display = 'flex';
 }
 
+// 自 sinceDate（不含）以來的除權息缺口總額（元）。
+// 未還原股價在除息日跳空下跌，但那不是虧損 — 停損/目標/報酬判定都要扣掉這段缺口。
+function exDivAdjust(ohlcv, sinceDate) {
+  let adj = 0;
+  for (let i = 1; i < (ohlcv?.length || 0); i++) {
+    const b = ohlcv[i];
+    if (!b.exDiv) continue;
+    if (sinceDate && !(b.time > sinceDate)) continue;
+    adj += b.divAmt != null ? b.divAmt : Math.max(0, ohlcv[i - 1].close - b.open);
+  }
+  return +adj.toFixed(2);
+}
+
 // 對單一持倉做出場研判
 function checkHoldingExit(h) {
   const s = allStocks.find(x => x.id === h.id);
@@ -3919,11 +4194,16 @@ function checkHoldingExit(h) {
   const a = s.analysis;
   const price = a.price;
   const m = buildManagerAnalysis(s);
-  const retPct = (price - h.entry) / h.entry * 100;
+  // 除息還原：報酬含息計算，停損/目標往下平移息值，避免除息跳空被誤判成跌破
+  const div = exDivAdjust(s.ohlcv, h.addedAt);
+  const stopAdj = +(h.stop - div).toFixed(2);
+  const t1Adj = h.t1 ? +(h.t1 - div).toFixed(2) : null;
+  const retPct = (price + div - h.entry) / h.entry * 100;
   const reasons = [];
   let level = 'hold';  // hold | watch | exit
 
-  if (price <= h.stop) { level = 'exit'; reasons.push(`跌破停損 ${h.stop}`); }
+  if (div > 0) reasons.push(`持有期間除息 ${div} 元已還原（停損調整為 ${stopAdj}）`);
+  if (price <= stopAdj) { level = 'exit'; reasons.push(`跌破停損 ${stopAdj}`); }
   if (m && m.dir <= -1) { level = 'exit'; reasons.push(`研判轉為「${m.stance}」，多方結構失效`); }
   if (a.ema20 && price < a.ema20 && a.ema50 && price < a.ema50) {
     if (level !== 'exit') level = 'watch';
@@ -3941,9 +4221,9 @@ function checkHoldingExit(h) {
     if (level !== 'exit') level = 'watch';
     reasons.push(`月營收年減 ${s.rev.yoy.toFixed(0)}%，基本面轉差`);
   }
-  if (h.t1 && price >= h.t1) {
+  if (t1Adj && price >= t1Adj) {
     if (level === 'hold') level = 'watch';
-    reasons.push(`已達目標價 ${h.t1}，可考慮減碼鎖利`);
+    reasons.push(`已達目標價 ${t1Adj}${div > 0 ? '（除息還原後）' : ''}，可考慮減碼鎖利`);
   }
   if (!reasons.length) reasons.push(m ? `結構維持「${m.stance}」，續抱` : '結構穩定，續抱');
 
@@ -4256,6 +4536,7 @@ function renderJournalRecords() {
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:4px;font-family:var(--mono)">
         ${t.entryDate} 進場 ${t.entry} → ${t.exitDate} 出場 ${t.exit}
+        ${t.divAdj ? `　<span style="color:var(--blue)">含息 ${t.divAdj} 元還原</span>` : ''}
         ${t.stars ? `　<span style="color:var(--yellow);letter-spacing:1px">${'★'.repeat(t.stars)}${'☆'.repeat(5 - t.stars)}</span>` : ''}
       </div>
       ${t.stars && t.stars < 3 && t.review?.length ? `<div style="margin-top:6px;padding:8px 11px;border-radius:8px;background:rgba(245,158,11,0.07);border-left:3px solid var(--yellow)">
