@@ -3524,7 +3524,10 @@ function backtestStock(s, opts = {}) {
   const rsi = btRSI(closes), { macd, sig } = btMACD(closes);
   const adx = btADX(highs, lows, closes), atr = btATR(highs, lows, closes);
   const trailEMA = opts.longTerm ? e50 : e20;
+  // 長期組連 3 收破才出場（減少均線附近洗刷出場 → 贏單抱得住，獲利因子提升）
+  const trailN = opts.longTerm ? 3 : 2;
   const timeStop = opts.longTerm ? 120 : 40;
+  const adxMin = opts.adxMin ?? 20;
   const trades = [];
   let pos = null;
   const startI = opts.longTerm ? 100 : 60;
@@ -3544,7 +3547,7 @@ function backtestStock(s, opts = {}) {
           pos.stop = pos.entry + pos.cum; // 剩餘部位保本（cum 之後仍會持續平移）
         }
         if (tgtAdj != null && b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
-        else if (closes[i] < trailEMA[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
+        else if (closes[i] < trailEMA[i]) { pos.below++; if (pos.below >= trailN) { exit = closes[i]; why = 'trail'; } }
         else pos.below = 0;
       }
       if (exit == null && i - pos.i >= timeStop) { exit = closes[i]; why = 'time'; }
@@ -3577,7 +3580,7 @@ function backtestStock(s, opts = {}) {
     }
     if (!(macd[i] > sig[i])) continue;
     if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < rsiMax)) continue;
-    if (!(adx[i] != null && adx[i] >= 20)) continue;
+    if (!(adx[i] != null && adx[i] >= adxMin)) continue;
     const entry = bars[i + 1].open;
     const a = atr[i] || entry * 0.02;
     let stop = Math.min(Math.min(...lows.slice(i - 4, i + 1)) * 0.99, entry - a);
@@ -3620,8 +3623,15 @@ function backtestDayTrade(s, regimeFn) {
     const chg = (b.close - closes[i - 1]) / closes[i - 1] * 100;
     if (chg < 0.5 || chg > 8) continue;
     if (!atr[i] || atr[i] / b.close < 0.018) continue;                         // 波動不夠沖不出價差
+    // 強收盤確認：收在當日振幅前 30% 才有隔日跟隨力（收上影長的隔日常開高走低）
+    const rng = b.high - b.low;
+    if (rng > 0 && (b.close - b.low) / rng < 0.7) continue;
     const d = bars[i + 1];
+    if (d.exDiv) continue;                                                     // 除息日不當沖
     const entry = d.open;
+    // 跳空窗：開低 >0.5% 代表動能已失，開高 >2% 是隔日沖最大虧損源（開高走低）
+    const gap = (entry - b.close) / b.close * 100;
+    if (gap < -0.5 || gap > 2) continue;
     const stop = entry * 0.985;                                                // 日內硬停損 -1.5%
     const risk = entry - stop;
     let exit, why;
@@ -3704,8 +3714,8 @@ async function runBacktest() {
   let regimeFn = null;
   try { regimeFn = makeRegimeFn(await fetchTWIIOHLC(14)); } catch {}
   const SWING = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true,
-                  pullback: true, volConfirm: true, frontRun: true };
-  const LONG = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, longTerm: true };
+                  pullback: true, volConfirm: true, frontRun: true, adxMin: 22 };
+  const LONG = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, longTerm: true, pullback: true };
 
   const base = [], swing = [], long = [], day = [];
   for (let k = 0; k < ready.length; k++) {
@@ -3773,7 +3783,7 @@ function renderBacktest() {
         ${row('⚡', '當沖（日內近似）', r.cats.day)}
         <tr style="border-top:1px solid var(--border);font-weight:700"><td style="padding:4px 8px">Σ 總計</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${r.trades}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);color:${r.winRate >= 50 ? 'var(--bull)' : 'var(--text1)'}">${r.winRate}%</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);color:${r.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${r.avgR > 0 ? '+' : ''}${r.avgR}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${r.pf ?? '∞'}</td></tr>
       </table></div>
-      <div style="font-size:0.66rem;color:var(--text3);margin-bottom:8px">長期組以 EMA100 作長期結構代理（資料僅 14 個月，年線樣本不足）、EMA50 移動出場；當沖組為「訊號隔日開盤買、收盤前出場、-1.5% 硬停損」的日內近似（無免費分鐘資料）</div>`;
+      <div style="font-size:0.66rem;color:var(--text3);margin-bottom:8px">長期組：EMA100 作長期結構代理（資料僅 14 個月）、回踩進場、連 3 收破 EMA50 才出場。當沖組：日內近似（隔日開盤買、收盤前出場、-1.5% 硬停損），僅取強收盤訊號（收在振幅前 30%）且開盤跳空 -0.5%~+2% 內才進場 — 開高逾 2% 不追（開高走低是隔日沖最大虧損源）。無免費分鐘資料。</div>`;
     })() : ''}
     ${r.base ? `<div style="font-size:0.73rem;color:var(--text3);margin-bottom:8px;padding:7px 11px;border-radius:8px;background:rgba(255,255,255,0.03)">
       對照｜基準版（無濾網、固定 2R）：${r.base.trades} 筆・勝率 ${r.base.winRate}%・平均 R ${r.base.avgR > 0 ? '+' : ''}${r.base.avgR}・獲利因子 ${r.base.pf ?? '∞'}・最大連虧 ${r.base.maxConsec} 筆<br>
@@ -4473,6 +4483,8 @@ function computeDayTradePicks() {
     const atrPct = (m.atr / a.price) * 100;
     if (atrPct < 1.8) continue;                  // 波動要夠，否則沖不出價差
     if (!(avg > 0 && last.volume >= avg * 1.3 && last.close > last.open)) continue; // 今日放量收紅
+    const rng0 = last.high - last.low;
+    if (rng0 > 0 && (last.close - last.low) / rng0 < 0.7) continue; // 收上影長，隔日跟隨力差（回測驗證）
     const prev = bars[bars.length - 2];
     const chg = prev ? (last.close - prev.close) / prev.close * 100 : 0;
     if (chg < 0.5 || chg > 8) continue;          // 太弱沒動能、近漲停追不得
@@ -4543,7 +4555,7 @@ function renderEntrySignals() {
       longs.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
     sect('📈 短期波段（數日～數週）', '技術與籌碼轉強但基本面支撐不足以長抱，按建議停損/目標紀律操作',
       swings.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
-    sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋當日動能篩選（處置/注意股已排除）。以日線資料為基礎，開盤後請以即時走勢確認，收盤前務必出場',
+    sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋強收盤動能篩選（處置/注意股已排除）。開盤跳空逾 +2% 不追（開高走低是隔日沖最大虧損源）、開低逾 -0.5% 放棄；收盤前務必出場',
       days.filter(dp => !picks.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
 
   el.innerHTML = body ||
