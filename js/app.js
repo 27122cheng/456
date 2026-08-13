@@ -1022,7 +1022,7 @@ function stockMarket(s) {
     if (localStorage.getItem(`mkt:${s.id}`) === 'tpex' || localStorage.getItem(`sym-suffix:${s.id}`) === 'TWO') return 'tpex';
     if (localStorage.getItem(`mkt:${s.id}`) === 'twse') return 'twse';
   } catch {}
-  return s.ohlcv?.length ? 'twse' : 'emerging'; // 掃得到但無標記多為上市；掃不到的歸興櫃/其他
+  return 'twse'; // 無標記的自選股預設歸上市（興櫃無官方日 K，不支援）
 }
 
 let rankingMarket = 'all';
