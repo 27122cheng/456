@@ -1,46 +1,115 @@
 // ── State ──────────────────────────────────────────────────────────────────
 
+// mkt: 'twse'=上市 / 'tpex'=上櫃。興櫃無官方日 K（STOCK_DAY／tradingStock 均不涵蓋），
+// 故預設清單不收興櫃；使用者自行加入的興櫃股會誠實顯示「查無官方日 K」。
 const DEFAULT_STOCKS = [
-  { id:'2330', name:'台積電',    sector:'半導體' },
-  { id:'2303', name:'聯電',      sector:'半導體' },
-  { id:'2454', name:'聯發科',    sector:'半導體' },
-  { id:'3711', name:'日月光投控',sector:'半導體' },
-  { id:'2379', name:'瑞昱',      sector:'半導體' },
-  { id:'3034', name:'聯詠',      sector:'IC設計' },
-  { id:'6770', name:'力積電',    sector:'半導體' },
-  { id:'2317', name:'鴻海',      sector:'電子製造' },
-  { id:'2382', name:'廣達',      sector:'伺服器' },
-  { id:'6669', name:'緯穎',      sector:'伺服器' },
-  { id:'2308', name:'台達電',    sector:'電子零組件' },
-  { id:'2357', name:'華碩',      sector:'電腦' },
-  { id:'2353', name:'宏碁',      sector:'電腦' },
-  { id:'2376', name:'技嘉',      sector:'電腦' },
-  { id:'3008', name:'大立光',    sector:'光學' },
-  { id:'2409', name:'友達',      sector:'面板' },
-  { id:'3481', name:'群創',      sector:'面板' },
-  { id:'4938', name:'和碩',      sector:'電子製造' },
-  { id:'2395', name:'研華',      sector:'工業電腦' },
-  { id:'2881', name:'富邦金',    sector:'金融' },
-  { id:'2882', name:'國泰金',    sector:'金融' },
-  { id:'2886', name:'兆豐金',    sector:'金融' },
-  { id:'2891', name:'中信金',    sector:'金融' },
-  { id:'2892', name:'第一金',    sector:'金融' },
-  { id:'5880', name:'合庫金',    sector:'金融' },
-  { id:'2884', name:'玉山金',    sector:'金融' },
-  { id:'2885', name:'元大金',    sector:'金融' },
-  { id:'2412', name:'中華電',    sector:'電信' },
-  { id:'4904', name:'遠傳',      sector:'電信' },
-  { id:'3045', name:'台灣大',    sector:'電信' },
-  { id:'1301', name:'台塑',      sector:'塑化' },
-  { id:'1303', name:'南亞',      sector:'塑化' },
-  { id:'6505', name:'台塑化',    sector:'石化' },
-  { id:'2002', name:'中鋼',      sector:'鋼鐵' },
-  { id:'2912', name:'統一超',    sector:'零售' },
-  { id:'1216', name:'統一',      sector:'食品' },
-  { id:'2474', name:'可成',      sector:'機殼' },
-  { id:'3019', name:'亞光',      sector:'光學' },
-  { id:'9910', name:'豐泰',      sector:'橡膠' },
-  { id:'0050', name:'元大台灣50',sector:'ETF' },
+  // ── 上市：半導體/IC ──
+  { id:'2330', name:'台積電',    sector:'半導體', mkt:'twse' },
+  { id:'2303', name:'聯電',      sector:'半導體', mkt:'twse' },
+  { id:'2454', name:'聯發科',    sector:'半導體', mkt:'twse' },
+  { id:'3711', name:'日月光投控',sector:'半導體', mkt:'twse' },
+  { id:'2379', name:'瑞昱',      sector:'IC設計', mkt:'twse' },
+  { id:'3034', name:'聯詠',      sector:'IC設計', mkt:'twse' },
+  { id:'6770', name:'力積電',    sector:'半導體', mkt:'twse' },
+  { id:'3443', name:'創意',      sector:'IC設計', mkt:'twse' },
+  { id:'3661', name:'世芯-KY',   sector:'IC設計', mkt:'twse' },
+  { id:'6415', name:'矽力-KY',   sector:'IC設計', mkt:'twse' },
+  { id:'2344', name:'華邦電',    sector:'記憶體', mkt:'twse' },
+  { id:'2337', name:'旺宏',      sector:'記憶體', mkt:'twse' },
+  { id:'6239', name:'力成',      sector:'封測',   mkt:'twse' },
+  { id:'2449', name:'京元電子',  sector:'封測',   mkt:'twse' },
+  // ── 上市：電子製造/AI 供應鏈 ──
+  { id:'2317', name:'鴻海',      sector:'電子製造', mkt:'twse' },
+  { id:'2382', name:'廣達',      sector:'伺服器', mkt:'twse' },
+  { id:'6669', name:'緯穎',      sector:'伺服器', mkt:'twse' },
+  { id:'3231', name:'緯創',      sector:'伺服器', mkt:'twse' },
+  { id:'2356', name:'英業達',    sector:'伺服器', mkt:'twse' },
+  { id:'2308', name:'台達電',    sector:'電子零組件', mkt:'twse' },
+  { id:'2301', name:'光寶科',    sector:'電子零組件', mkt:'twse' },
+  { id:'2385', name:'群光',      sector:'電子零組件', mkt:'twse' },
+  { id:'2327', name:'國巨',      sector:'被動元件', mkt:'twse' },
+  { id:'2492', name:'華新科',    sector:'被動元件', mkt:'twse' },
+  { id:'3037', name:'欣興',      sector:'PCB',    mkt:'twse' },
+  { id:'2383', name:'台光電',    sector:'PCB',    mkt:'twse' },
+  { id:'8046', name:'南電',      sector:'PCB',    mkt:'twse' },
+  { id:'2313', name:'華通',      sector:'PCB',    mkt:'twse' },
+  { id:'2357', name:'華碩',      sector:'電腦',   mkt:'twse' },
+  { id:'2353', name:'宏碁',      sector:'電腦',   mkt:'twse' },
+  { id:'2376', name:'技嘉',      sector:'電腦',   mkt:'twse' },
+  { id:'2377', name:'微星',      sector:'電腦',   mkt:'twse' },
+  { id:'2324', name:'仁寶',      sector:'電腦',   mkt:'twse' },
+  { id:'4938', name:'和碩',      sector:'電子製造', mkt:'twse' },
+  { id:'2354', name:'鴻準',      sector:'機殼',   mkt:'twse' },
+  { id:'2474', name:'可成',      sector:'機殼',   mkt:'twse' },
+  { id:'2395', name:'研華',      sector:'工業電腦', mkt:'twse' },
+  { id:'2345', name:'智邦',      sector:'網通',   mkt:'twse' },
+  { id:'2360', name:'致茂',      sector:'量測設備', mkt:'twse' },
+  { id:'6176', name:'瑞儀',      sector:'背光模組', mkt:'twse' },
+  // ── 上市：光電/面板 ──
+  { id:'3008', name:'大立光',    sector:'光學',   mkt:'twse' },
+  { id:'3019', name:'亞光',      sector:'光學',   mkt:'twse' },
+  { id:'2409', name:'友達',      sector:'面板',   mkt:'twse' },
+  { id:'3481', name:'群創',      sector:'面板',   mkt:'twse' },
+  // ── 上市：金融 ──
+  { id:'2881', name:'富邦金',    sector:'金融',   mkt:'twse' },
+  { id:'2882', name:'國泰金',    sector:'金融',   mkt:'twse' },
+  { id:'2886', name:'兆豐金',    sector:'金融',   mkt:'twse' },
+  { id:'2891', name:'中信金',    sector:'金融',   mkt:'twse' },
+  { id:'2892', name:'第一金',    sector:'金融',   mkt:'twse' },
+  { id:'5880', name:'合庫金',    sector:'金融',   mkt:'twse' },
+  { id:'2884', name:'玉山金',    sector:'金融',   mkt:'twse' },
+  { id:'2885', name:'元大金',    sector:'金融',   mkt:'twse' },
+  { id:'2880', name:'華南金',    sector:'金融',   mkt:'twse' },
+  { id:'2883', name:'開發金',    sector:'金融',   mkt:'twse' },
+  { id:'2887', name:'台新金',    sector:'金融',   mkt:'twse' },
+  { id:'2890', name:'永豐金',    sector:'金融',   mkt:'twse' },
+  { id:'5871', name:'中租-KY',   sector:'租賃',   mkt:'twse' },
+  { id:'5876', name:'上海商銀',  sector:'金融',   mkt:'twse' },
+  // ── 上市：航運/航空 ──
+  { id:'2603', name:'長榮',      sector:'航運',   mkt:'twse' },
+  { id:'2609', name:'陽明',      sector:'航運',   mkt:'twse' },
+  { id:'2615', name:'萬海',      sector:'航運',   mkt:'twse' },
+  { id:'2618', name:'長榮航',    sector:'航空',   mkt:'twse' },
+  { id:'2610', name:'華航',      sector:'航空',   mkt:'twse' },
+  // ── 上市：傳產/電信/內需 ──
+  { id:'2412', name:'中華電',    sector:'電信',   mkt:'twse' },
+  { id:'4904', name:'遠傳',      sector:'電信',   mkt:'twse' },
+  { id:'3045', name:'台灣大',    sector:'電信',   mkt:'twse' },
+  { id:'1301', name:'台塑',      sector:'塑化',   mkt:'twse' },
+  { id:'1303', name:'南亞',      sector:'塑化',   mkt:'twse' },
+  { id:'1326', name:'台化',      sector:'塑化',   mkt:'twse' },
+  { id:'6505', name:'台塑化',    sector:'石化',   mkt:'twse' },
+  { id:'2002', name:'中鋼',      sector:'鋼鐵',   mkt:'twse' },
+  { id:'2027', name:'大成鋼',    sector:'鋼鐵',   mkt:'twse' },
+  { id:'1605', name:'華新',      sector:'電線電纜', mkt:'twse' },
+  { id:'1101', name:'台泥',      sector:'水泥',   mkt:'twse' },
+  { id:'1102', name:'亞泥',      sector:'水泥',   mkt:'twse' },
+  { id:'2105', name:'正新',      sector:'輪胎',   mkt:'twse' },
+  { id:'2207', name:'和泰車',    sector:'汽車',   mkt:'twse' },
+  { id:'2912', name:'統一超',    sector:'零售',   mkt:'twse' },
+  { id:'1216', name:'統一',      sector:'食品',   mkt:'twse' },
+  { id:'9904', name:'寶成',      sector:'製鞋',   mkt:'twse' },
+  { id:'9910', name:'豐泰',      sector:'製鞋',   mkt:'twse' },
+  { id:'1476', name:'儒鴻',      sector:'紡織',   mkt:'twse' },
+  { id:'1402', name:'遠東新',    sector:'紡織',   mkt:'twse' },
+  { id:'0050', name:'元大台灣50',sector:'ETF',    mkt:'twse' },
+  { id:'0056', name:'元大高股息',sector:'ETF',    mkt:'twse' },
+  // ── 上櫃（TPEx）──
+  { id:'5483', name:'中美晶',    sector:'半導體', mkt:'tpex' },
+  { id:'6488', name:'環球晶',    sector:'半導體', mkt:'tpex' },
+  { id:'3105', name:'穩懋',      sector:'砷化鎵', mkt:'tpex' },
+  { id:'5347', name:'世界先進',  sector:'半導體', mkt:'tpex' },
+  { id:'8299', name:'群聯',      sector:'記憶體', mkt:'tpex' },
+  { id:'3529', name:'力旺',      sector:'IC設計', mkt:'tpex' },
+  { id:'4966', name:'譜瑞-KY',   sector:'IC設計', mkt:'tpex' },
+  { id:'5274', name:'信驊',      sector:'IC設計', mkt:'tpex' },
+  { id:'6510', name:'精測',      sector:'半導體檢測', mkt:'tpex' },
+  { id:'8069', name:'元太',      sector:'電子紙', mkt:'tpex' },
+  { id:'3293', name:'鈊象',      sector:'遊戲',   mkt:'tpex' },
+  { id:'6180', name:'橘子',      sector:'遊戲',   mkt:'tpex' },
+  { id:'8044', name:'網家',      sector:'電商',   mkt:'tpex' },
+  { id:'6446', name:'藥華藥',    sector:'生技',   mkt:'tpex' },
+  { id:'1795', name:'美時',      sector:'生技',   mkt:'tpex' },
 ];
 
 let allStocks = [];       // { ...meta, ohlcv, analysis, reversal }
@@ -101,6 +170,12 @@ async function runScan() {
 
   const stocks = getStockList();
   allStocks = stocks.map(s => ({ ...s, ohlcv: [], analysis: null, reversal: null }));
+  // 上櫃股預先標記市場別，跳過「先試上市再試上櫃」的空探（100 檔時差很多）
+  allStocks.forEach(s => {
+    if (s.mkt === 'tpex') {
+      try { localStorage.setItem(`sym-suffix:${s.id}`, 'TWO'); localStorage.setItem(`mkt:${s.id}`, 'tpex'); } catch {}
+    }
+  });
 
   showScanBar(true);
   updateLoadingText('掃描台股技術指標...');
@@ -940,9 +1015,22 @@ function renderMarketIndex(data) {
 
 // ── Ranking ────────────────────────────────────────────────────────────────
 
+// 市場別判定：清單標記優先，其次看掃描過程記住的來源（自選股）
+function stockMarket(s) {
+  if (s.mkt) return s.mkt;
+  try {
+    if (localStorage.getItem(`mkt:${s.id}`) === 'tpex' || localStorage.getItem(`sym-suffix:${s.id}`) === 'TWO') return 'tpex';
+    if (localStorage.getItem(`mkt:${s.id}`) === 'twse') return 'twse';
+  } catch {}
+  return s.ohlcv?.length ? 'twse' : 'emerging'; // 掃得到但無標記多為上市；掃不到的歸興櫃/其他
+}
+
+let rankingMarket = 'all';
+
 function renderRanking() {
   const ready = allStocks.filter(s => s.analysis);
   let filtered = rankingFilter === 'all' ? ready : ready.filter(s => s.analysis.signal === rankingFilter);
+  if (rankingMarket !== 'all') filtered = filtered.filter(s => stockMarket(s) === rankingMarket);
 
   // Search filter
   const q = document.getElementById('dash-search')?.value?.toLowerCase() || '';
@@ -2927,6 +3015,16 @@ function initEventListeners() {
     });
   });
 
+  // Market filter chips（上市/上櫃/興櫃）
+  document.getElementById('market-filter')?.querySelectorAll('.chip').forEach(c => {
+    c.addEventListener('click', () => {
+      document.getElementById('market-filter').querySelectorAll('.chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+      rankingMarket = c.dataset.market;
+      renderRanking();
+    });
+  });
+
   // Ranking search
   document.getElementById('dash-search')?.addEventListener('input', () => renderRanking());
 
@@ -4488,12 +4586,29 @@ function computeDayTradePicks() {
     const prev = bars[bars.length - 2];
     const chg = prev ? (last.close - prev.close) / prev.close * 100 : 0;
     if (chg < 0.5 || chg > 8) continue;          // 太弱沒動能、近漲停追不得
-    out.push({ s, m, why: [
+
+    // ── 籌碼支撐檢查（當沖最怕拉高沒人接）──
+    // 法人明顯倒貨（賣超逾當日成交 5%）不列；有買超才給籌碼分數並優先排序
+    const net = (s.foreign ?? 0) + (s.investment ?? 0);
+    if (net < 0 && Math.abs(net) > volZ * 0.05) continue;
+    const st = instStreak(s.id);
+    const chipRatio = volZ > 0 ? net / volZ : 0;
+    const chips = net > 0
+      ? `法人買超 ${net.toLocaleString()} 張（佔成交 ${(chipRatio * 100).toFixed(0)}%）${st?.dir > 0 && st.days >= 2 ? `、連 ${st.days} 日買超` : ''}`
+      : '⚠ 法人未明顯站隊 — 拉抬缺乏籌碼支撐，只宜小部位';
+    const dFin = m.oi?.dFin;
+    const finWarn = dFin != null && dFin > 0 && volZ > 0 && dFin >= volZ * 0.08
+      ? `⚠ 融資大增 ${dFin.toLocaleString()} 張，散戶追價籌碼偏髒` : null;
+
+    out.push({ s, m, hasChips: net > 0 ? 1 : 0, why: [
       `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
+      chips,
+      ...(finWarn ? [finWarn] : []),
       `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
-    ], score: chg + atrPct });
+    ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct });
   }
-  out.sort((x, y) => y.score - x.score);
+  // 有法人籌碼支撐者優先
+  out.sort((x, y) => (y.hasChips - x.hasChips) || (y.score - x.score));
   return out.slice(0, 4);
 }
 
