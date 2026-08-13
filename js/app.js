@@ -3501,9 +3501,15 @@ function btADX(highs, lows, closes, n = 14) {
   return out;
 }
 
-function backtestStock(s) {
+// opts：勝率調整參數
+//   rsiMax    — RSI 進場上限（預設 70；調低可避開追高段）
+//   extMax    — 收盤相對 EMA20 乖離上限（如 1.05 = 超過 +5% 不追）
+//   scaleOut  — 觸及 1R 先出一半並把停損上移到成本（大幅減少「賺過又變虧」）
+//   regimeFn  — 大盤濾網：date → 是否允許進場（大盤空頭時不做多）
+function backtestStock(s, opts = {}) {
   const bars = s.ohlcv;
   if (!bars || bars.length < 80) return [];
+  const rsiMax = opts.rsiMax ?? 70;
   const closes = bars.map(b => b.close), highs = bars.map(b => b.high), lows = bars.map(b => b.low);
   const e20 = btEMA(closes, 20), e50 = btEMA(closes, 50);
   const rsi = btRSI(closes), { macd, sig } = btMACD(closes);
@@ -3515,17 +3521,27 @@ function backtestStock(s) {
     if (pos) {
       if (b.exDiv && i > 0) pos.cum += b.divAmt != null ? b.divAmt : Math.max(0, closes[i - 1] - b.open);
       const stopAdj = pos.stop - pos.cum, tgtAdj = pos.t1 - pos.cum;
+      // 1R 分批：先判停損（同日先低後高保守處理），未觸停損且過 1R → 減半、停損上移成本
       let exit = null, why = null;
-      if (b.low <= stopAdj) { exit = stopAdj; why = 'stop'; }
-      else if (b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
-      else if (closes[i] < e20[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
-      else pos.below = 0;
+      if (b.low <= stopAdj) { exit = stopAdj; why = pos.scaled ? 'be' : 'stop'; }
+      else {
+        if (opts.scaleOut && !pos.scaled && b.high >= pos.entry + pos.risk - pos.cum) {
+          pos.scaled = true;
+          pos.realized = 0.5;            // 半數部位在 +1R 落袋
+          pos.stop = pos.entry + pos.cum; // 剩餘部位保本（cum 之後仍會持續平移）
+        }
+        if (b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
+        else if (closes[i] < e20[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
+        else pos.below = 0;
+      }
       if (exit == null && i - pos.i >= 40) { exit = closes[i]; why = 'time'; }
       if (exit != null) {
+        const restR = (exit + pos.cum - pos.entry) / pos.risk;
+        const r = pos.scaled ? pos.realized + 0.5 * restR : restR;
         trades.push({
           id: s.id, name: s.name, entryTime: bars[pos.i].time, exitTime: b.time, why,
-          r: +((exit + pos.cum - pos.entry) / pos.risk).toFixed(2),
-          retPct: +((exit + pos.cum - pos.entry) / pos.entry * 100).toFixed(2),
+          r: +r.toFixed(2),
+          retPct: +(r * pos.risk / pos.entry * 100).toFixed(2),
           hold: i - pos.i,
         });
         pos = null;
@@ -3534,9 +3550,11 @@ function backtestStock(s) {
     }
     if (i + 1 >= bars.length) break;
     const c = closes[i];
+    if (opts.regimeFn && !opts.regimeFn(b.time)) continue;      // 大盤濾網
     if (!(c > e20[i] && e20[i] > e50[i])) continue;
+    if (opts.extMax && c > e20[i] * opts.extMax) continue;       // 乖離過大不追
     if (!(macd[i] > sig[i])) continue;
-    if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < 70)) continue;
+    if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < rsiMax)) continue;
     if (!(adx[i] != null && adx[i] >= 20)) continue;
     const entry = bars[i + 1].open;
     const a = atr[i] || entry * 0.02;
@@ -3544,9 +3562,24 @@ function backtestStock(s) {
     const maxRisk = Math.min(entry * 0.08, a * 3);
     if (entry - stop > maxRisk) stop = entry - maxRisk;
     if (stop >= entry) continue;
-    pos = { i: i + 1, entry, stop, risk: entry - stop, t1: entry + (entry - stop) * 2, cum: 0, below: 0 };
+    pos = { i: i + 1, entry, stop, risk: entry - stop, t1: entry + (entry - stop) * 2, cum: 0, below: 0, scaled: false, realized: 0 };
   }
   return trades;
+}
+
+// 大盤濾網：加權指數收盤 > 其 50 日 EMA 的日期才允許進場
+function makeRegimeFn(twiiBars) {
+  if (!twiiBars || twiiBars.length < 60) return null;
+  const closes = twiiBars.map(b => b.close);
+  const e50 = btEMA(closes, 50);
+  const dates = twiiBars.map(b => b.time);
+  return (date) => {
+    // 找最後一根 ≤ date 的大盤 K（日期均為 ISO 字串，可直接比較）
+    let lo = 0, hi = dates.length - 1, idx = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (dates[mid] <= date) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (idx < 50) return true; // 資料不足時不擋（誠實：無法判斷就不假裝有濾網）
+    return closes[idx] > e50[idx];
+  };
 }
 
 function summarizeBacktest(trades) {
@@ -3581,16 +3614,32 @@ async function runBacktest() {
   const ready = allStocks.filter(s => s.ohlcv?.length >= 80);
   if (ready.length < 5) { el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">歷史資料尚未就緒，請等掃描完成後再執行。</p>'; return; }
   el.innerHTML = '<div class="adv-loading">回測中...</div>';
-  const all = [];
+
+  // 調整版參數：大盤 EMA50 濾網 + RSI 上限 65 + 乖離 >5% 不追 + 1R 減半保本
+  let regimeFn = null;
+  try { regimeFn = makeRegimeFn(await fetchTWIIOHLC(14)); } catch {}
+  const TUNED = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn };
+
+  const base = [], tuned = [];
   for (let k = 0; k < ready.length; k++) {
-    try { all.push(...backtestStock(ready[k])); } catch (e) { console.warn(`回測 ${ready[k].id} 失敗:`, e); }
+    try {
+      base.push(...backtestStock(ready[k]));
+      tuned.push(...backtestStock(ready[k], TUNED));
+    } catch (e) { console.warn(`回測 ${ready[k].id} 失敗:`, e); }
     if (k % 8 === 7) {
       el.innerHTML = `<div class="adv-loading">回測中... ${k + 1}/${ready.length}</div>`;
       await new Promise(r => setTimeout(r, 0)); // 讓出主執行緒，不凍結 UI
     }
   }
-  const res = summarizeBacktest(all);
-  try { localStorage.setItem('backtest-result', JSON.stringify({ at: new Date().toISOString().slice(0, 10), universe: ready.length, ...res })); } catch {}
+  const res = summarizeBacktest(tuned);
+  const baseRes = summarizeBacktest(base);
+  try {
+    localStorage.setItem('backtest-result', JSON.stringify({
+      at: new Date().toISOString().slice(0, 10), universe: ready.length, hasRegime: !!regimeFn,
+      ...res,
+      base: { trades: baseRes.trades, winRate: baseRes.winRate, avgR: baseRes.avgR, pf: baseRes.pf, maxConsec: baseRes.maxConsec },
+    }));
+  } catch {}
   renderBacktest();
 }
 
@@ -3601,8 +3650,11 @@ function renderBacktest() {
   try { r = JSON.parse(localStorage.getItem('backtest-result') || 'null'); } catch { r = null; }
   const btn = '<button class="btn-ghost" style="padding:5px 14px;font-size:0.74rem;margin-top:8px" onclick="runBacktest()">🔄 重新回測</button>';
   if (!r) { el.innerHTML = '<button class="btn-primary" style="padding:7px 18px;font-size:0.78rem" onclick="runBacktest()">▶ 執行回測（掃描完成後可用）</button>'; return; }
-  if (!r.trades) { el.innerHTML = `<p style="font-size:0.8rem;color:var(--text3)">近 14 個月內沒有任何一天同時滿足全部進場條件 — 條件偏嚴屬正常，等市況轉多再驗證。</p>${btn}`; return; }
-  const whyName = { stop: '停損', target: '達 2R 目標', trail: '破 EMA20 出場', time: '時間停損' };
+  if (!r.trades) {
+    el.innerHTML = `<p style="font-size:0.8rem;color:var(--text3)">調整版（含大盤濾網、RSI ≤65、乖離 ≤5%）近 14 個月無符合全部條件的進場點 — 濾網偏嚴屬正常，代表這段期間多數進場點品質不佳。${r.base?.trades ? `基準版（無濾網）同期有 ${r.base.trades} 筆、勝率 ${r.base.winRate}%，可對照參考。` : ''}</p>${btn}`;
+    return;
+  }
+  const whyName = { stop: '停損', target: '達 2R 目標', trail: '破 EMA20 出場', time: '時間停損', be: '1R 減半後保本出場' };
   const verdict = r.pf == null || r.pf >= 1.5
     ? { t: '✅ 此技術條件過去 14 個月具正期望值優勢', c: 'var(--bull)' }
     : r.pf >= 1.0
@@ -3618,6 +3670,10 @@ function renderBacktest() {
       <div class="inst-card"><div class="inst-card-lbl">平均持有</div><div class="inst-card-val">${r.avgHold} 日</div></div>
     </div>
     <div style="padding:9px 12px;border-radius:8px;background:${verdict.c}0d;border-left:3px solid ${verdict.c};font-size:0.78rem;color:${verdict.c};font-weight:600;margin-bottom:8px">${verdict.t}</div>
+    ${r.base ? `<div style="font-size:0.73rem;color:var(--text3);margin-bottom:8px;padding:7px 11px;border-radius:8px;background:rgba(255,255,255,0.03)">
+      對照｜基準版（無濾網、固定 2R）：${r.base.trades} 筆・勝率 ${r.base.winRate}%・平均 R ${r.base.avgR > 0 ? '+' : ''}${r.base.avgR}・獲利因子 ${r.base.pf ?? '∞'}・最大連虧 ${r.base.maxConsec} 筆<br>
+      調整版加入：大盤站上 50 日均線才進場${r.hasRegime ? '' : '（本輪大盤資料未到位，此濾網未生效）'}・RSI 上限 65・乖離 EMA20 逾 5% 不追・達 1R 先減半並保本
+    </div>` : ''}
     <div style="font-size:0.74rem;color:var(--text2);line-height:1.7">
       出場分佈：${Object.entries(r.byWhy).map(([w, n]) => `${whyName[w] || w} ${n} 筆`).join('・')}<br>
       ${r.best?.length ? `此規則最適合：${r.best.map(x => `${x.name}（均 ${x.avgR > 0 ? '+' : ''}${x.avgR}R）`).join('、')}<br>` : ''}
@@ -4351,6 +4407,7 @@ function renderEntrySignals() {
       <div style="font-size:0.76rem;color:var(--text2);margin-top:5px;font-family:var(--mono)">
         進場 ${p.lo} ~ ${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）｜${p.holdOn ? '無壓力續抱' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}
       </div>
+      <div style="font-size:0.7rem;color:var(--blue);margin-top:3px">紀律：觸及 1R（${(p.lo * 2 - p.stop).toFixed(2)}）先減碼一半、停損上移至成本 — 回測驗證可大幅減少「賺過又變虧」</div>
       <div style="font-size:0.73rem;color:var(--text3);margin-top:4px">${(ltWhy || d.reasons).slice(0, 3).join('・')}</div>
       <div style="margin-top:7px">${inH.has(s.id)
         ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
@@ -4446,6 +4503,7 @@ function notifyEntrySignals() {
     return `${tag}｜${s.name}(${s.id})　綜合 ${d.total}／100\n` +
       `　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）\n` +
       `　${p.holdOn ? '上方無壓力，續抱為主' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}\n` +
+      `　1R ${(p.lo * 2 - p.stop).toFixed(2)} 先減半、停損上移成本\n` +
       `　依據：${sup.join('・') || '技術面轉強'}`;
   }).join('\n\n');
 
