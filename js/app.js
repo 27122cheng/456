@@ -3957,7 +3957,7 @@ function getHoldings() {
 }
 function saveHoldings(h) { localStorage.setItem('my-holdings', JSON.stringify(h)); }
 
-function addHolding(stockId) {
+function addHolding(stockId, kind = 'long') {
   const s = allStocks.find(x => x.id === stockId);
   if (!s?.analysis) { showToast('資料未就緒，稍後再試', 'error'); return; }
   const holdings = getHoldings();
@@ -3975,7 +3975,7 @@ function addHolding(stockId) {
     id: stockId, name: s.name, entry: +entry.toFixed(2),
     stop: p?.ok ? p.stop : +(entry * 0.93).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
-    src: 'ai', kind: 'long',
+    src: 'ai', kind: kind === 'day' ? 'day' : 'long',
     planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
     addedAt: new Date().toISOString().slice(0, 10),
     // 進場情境快照 — 結案後檢討「當時憑什麼進場」的依據
@@ -4269,19 +4269,78 @@ function renderHoldings() {
   renderEntrySignals();
 }
 
-// 持有中頁：今日推薦交易
+// ── 推薦交易的持有週期分類 ─────────────────────────────────────────────────
+// 長期（3 個月以上）：長期趨勢結構 + 基本面至少兩項過硬，靠營收/獲利撐 3 個月。
+// 短期波段（數日~數週）：通過進場門檻但基本面/長期結構不足以撐長抱。
+// 當沖：流動性 + 波動 + 當日動能的獨立篩選（處置/注意股一律排除）。
+
+function classifyLongTerm(s) {
+  const a = s.analysis;
+  // 長期結構：站上年線且中期均線多頭排列（沒有這個，基本面再好也先不標長抱）
+  if (!(a.ema200 && a.price > a.ema200)) return null;
+  if (!(a.ema50 && a.ema50 > a.ema200)) return null;
+  const why = ['站上年線、中期均線多頭排列'];
+  let f = 0;
+  if (s.rev?.yoy >= 10) { f++; why.push(`月營收年增 +${s.rev.yoy.toFixed(0)}%`); }
+  if (s.rev?.cumYoy >= 5) { f++; why.push(`累計營收年增 +${s.rev.cumYoy.toFixed(0)}%`); }
+  if (s._fin?.grossMargin >= 25) { f++; why.push(`毛利率 ${s._fin.grossMargin.toFixed(0)}%`); }
+  if (s._fin?.roe >= 10) { f++; why.push(`ROE ${s._fin.roe.toFixed(0)}%`); }
+  if (s._fd?.pe > 0 && s._fd.pe < 25) { f++; why.push(`本益比 ${s._fd.pe.toFixed(1)}x 未過熱`); }
+  if (s._fd?.divYield >= 0.03) { f++; why.push(`殖利率 ${(s._fd.divYield * 100).toFixed(1)}%`); }
+  if (f < 2) return null; // 基本面證據不足兩項 → 不夠格標「至少抱 3 個月」
+  const st = instStreak(s.id);
+  if (st?.dir > 0 && st.days >= 3) why.push(`法人連 ${st.days} 日買超`);
+  return why;
+}
+
+function computeDayTradePicks() {
+  const ready = allStocks.filter(s => s.analysis && s.ohlcv?.length >= 21);
+  const out = [];
+  for (const s of ready) {
+    if (s._alert) continue;                      // 注意/處置股不當沖
+    const a = s.analysis;
+    const bars = s.ohlcv;
+    const last = bars[bars.length - 1];
+    const vols = bars.map(b => b.volume);
+    const n = Math.min(20, vols.length - 1);
+    const avg = vols.slice(-n - 1, -1).reduce((x, y) => x + y, 0) / Math.max(1, n);
+    const volZ = last.volume / 1000;
+    if (volZ < 5000) continue;                   // 流動性：日成交 5000 張以上
+    const m = buildManagerAnalysis(s);
+    if (!m || m.dir < 1) continue;               // 至少不偏空
+    const atrPct = (m.atr / a.price) * 100;
+    if (atrPct < 1.8) continue;                  // 波動要夠，否則沖不出價差
+    if (!(avg > 0 && last.volume >= avg * 1.3 && last.close > last.open)) continue; // 今日放量收紅
+    const prev = bars[bars.length - 2];
+    const chg = prev ? (last.close - prev.close) / prev.close * 100 : 0;
+    if (chg < 0.5 || chg > 8) continue;          // 太弱沒動能、近漲停追不得
+    out.push({ s, m, why: [
+      `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
+      `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
+    ], score: chg + atrPct });
+  }
+  out.sort((x, y) => y.score - x.score);
+  return out.slice(0, 4);
+}
+
+// 持有中頁：今日推薦交易（分三類呈現）
 function renderEntrySignals() {
   const el = document.getElementById('entry-signals-body');
   if (!el) return;
   const ready = allStocks.filter(s => s.analysis).length;
   if (ready < 5) { el.innerHTML = '<div class="adv-loading">等待掃描完成...</div>'; return; }
   const picks = computeEntrySignals();
-  if (!picks.length) {
-    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">今日無符合條件的推薦 — 標準較嚴（研判偏多 + 綜合 ≥65 + 非追高 + 非處置股），寧可空手也不硬給訊號。</p>';
-    return;
-  }
   const inH = new Set(getHoldings().map(h => h.id));
-  el.innerHTML = picks.slice(0, 6).map(({ s, m, p, d }) => `
+
+  const longs = [], swings = [];
+  for (const pk of picks.slice(0, 8)) {
+    const ltWhy = classifyLongTerm(pk.s);
+    if (ltWhy) longs.push({ ...pk, ltWhy });
+    else swings.push(pk);
+  }
+  const days = computeDayTradePicks();
+
+  const card = ({ s, m, p, d, ltWhy }, kind) => `
     <div style="padding:11px 13px;border-radius:9px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.15);margin-bottom:9px">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <strong style="font-size:0.88rem;cursor:pointer" onclick="openStock('${s.id}')">${s.name} <span style="color:var(--text3);font-size:0.74rem">${s.id}</span></strong>
@@ -4292,11 +4351,40 @@ function renderEntrySignals() {
       <div style="font-size:0.76rem;color:var(--text2);margin-top:5px;font-family:var(--mono)">
         進場 ${p.lo} ~ ${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）｜${p.holdOn ? '無壓力續抱' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}
       </div>
-      <div style="font-size:0.73rem;color:var(--text3);margin-top:4px">${d.reasons.slice(0, 3).join('・')}</div>
+      <div style="font-size:0.73rem;color:var(--text3);margin-top:4px">${(ltWhy || d.reasons).slice(0, 3).join('・')}</div>
       <div style="margin-top:7px">${inH.has(s.id)
         ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
-        : `<button class="btn-primary" style="padding:5px 14px;font-size:0.74rem" onclick="addHolding('${s.id}')">📌 買進後記錄持倉</button>`}</div>
-    </div>`).join('');
+        : `<button class="btn-primary" style="padding:5px 14px;font-size:0.74rem" onclick="addHolding('${s.id}','${kind}')">📌 買進後記錄持倉</button>`}</div>
+    </div>`;
+
+  const dayCard = ({ s, m, why }) => `
+    <div style="padding:10px 13px;border-radius:9px;background:rgba(245,158,11,0.05);border:1px solid rgba(245,158,11,0.18);margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:0.86rem;cursor:pointer" onclick="openStock('${s.id}')">${s.name} <span style="color:var(--text3);font-size:0.72rem">${s.id}</span></strong>
+        <span style="font-size:0.66rem;color:${m.stanceColor}">${m.stance}</span>
+        <span style="margin-left:auto;font-size:0.7rem;color:var(--text3)">現價 ${s.analysis.price.toFixed(2)}</span>
+      </div>
+      <div style="font-size:0.73rem;color:var(--text2);margin-top:4px;line-height:1.6">${why.join('・')}</div>
+      <div style="margin-top:6px">${inH.has(s.id)
+        ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
+        : `<button class="btn-ghost" style="padding:4px 13px;font-size:0.72rem" onclick="addHolding('${s.id}','day')">⚡ 記錄當沖單</button>`}</div>
+    </div>`;
+
+  const sect = (title, note, html) => html
+    ? `<div style="font-size:0.8rem;font-weight:700;color:var(--text2);margin:12px 0 2px">${title}</div>
+       <div style="font-size:0.68rem;color:var(--text3);margin-bottom:8px">${note}</div>${html}`
+    : '';
+
+  const body =
+    sect('🏛 可長期持有（3 個月以上）', '長期趨勢結構＋至少兩項基本面支撐，適合大部位慢慢佈局、用季線防守',
+      longs.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
+    sect('📈 短期波段（數日～數週）', '技術與籌碼轉強但基本面支撐不足以長抱，按建議停損/目標紀律操作',
+      swings.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
+    sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋當日動能篩選（處置/注意股已排除）。以日線資料為基礎，開盤後請以即時走勢確認，收盤前務必出場',
+      days.filter(dp => !picks.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
+
+  el.innerHTML = body ||
+    '<p style="font-size:0.8rem;color:var(--text3)">今日三類皆無符合條件的推薦 — 標準較嚴（研判偏多 + 綜合 ≥65 + 非追高 + 非處置股），寧可空手也不硬給訊號。</p>';
 }
 
 // 每日一次：持倉出場訊號 Telegram 推送
@@ -4351,14 +4439,24 @@ function notifyEntrySignals() {
   if (!picks.length) return;
 
   const lines = picks.slice(0, 5).map(({ s, p, d }) => {
-    const sup = [...p.support.chips.slice(0, 1), ...p.support.fund.slice(0, 1), ...p.support.tech.slice(0, 1)];
-    return `📈 ${s.name}(${s.id})　綜合 ${d.total}／100\n` +
+    const ltWhy = classifyLongTerm(s);
+    const tag = ltWhy ? '🏛 長期持有（3個月以上）' : '📈 短期波段';
+    const sup = ltWhy ? ltWhy.slice(0, 2)
+      : [...p.support.chips.slice(0, 1), ...p.support.fund.slice(0, 1), ...p.support.tech.slice(0, 1)];
+    return `${tag}｜${s.name}(${s.id})　綜合 ${d.total}／100\n` +
       `　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）\n` +
       `　${p.holdOn ? '上方無壓力，續抱為主' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}\n` +
       `　依據：${sup.join('・') || '技術面轉強'}`;
   }).join('\n\n');
 
-  tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}\n\n⚠ 僅供參考，非投資建議`);
+  // 當沖參考獨立列出（極高風險，僅日線資料篩選）
+  const days = computeDayTradePicks().filter(dp => !picks.some(pk => pk.s.id === dp.s.id)).slice(0, 3);
+  const dayLines = days.length
+    ? `\n\n⚡ 當沖參考（極高風險，開盤後請以即時走勢確認）\n` +
+      days.map(({ s, why }) => `・${s.name}(${s.id})：${why.join('；')}`).join('\n')
+    : '';
+
+  tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}\n\n⚠ 僅供參考，非投資建議`);
   localStorage.setItem('tg-entry-date', today);
 }
 
