@@ -168,13 +168,22 @@ function cacheGetStale(key, maxAge = 24 * 60 * 60 * 1000) {
 }
 
 function cacheSet(key, data) {
+  const val = JSON.stringify({ t: Date.now(), data });
   try {
-    localStorage.setItem(key, JSON.stringify({ t: Date.now(), data }));
+    localStorage.setItem(key, val);
   } catch {
-    // 空間滿了 → 清掉舊行情快取再試一次
+    // 空間滿了 → 從最舊的快取開始淘汰（100 檔的月 K 快取量大，
+    // 全清會讓每輪掃描都重抓 → 改成汰舊留新，命中率高很多）
     try {
-      Object.keys(localStorage).filter(k => k.startsWith('cache:')).forEach(k => localStorage.removeItem(k));
-      localStorage.setItem(key, JSON.stringify({ t: Date.now(), data }));
+      const ks = Object.keys(localStorage).filter(k => k.startsWith('cache:'))
+        .map(k => { let t = 0; try { t = JSON.parse(localStorage.getItem(k))?.t || 0; } catch {} return { k, t }; })
+        .sort((a, b) => a.t - b.t);
+      for (let i = 0; i < ks.length; i++) {
+        localStorage.removeItem(ks[i].k);
+        if (i % 20 === 19 || i === ks.length - 1) {
+          try { localStorage.setItem(key, val); return; } catch {}
+        }
+      }
     } catch {}
   }
 }

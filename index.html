@@ -252,18 +252,6 @@
         <div id="capital-flow-body"><div class="adv-loading">載入資金流動事件...</div></div>
       </div>
 
-      <!-- 反轉機會 -->
-      <div class="section-row" style="margin-top:16px">
-        <div class="section-label">
-          <span class="pulse-dot"></span>
-          反轉機會
-        </div>
-        <span class="rev-badge" id="rev-count">0</span>
-      </div>
-      <div class="reversal-grid" id="reversal-grid">
-        <div class="rev-placeholder">正在掃描反轉訊號...</div>
-      </div>
-
     </section>
 
     <!-- ═══════════════════ 市場排名頁面 ═══════════════════ -->
@@ -356,6 +344,24 @@
           <button class="chip chip-bear" data-filter="空頭">空頭</button>
           <button class="chip chip-sbear" data-filter="強勢空頭">強勢空頭</button>
         </div>
+        <div class="filter-chips" id="market-filter" style="margin-top:8px">
+          <button class="chip active" data-market="all">全部市場</button>
+          <button class="chip" data-market="twse">上市</button>
+          <button class="chip" data-market="tpex">上櫃</button>
+          <button class="chip" data-market="emerging">興櫃/其他</button>
+        </div>
+      </div>
+
+      <!-- 反轉機會（自儀表板移至市場排名下方） -->
+      <div class="section-row" style="margin-top:16px">
+        <div class="section-label">
+          <span class="pulse-dot"></span>
+          反轉機會
+        </div>
+        <span class="rev-badge" id="rev-count">0</span>
+      </div>
+      <div class="reversal-grid" id="reversal-grid">
+        <div class="rev-placeholder">正在掃描反轉訊號...</div>
       </div>
     </section>
 
