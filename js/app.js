@@ -168,7 +168,10 @@ async function startScan() {
 
 async function runScan() {
 
-  const stocks = getStockList();
+  // 掃描範圍 = 正式清單 + 法人自動追蹤清單（全市場粗篩自動納入，不必手動加）
+  const baseList = getStockList();
+  const baseIds = new Set(baseList.map(x => x.id));
+  const stocks = [...baseList, ...getAutoStocks().filter(a => !baseIds.has(a.id))];
   allStocks = stocks.map(s => ({ ...s, ohlcv: [], analysis: null, reversal: null }));
   // 上櫃股預先標記市場別，跳過「先試上市再試上櫃」的空探（100 檔時差很多）
   allStocks.forEach(s => {
@@ -1274,6 +1277,25 @@ function buildManagerAnalysis(s) {
     else notes.push(`外資買賣超僅 ${mag.toFixed(1)}% 日均量，影響有限`);
   } else if (foreign != null && Math.abs(foreign) > 1000) {
     add(0.6, foreign > 0 ? 1 : -1, `外資${foreign > 0 ? '買' : '賣'}超 ${Math.abs(foreign).toLocaleString()} 張`, 'chip');
+  }
+
+  // 投信（台股特性：投信認養常伴隨波段行情，權重次於外資）
+  const inv = s.investment;
+  if (inv != null && Math.abs(inv) >= 1000) {
+    add(1, inv > 0 ? 1 : -1, `投信${inv > 0 ? '買' : '賣'}超 ${Math.abs(inv).toLocaleString()} 張${inv > 0 ? '（投信認養）' : ''}`, 'chip');
+  } else if (inv != null && Math.abs(inv) >= 300) {
+    add(0.5, inv > 0 ? 1 : -1, `投信${inv > 0 ? '買' : '賣'}超 ${Math.abs(inv).toLocaleString()} 張`, 'chip');
+  }
+  // 自營商（短線資金，權重最低，僅大額才列）
+  const dl = s.dealer;
+  if (dl != null && Math.abs(dl) >= 1500) {
+    add(0.4, dl > 0 ? 1 : -1, `自營商${dl > 0 ? '買' : '賣'}超 ${Math.abs(dl).toLocaleString()} 張（短線資金）`, 'chip');
+  }
+  // 外資 + 投信同步同向 → 雙引擎，額外佐證
+  if (foreign != null && inv != null && foreign > 500 && inv > 300) {
+    add(0.8, 1, '外資與投信同步買超（雙引擎籌碼）', 'chip');
+  } else if (foreign != null && inv != null && foreign < -500 && inv < -300) {
+    add(0.8, -1, '外資與投信同步賣超（法人一致撤退）', 'chip');
   }
 
   const streak = instStreak(s.id);
@@ -3939,7 +3961,7 @@ async function detectWhales() {
     const n = Math.min(20, vols.length - 1);
     const avg20 = vols.slice(-n - 1, -1).reduce((x, y) => x + y, 0) / Math.max(1, n); // 股
     const avgZ = avg20 / 1000; // 張
-    const net = (s.foreign ?? 0) + (s.investment ?? 0); // 張
+    const net = (s.foreign ?? 0) + (s.investment ?? 0) + (s.dealer ?? 0); // 三大法人合計（張）
     const st = instStreak(s.id);
 
     // ── 大量買入跡象（必須有法人籌碼證據，單純爆量不算大戶） ──
@@ -4027,6 +4049,25 @@ function renderWhales() {
 
 let _screenResults = null;
 
+// 法人自動追蹤清單：粗篩合格者自動納入下輪掃描（毋須手動加入），
+// 連續 7 天未再入榜自動移除，上限 10 檔避免清單無限膨脹
+function getAutoStocks() {
+  try { return JSON.parse(localStorage.getItem('auto-stocks') || '[]'); } catch { return []; }
+}
+function updateAutoStocks(cands) {
+  const today = new Date().toISOString().slice(0, 10);
+  const cutoff = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+  let autos = getAutoStocks().filter(a => (a.lastHit || '') >= cutoff);
+  for (const c of cands) {
+    const ex = autos.find(a => a.id === c.id);
+    if (ex) { ex.lastHit = today; ex.name = c.name; }
+    else autos.push({ id: c.id, name: c.name, sector: '法人動向', lastHit: today, auto: true });
+  }
+  autos = autos.slice(-10);
+  try { localStorage.setItem('auto-stocks', JSON.stringify(autos)); } catch {}
+  return autos;
+}
+
 async function marketWideWhaleScreen() {
   const [t86, day] = await Promise.all([
     fetchT86Parsed().catch(() => null),
@@ -4036,7 +4077,7 @@ async function marketWideWhaleScreen() {
   const inList = new Set(getStockList().map(x => x.id));
   const cands = [];
   for (const r of t86) {
-    const net = r.foreign + r.investment;      // 張
+    const net = r.foreign + r.investment + (r.dealer || 0); // 三大法人合計（張）
     if (net < 1000) continue;                  // 買超規模門檻
     const q = day[r.id];
     if (!q?.close || !q.volume) continue;
@@ -4050,6 +4091,8 @@ async function marketWideWhaleScreen() {
   }
   cands.sort((a, b) => b.ratio - a.ratio);
   _screenResults = cands.filter(c => !c.inList).slice(0, 10);
+  // 合格者自動納入下輪掃描 — 不必手動按加入
+  updateAutoStocks(_screenResults);
   renderMarketScreen();
 }
 
@@ -4066,12 +4109,13 @@ function renderMarketScreen() {
   }
   el.innerHTML = _screenResults.map(c => `
     <div style="display:flex;align-items:center;gap:8px;font-size:0.78rem;padding:6px 0;border-bottom:1px solid var(--border);flex-wrap:wrap">
-      <strong>${c.name} <span style="color:var(--text3);font-size:0.7rem">${c.id}</span></strong>
+      <strong style="cursor:pointer" onclick="openStock('${c.id}')">${c.name} <span style="color:var(--text3);font-size:0.7rem">${c.id}</span></strong>
       <span style="color:var(--text3);font-size:0.72rem;font-family:var(--mono)">收 ${c.close}${c.chg != null ? `（${c.chg >= 0 ? '+' : ''}${c.chg}）` : ''}</span>
       <span style="color:var(--blue);font-size:0.72rem">法人買超 ${c.net.toLocaleString()} 張・佔成交 ${(c.ratio * 100).toFixed(0)}%</span>
-      <button class="btn-ghost" style="margin-left:auto;padding:3px 12px;font-size:0.7rem" onclick="addWatchStock('${c.id}','${c.name}')">＋ 加入掃描</button>
+      <span style="margin-left:auto;font-size:0.68rem;color:var(--bull)">✓ 已自動納入掃描</span>
+      <button class="btn-ghost" style="padding:3px 10px;font-size:0.68rem" onclick="addWatchStock('${c.id}','${c.name}')">＋轉正式自選</button>
     </div>`).join('') +
-    '<div style="font-size:0.68rem;color:var(--text3);margin-top:6px">粗篩僅用單日快照，未過陷阱檢查 — 加入掃描清單後，下輪會做完整技術/籌碼/陷阱分析</div>';
+    '<div style="font-size:0.68rem;color:var(--text3);margin-top:6px">合格者已自動納入下輪掃描做完整技術/籌碼/陷阱分析（連 7 天未再入榜自動移除）；按「轉正式自選」可永久保留</div>';
 }
 
 function addWatchStock(id, name) {
@@ -4602,7 +4646,7 @@ function computeDayTradePicks() {
 
     // ── 籌碼支撐檢查（當沖最怕拉高沒人接）──
     // 法人明顯倒貨（賣超逾當日成交 5%）不列；有買超才給籌碼分數並優先排序
-    const net = (s.foreign ?? 0) + (s.investment ?? 0);
+    const net = (s.foreign ?? 0) + (s.investment ?? 0) + (s.dealer ?? 0); // 三大法人合計
     if (net < 0 && Math.abs(net) > volZ * 0.05) continue;
     const st = instStreak(s.id);
     const chipRatio = volZ > 0 ? net / volZ : 0;
