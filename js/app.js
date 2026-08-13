@@ -1343,8 +1343,35 @@ function buildManagerAnalysis(s) {
     else notes.push(a.pattern.txt);
   }
   const cSum = (a.candles || []).reduce((n, c) => n + c.dir, 0);
-  if (cSum > 0) { const c = a.candles.find(x => x.dir > 0); add(0.5, 1, `${c.name}：${c.txt}`); }
-  else if (cSum < 0) { const c = a.candles.find(x => x.dir < 0); add(0.5, -1, `${c.name}：${c.txt}`); }
+  // K 棒型態依「位置語境」加權：支撐位的多方型態／壓力位的空方型態可信度加倍，
+  // 半空中的型態多為雜訊 → 權重砍半（正統裸 K：型態只在關鍵位置才有意義）
+  const paW = (dir) => {
+    const at = a.paCtx?.at;
+    if (dir > 0) return at === 'support' ? 1.2 : at === 'resistance' ? 0.25 : 0.4;
+    return at === 'resistance' ? 1.2 : at === 'support' ? 0.25 : 0.4;
+  };
+  const paLoc = (dir) => {
+    const at = a.paCtx?.at;
+    if (dir > 0 && at === 'support') return `（出現在支撐 ${a.paCtx.level} — 位置關鍵，可信度高）`;
+    if (dir < 0 && at === 'resistance') return `（出現在壓力 ${a.paCtx.level} — 位置關鍵，可信度高）`;
+    if (at === 'mid') return '（出現在半空中，僅供參考）';
+    return '';
+  };
+  if (cSum > 0) { const c = a.candles.find(x => x.dir > 0); add(paW(1), 1, `${c.name}：${c.txt}${paLoc(1)}`); }
+  else if (cSum < 0) { const c = a.candles.find(x => x.dir < 0); add(paW(-1), -1, `${c.name}：${c.txt}${paLoc(-1)}`); }
+
+  // 假突破（Spring/Upthrust）— 勝率最高的裸 K 訊號，權重高
+  if (a.falseBreak) add(1.5, a.falseBreak.type === 'spring' ? 1 : -1, a.falseBreak.txt);
+
+  // 未回補跳空缺口 = 最乾淨的支撐/壓力
+  if (a.gaps?.supportGap && price > 0 && (price - a.gaps.supportGap.top) / price <= 0.05)
+    add(0.6, 1, `下方 ${a.gaps.supportGap.bottom}~${a.gaps.supportGap.top} 有未回補上跳缺口（缺口支撐）`);
+  if (a.gaps?.resistGap && price > 0 && (a.gaps.resistGap.bottom - price) / price <= 0.05)
+    add(0.6, -1, `上方 ${a.gaps.resistGap.bottom}~${a.gaps.resistGap.top} 有未回補下跳缺口（缺口壓力）`);
+  if (a.gaps?.recent) {
+    if (a.gaps.recent.type === 'up' && volR >= 1.5) add(0.8, 1, `帶量向上跳空缺口（${a.gaps.recent.bottom}~${a.gaps.recent.top}）未回補 — 突破缺口特徵`);
+    else if (a.gaps.recent.type === 'down' && volR >= 1.5) add(0.8, -1, `帶量向下跳空缺口未回補 — 逃逸缺口特徵，趨勢轉弱`);
+  }
   if (a.vpRegime) {
     if (a.vpRegime.dir === 1) add(0.5, 1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
     else if (a.vpRegime.dir === -1) add(0.5, -1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
@@ -2030,9 +2057,16 @@ function renderPatterns(s) {
   if (a.rsiDiv) parts.push(card('🔀 動能背離', a.rsiDiv.txt, tone(a.rsiDiv.type === 'bull' ? 1 : -1)));
   if (a.diverg) parts.push(card('📉 量價背離', a.diverg.txt,
     tone(a.diverg.type === 'bear' ? -1 : a.diverg.type === 'bull' ? 1 : 0)));
-  if (a.candles?.length) parts.push(card('🕯 K 棒訊號',
-    a.candles.map(c => `<strong style="color:${tone(c.dir)}">${c.name}</strong> — ${c.txt}`).join('<br>'),
+  if (a.candles?.length) parts.push(card('🕯 K 棒訊號' + (a.paCtx ? `（位置：${a.paCtx.at === 'support' ? `支撐 ${a.paCtx.level} 附近` : a.paCtx.at === 'resistance' ? `壓力 ${a.paCtx.level} 附近` : '區間中段'}）` : ''),
+    a.candles.map(c => `<strong style="color:${tone(c.dir)}">${c.name}</strong> — ${c.txt}`).join('<br>') +
+    (a.paCtx?.at === 'mid' ? '<br><span style="font-size:0.72rem;color:var(--text3)">位於半空中的型態雜訊居多，研判已自動降低其權重</span>'
+      : a.paCtx ? '<br><span style="font-size:0.72rem;color:var(--bull)">出現在關鍵價位附近 — 研判已提高其權重</span>' : ''),
     tone(a.candles.reduce((n, c) => n + c.dir, 0))));
+  if (a.falseBreak) parts.push(card(a.falseBreak.type === 'spring' ? '🪤 假跌破反轉（Spring）' : '🪤 假突破回落（Upthrust）',
+    a.falseBreak.txt, tone(a.falseBreak.type === 'spring' ? 1 : -1)));
+  if (a.gaps?.list?.length) parts.push(card('🕳 未回補跳空缺口',
+    a.gaps.list.slice(-3).map(g => `${g.type === 'up' ? '⬆ 上跳' : '⬇ 下跳'} ${g.bottom} ~ ${g.top}<span style="font-size:0.72rem;color:var(--text3)">（${g.time}${g.type === 'up' ? '，回測此區有支撐' : '，反彈至此區有壓力'}）</span>`).join('<br>'),
+    'var(--blue)'));
   if (a.vpRegime) parts.push(card('📶 量價關係', `<strong>${a.vpRegime.k}</strong> — ${a.vpRegime.txt}`, tone(a.vpRegime.dir)));
   if (a.vForce) parts.push(card('⚔️ 多空力道', a.vForce.txt +
     `<br><span style="font-size:0.75rem;color:var(--text3)">上漲 ${a.vForce.upDays} 日 / 下跌 ${a.vForce.dnDays} 日${a.vForce.ratio ? `｜漲日均量為跌日的 ${a.vForce.ratio} 倍` : ''}</span>`,
