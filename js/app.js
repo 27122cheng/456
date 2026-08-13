@@ -1237,6 +1237,20 @@ function buildManagerAnalysis(s) {
   const notes = [];
   const add = (w, d, txt, kind = 'tech') => ev.push({ w, d, txt, kind });
 
+  // ⓪ 趨勢判定引擎（多因子：均線斜率/持續性/ADX 方向/Choppiness/ZigZag 段數）
+  if (a.trend) {
+    const t = a.trend;
+    if (t.phase === 'strong-up') add(2.2, 1, `趨勢判定：${t.phaseTxt}`);
+    else if (t.phase === 'up') add(1.2, 1, `趨勢判定：${t.phaseTxt}`);
+    else if (t.phase === 'strong-down') add(2.2, -1, `趨勢判定：${t.phaseTxt}`);
+    else if (t.phase === 'down') add(1.2, -1, `趨勢判定：${t.phaseTxt}`);
+    else notes.push(`趨勢判定：${t.phaseTxt}`);
+    // 成熟度：末升段的多方證據要打折 — 追價風險最高的階段
+    if (t.maturity === 'late' && (t.phase === 'up' || t.phase === 'strong-up'))
+      add(0.8, -1, t.maturityTxt);
+    else if (t.maturityTxt) notes.push(t.maturityTxt);
+  }
+
   // ① 均線結構
   if (a.ema20 > a.ema50 && price > a.ema20) add(2, 1, '均線多頭排列且站穩 EMA20');
   else if (price < a.ema20) add(1.5, -1, '跌破 EMA20 短均');
@@ -1457,6 +1471,11 @@ function buildManagerAnalysis(s) {
   } else if (a.adx != null && a.adx < 20) {
     dir *= 0.8;    // 無趨勢盤整期，任何方向的訊號都應打折
     notes.push(`ADX ${a.adx.toFixed(0)} 無明確趨勢（盤整），訊號可信度降低`);
+  }
+  // 趨勢引擎判定為盤整市 → 整體再打折（Choppiness 高時趨勢類證據多為假訊號）
+  if (a.trend?.phase === 'range' && Math.abs(dir) > 0.5) {
+    dir *= 0.7;
+    notes.push('趨勢引擎判定盤整市 — 淨方向已按盤整折價，突破確立前勿重倉');
   }
 
   // ⑧ 大盤環境：作為調節係數而非單純加減分
@@ -2047,6 +2066,12 @@ function renderPatterns(s) {
     </div>`;
   const tone = d => d > 0 ? 'var(--bull)' : d < 0 ? 'var(--bear)' : 'var(--yellow)';
   const parts = [];
+
+  if (a.trend) parts.push(card('🧭 趨勢判定引擎',
+    `<strong>${a.trend.phaseTxt}</strong>` +
+    (a.trend.maturityTxt ? `<br>${a.trend.maturityTxt}` : '') +
+    `<br><span style="font-size:0.74rem;color:var(--text3)">EMA20 斜率 ${a.trend.s20 > 0 ? '+' : ''}${a.trend.s20}%/10日｜持續性 ${a.trend.persist}%（近20日收在EMA20上方比例）｜ADX ${a.trend.adx ?? '--'}${a.trend.adxRising ? '↑' : ''}｜Choppiness ${a.trend.chop}｜波段第 ${a.trend.legs || '--'} 段${a.trend.ext200 != null ? `｜乖離年線 ${a.trend.ext200 > 0 ? '+' : ''}${a.trend.ext200}%` : ''}</span>`,
+    a.trend.phase.includes('up') ? tone(1) : a.trend.phase.includes('down') ? tone(-1) : tone(0)));
 
   if (a.structure) parts.push(card('📐 趨勢結構（道氏理論）',
     `${a.structure.txt}<br><span style="font-size:0.75rem;color:var(--text3)">前波高點 ${a.structure.lastSwingHigh}｜前波低點 ${a.structure.lastSwingLow}</span>` +
