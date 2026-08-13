@@ -3508,17 +3508,27 @@ function btADX(highs, lows, closes, n = 14) {
 //   regimeFn  — 大盤濾網：date → 是否允許進場（大盤空頭時不做多）
 //   resistTarget — 停利改用真實壓力區（前波高點/樞紐），非固定 2R；
 //                  無壓力則不設目標、靠移動出場續抱；壓力距離不足 1R 不進場
+//   pullback   — 近 3 根曾回踩 EMA20（貼近成本區買，不在半空中追）
+//   volConfirm — 進場訊號日量能不低於 20 日均量（有量才有跟隨）
+//   frontRun   — 停利掛在壓力前緣（壓力 ×0.995），壓力下常見的「差一點沒到」轉為成交
+//   longTerm   — 長期模式：加要求長期結構（EMA100 之上、EMA50>EMA100），
+//                無固定停利、移動出場改用 EMA50、時間停損放寬到 120 日
 function backtestStock(s, opts = {}) {
   const bars = s.ohlcv;
   if (!bars || bars.length < 80) return [];
   const rsiMax = opts.rsiMax ?? 70;
   const closes = bars.map(b => b.close), highs = bars.map(b => b.high), lows = bars.map(b => b.low);
+  const vols = bars.map(b => b.volume);
   const e20 = btEMA(closes, 20), e50 = btEMA(closes, 50);
+  const e100 = opts.longTerm ? btEMA(closes, 100) : null;
   const rsi = btRSI(closes), { macd, sig } = btMACD(closes);
   const adx = btADX(highs, lows, closes), atr = btATR(highs, lows, closes);
+  const trailEMA = opts.longTerm ? e50 : e20;
+  const timeStop = opts.longTerm ? 120 : 40;
   const trades = [];
   let pos = null;
-  for (let i = 60; i < bars.length; i++) {
+  const startI = opts.longTerm ? 100 : 60;
+  for (let i = startI; i < bars.length; i++) {
     const b = bars[i];
     if (pos) {
       if (b.exDiv && i > 0) pos.cum += b.divAmt != null ? b.divAmt : Math.max(0, closes[i - 1] - b.open);
@@ -3534,10 +3544,11 @@ function backtestStock(s, opts = {}) {
           pos.stop = pos.entry + pos.cum; // 剩餘部位保本（cum 之後仍會持續平移）
         }
         if (tgtAdj != null && b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
-        else if (closes[i] < e20[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
+        else if (closes[i] < trailEMA[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
         else pos.below = 0;
       }
-      if (exit == null && i - pos.i >= 40) { exit = closes[i]; why = 'time'; }
+      if (exit == null && i - pos.i >= timeStop) { exit = closes[i]; why = 'time'; }
+      if (exit == null && i === bars.length - 1 && opts.longTerm) { exit = closes[i]; why = 'end'; } // 長期模式：期末結算未平倉部位
       if (exit != null) {
         const restR = (exit + pos.cum - pos.entry) / pos.risk;
         const r = pos.scaled ? pos.realized + 0.5 * restR : restR;
@@ -3555,7 +3566,15 @@ function backtestStock(s, opts = {}) {
     const c = closes[i];
     if (opts.regimeFn && !opts.regimeFn(b.time)) continue;      // 大盤濾網
     if (!(c > e20[i] && e20[i] > e50[i])) continue;
+    if (opts.longTerm && !(e100 && c > e100[i] && e50[i] > e100[i])) continue; // 長期結構
     if (opts.extMax && c > e20[i] * opts.extMax) continue;       // 乖離過大不追
+    if (opts.pullback && Math.min(lows[i], lows[i - 1], lows[i - 2]) > e20[i] * 1.015) continue; // 近 3 根未回踩 EMA20 → 半空中不追
+    if (opts.volConfirm) {
+      const n = Math.min(20, i);
+      const avgV = vols.slice(i - n, i).reduce((x, y) => x + y, 0) / n;
+      // 回踩日常態量縮，只過濾「明顯量縮」（<0.8 倍均量）的無人問津訊號
+      if (avgV > 0 && vols[i] < avgV * 0.8) continue;
+    }
     if (!(macd[i] > sig[i])) continue;
     if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < rsiMax)) continue;
     if (!(adx[i] != null && adx[i] >= 20)) continue;
@@ -3567,14 +3586,50 @@ function backtestStock(s, opts = {}) {
     if (stop >= entry) continue;
     const risk = entry - stop;
     let t1;
-    if (opts.resistTarget) {
+    if (opts.longTerm) {
+      t1 = null;                                        // 長期：不設固定停利，跟著趨勢走
+    } else if (opts.resistTarget) {
       t1 = btFindResistance(highs, i, entry);           // 最近的真實壓力區
+      if (t1 != null && opts.frontRun) t1 = +(t1 * 0.995).toFixed(2); // 掛壓力前緣，提高成交率
       if (t1 != null && t1 - entry < risk) continue;    // 壓力太近（不足 1R）→ 風險報酬不划算，不進場
       // t1 == null：上方無壓力 → 不設固定目標，靠移動出場續抱（鏡射實盤「無壓力就續抱」）
     } else {
       t1 = entry + risk * 2;                            // 基準版：固定 2R
     }
     pos = { i: i + 1, entry, stop, risk, t1, cum: 0, below: 0, scaled: false, realized: 0 };
+  }
+  return trades;
+}
+
+// 當沖回測（日內近似）：無免費分鐘資料，以「訊號隔日開盤買進、收盤前出場」近似，
+// 停損 -1.5%（同日觸及先保守判停損）。訊號條件鏡射當沖篩選：前日 1.3 倍量收紅、
+// 漲幅 0.5~8%、波動夠、量夠大。
+function backtestDayTrade(s, regimeFn) {
+  const bars = s.ohlcv;
+  if (!bars || bars.length < 40) return [];
+  const closes = bars.map(b => b.close), highs = bars.map(b => b.high), lows = bars.map(b => b.low);
+  const atr = btATR(highs, lows, closes);
+  const trades = [];
+  for (let i = 21; i < bars.length - 1; i++) {
+    const b = bars[i];
+    if (regimeFn && !regimeFn(b.time)) continue;
+    const n = Math.min(20, i);
+    const avgV = bars.slice(i - n, i).reduce((x, y) => x + y.volume, 0) / n;
+    if (!(avgV > 0 && b.volume >= avgV * 1.3 && b.close > b.open)) continue;  // 前日放量收紅
+    if (b.volume / 1000 < 5000) continue;                                      // 流動性
+    const chg = (b.close - closes[i - 1]) / closes[i - 1] * 100;
+    if (chg < 0.5 || chg > 8) continue;
+    if (!atr[i] || atr[i] / b.close < 0.018) continue;                         // 波動不夠沖不出價差
+    const d = bars[i + 1];
+    const entry = d.open;
+    const stop = entry * 0.985;                                                // 日內硬停損 -1.5%
+    const risk = entry - stop;
+    let exit, why;
+    if (d.low <= stop) { exit = stop; why = 'stop'; }        // 保守：同日觸停損先判輸
+    else { exit = d.close; why = 'eod'; }                    // 收盤前出場
+    const r = (exit - entry) / risk;
+    trades.push({ id: s.id, name: s.name, entryTime: d.time, exitTime: d.time, why,
+      r: +r.toFixed(2), retPct: +((exit - entry) / entry * 100).toFixed(2), hold: 1 });
   }
   return trades;
 }
@@ -3644,28 +3699,36 @@ async function runBacktest() {
   if (ready.length < 5) { el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">歷史資料尚未就緒，請等掃描完成後再執行。</p>'; return; }
   el.innerHTML = '<div class="adv-loading">回測中...</div>';
 
-  // 調整版參數：大盤 EMA50 濾網 + RSI 上限 65 + 乖離 >5% 不追 + 1R 減半保本
+  // 調整版參數：大盤濾網 + RSI 65 + 乖離過濾 + 回踩確認 + 量能確認 +
+  // 1R 減半保本 + 壓力區停利（掛前緣）
   let regimeFn = null;
   try { regimeFn = makeRegimeFn(await fetchTWIIOHLC(14)); } catch {}
-  const TUNED = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true };
+  const SWING = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true,
+                  pullback: true, volConfirm: true, frontRun: true };
+  const LONG = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, longTerm: true };
 
-  const base = [], tuned = [];
+  const base = [], swing = [], long = [], day = [];
   for (let k = 0; k < ready.length; k++) {
     try {
       base.push(...backtestStock(ready[k]));
-      tuned.push(...backtestStock(ready[k], TUNED));
+      swing.push(...backtestStock(ready[k], SWING));
+      long.push(...backtestStock(ready[k], LONG));
+      day.push(...backtestDayTrade(ready[k], regimeFn));
     } catch (e) { console.warn(`回測 ${ready[k].id} 失敗:`, e); }
     if (k % 8 === 7) {
       el.innerHTML = `<div class="adv-loading">回測中... ${k + 1}/${ready.length}</div>`;
       await new Promise(r => setTimeout(r, 0)); // 讓出主執行緒，不凍結 UI
     }
   }
-  const res = summarizeBacktest(tuned);
+  const all = [...long, ...swing, ...day];
+  const res = summarizeBacktest(all);
+  const sum4 = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? null, avgR: x.avgR ?? null, pf: x.pf ?? null }; };
   const baseRes = summarizeBacktest(base);
   try {
     localStorage.setItem('backtest-result', JSON.stringify({
       at: new Date().toISOString().slice(0, 10), universe: ready.length, hasRegime: !!regimeFn,
       ...res,
+      cats: { long: sum4(long), swing: sum4(swing), day: sum4(day) },
       base: { trades: baseRes.trades, winRate: baseRes.winRate, avgR: baseRes.avgR, pf: baseRes.pf, maxConsec: baseRes.maxConsec },
     }));
   } catch {}
@@ -3683,7 +3746,7 @@ function renderBacktest() {
     el.innerHTML = `<p style="font-size:0.8rem;color:var(--text3)">調整版（含大盤濾網、RSI ≤65、乖離 ≤5%）近 14 個月無符合全部條件的進場點 — 濾網偏嚴屬正常，代表這段期間多數進場點品質不佳。${r.base?.trades ? `基準版（無濾網）同期有 ${r.base.trades} 筆、勝率 ${r.base.winRate}%，可對照參考。` : ''}</p>${btn}`;
     return;
   }
-  const whyName = { stop: '停損', target: '達壓力區停利', trail: '破 EMA20 出場', time: '時間停損', be: '1R 減半後保本出場' };
+  const whyName = { stop: '停損', target: '達壓力區停利', trail: '破均線出場', time: '時間停損', be: '1R 減半後保本出場', eod: '當沖收盤出場', end: '期末結算' };
   const verdict = r.pf == null || r.pf >= 1.5
     ? { t: '✅ 此技術條件過去 14 個月具正期望值優勢', c: 'var(--bull)' }
     : r.pf >= 1.0
@@ -3699,6 +3762,19 @@ function renderBacktest() {
       <div class="inst-card"><div class="inst-card-lbl">平均持有</div><div class="inst-card-val">${r.avgHold} 日</div></div>
     </div>
     <div style="padding:9px 12px;border-radius:8px;background:${verdict.c}0d;border-left:3px solid ${verdict.c};font-size:0.78rem;color:${verdict.c};font-weight:600;margin-bottom:8px">${verdict.t}</div>
+    ${r.cats ? (() => {
+      const row = (icon, label, c) => c && c.trades
+        ? `<tr><td style="padding:4px 8px">${icon} ${label}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${c.trades}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);font-weight:700;color:${c.winRate >= 50 ? 'var(--bull)' : 'var(--text1)'}">${c.winRate}%</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);color:${c.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${c.avgR > 0 ? '+' : ''}${c.avgR}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${c.pf ?? '∞'}</td></tr>`
+        : `<tr><td style="padding:4px 8px">${icon} ${label}</td><td colspan="4" style="padding:4px 8px;color:var(--text3)">此期間無符合條件的交易</td></tr>`;
+      return `<div style="overflow-x:auto;margin-bottom:8px"><table style="width:100%;border-collapse:collapse;font-size:0.74rem;color:var(--text2)">
+        <tr style="color:var(--text3);font-size:0.68rem"><td style="padding:4px 8px">類別</td><td style="padding:4px 8px;text-align:right">筆數</td><td style="padding:4px 8px;text-align:right">勝率</td><td style="padding:4px 8px;text-align:right">平均R</td><td style="padding:4px 8px;text-align:right">獲利因子</td></tr>
+        ${row('🏛', '長期持有', r.cats.long)}
+        ${row('📈', '短期波段', r.cats.swing)}
+        ${row('⚡', '當沖（日內近似）', r.cats.day)}
+        <tr style="border-top:1px solid var(--border);font-weight:700"><td style="padding:4px 8px">Σ 總計</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${r.trades}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);color:${r.winRate >= 50 ? 'var(--bull)' : 'var(--text1)'}">${r.winRate}%</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono);color:${r.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${r.avgR > 0 ? '+' : ''}${r.avgR}</td><td style="padding:4px 8px;text-align:right;font-family:var(--mono)">${r.pf ?? '∞'}</td></tr>
+      </table></div>
+      <div style="font-size:0.66rem;color:var(--text3);margin-bottom:8px">長期組以 EMA100 作長期結構代理（資料僅 14 個月，年線樣本不足）、EMA50 移動出場；當沖組為「訊號隔日開盤買、收盤前出場、-1.5% 硬停損」的日內近似（無免費分鐘資料）</div>`;
+    })() : ''}
     ${r.base ? `<div style="font-size:0.73rem;color:var(--text3);margin-bottom:8px;padding:7px 11px;border-radius:8px;background:rgba(255,255,255,0.03)">
       對照｜基準版（無濾網、固定 2R）：${r.base.trades} 筆・勝率 ${r.base.winRate}%・平均 R ${r.base.avgR > 0 ? '+' : ''}${r.base.avgR}・獲利因子 ${r.base.pf ?? '∞'}・最大連虧 ${r.base.maxConsec} 筆<br>
       調整版加入：大盤站上 50 日均線才進場${r.hasRegime ? '' : '（本輪大盤資料未到位，此濾網未生效）'}・RSI 上限 65・乖離 EMA20 逾 5% 不追・達 1R 先減半並保本・停利改用真實壓力區（前波高點/樞紐；無壓力則續抱移動出場、壓力不足 1R 不進場）<br>
