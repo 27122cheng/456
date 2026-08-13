@@ -3506,6 +3506,8 @@ function btADX(highs, lows, closes, n = 14) {
 //   extMax    — 收盤相對 EMA20 乖離上限（如 1.05 = 超過 +5% 不追）
 //   scaleOut  — 觸及 1R 先出一半並把停損上移到成本（大幅減少「賺過又變虧」）
 //   regimeFn  — 大盤濾網：date → 是否允許進場（大盤空頭時不做多）
+//   resistTarget — 停利改用真實壓力區（前波高點/樞紐），非固定 2R；
+//                  無壓力則不設目標、靠移動出場續抱；壓力距離不足 1R 不進場
 function backtestStock(s, opts = {}) {
   const bars = s.ohlcv;
   if (!bars || bars.length < 80) return [];
@@ -3520,7 +3522,8 @@ function backtestStock(s, opts = {}) {
     const b = bars[i];
     if (pos) {
       if (b.exDiv && i > 0) pos.cum += b.divAmt != null ? b.divAmt : Math.max(0, closes[i - 1] - b.open);
-      const stopAdj = pos.stop - pos.cum, tgtAdj = pos.t1 - pos.cum;
+      const stopAdj = pos.stop - pos.cum;
+      const tgtAdj = pos.t1 != null ? pos.t1 - pos.cum : null;
       // 1R 分批：先判停損（同日先低後高保守處理），未觸停損且過 1R → 減半、停損上移成本
       let exit = null, why = null;
       if (b.low <= stopAdj) { exit = stopAdj; why = pos.scaled ? 'be' : 'stop'; }
@@ -3530,7 +3533,7 @@ function backtestStock(s, opts = {}) {
           pos.realized = 0.5;            // 半數部位在 +1R 落袋
           pos.stop = pos.entry + pos.cum; // 剩餘部位保本（cum 之後仍會持續平移）
         }
-        if (b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
+        if (tgtAdj != null && b.high >= tgtAdj) { exit = tgtAdj; why = 'target'; }
         else if (closes[i] < e20[i]) { pos.below++; if (pos.below >= 2) { exit = closes[i]; why = 'trail'; } }
         else pos.below = 0;
       }
@@ -3562,9 +3565,35 @@ function backtestStock(s, opts = {}) {
     const maxRisk = Math.min(entry * 0.08, a * 3);
     if (entry - stop > maxRisk) stop = entry - maxRisk;
     if (stop >= entry) continue;
-    pos = { i: i + 1, entry, stop, risk: entry - stop, t1: entry + (entry - stop) * 2, cum: 0, below: 0, scaled: false, realized: 0 };
+    const risk = entry - stop;
+    let t1;
+    if (opts.resistTarget) {
+      t1 = btFindResistance(highs, i, entry);           // 最近的真實壓力區
+      if (t1 != null && t1 - entry < risk) continue;    // 壓力太近（不足 1R）→ 風險報酬不划算，不進場
+      // t1 == null：上方無壓力 → 不設固定目標，靠移動出場續抱（鏡射實盤「無壓力就續抱」）
+    } else {
+      t1 = entry + risk * 2;                            // 基準版：固定 2R
+    }
+    pos = { i: i + 1, entry, stop, risk, t1, cum: 0, below: 0, scaled: false, realized: 0 };
   }
   return trades;
+}
+
+// 進場當下往前找最近的真實壓力區（無前視：只用進場前的資料）
+// 依據：前波樞紐高點（左右各 2 根的局部極大值）、前 20 日高、前 60 日高，
+// 一律排除最近 3 根（避免把自己當天的高點當壓力），只取高於進場價 1.5% 者。
+function btFindResistance(highs, i, entry) {
+  const prior = highs.slice(Math.max(0, i - 82), Math.max(0, i - 2)); // 近 80 根、排除最近 3 根
+  if (prior.length < 10) return null;
+  const cand = [];
+  for (let k = 2; k < prior.length - 2; k++) {
+    const v = prior[k];
+    if (v >= prior[k - 1] && v >= prior[k - 2] && v >= prior[k + 1] && v >= prior[k + 2]) cand.push(v);
+  }
+  if (prior.length >= 20) cand.push(Math.max(...prior.slice(-20)));
+  if (prior.length >= 60) cand.push(Math.max(...prior.slice(-60)));
+  const above = cand.filter(v => v > entry * 1.015).sort((a, b) => a - b);
+  return above.length ? +above[0].toFixed(2) : null; // 最近的壓力；null = 上方無壓力
 }
 
 // 大盤濾網：加權指數收盤 > 其 50 日 EMA 的日期才允許進場
@@ -3618,7 +3647,7 @@ async function runBacktest() {
   // 調整版參數：大盤 EMA50 濾網 + RSI 上限 65 + 乖離 >5% 不追 + 1R 減半保本
   let regimeFn = null;
   try { regimeFn = makeRegimeFn(await fetchTWIIOHLC(14)); } catch {}
-  const TUNED = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn };
+  const TUNED = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true };
 
   const base = [], tuned = [];
   for (let k = 0; k < ready.length; k++) {
@@ -3654,7 +3683,7 @@ function renderBacktest() {
     el.innerHTML = `<p style="font-size:0.8rem;color:var(--text3)">調整版（含大盤濾網、RSI ≤65、乖離 ≤5%）近 14 個月無符合全部條件的進場點 — 濾網偏嚴屬正常，代表這段期間多數進場點品質不佳。${r.base?.trades ? `基準版（無濾網）同期有 ${r.base.trades} 筆、勝率 ${r.base.winRate}%，可對照參考。` : ''}</p>${btn}`;
     return;
   }
-  const whyName = { stop: '停損', target: '達 2R 目標', trail: '破 EMA20 出場', time: '時間停損', be: '1R 減半後保本出場' };
+  const whyName = { stop: '停損', target: '達壓力區停利', trail: '破 EMA20 出場', time: '時間停損', be: '1R 減半後保本出場' };
   const verdict = r.pf == null || r.pf >= 1.5
     ? { t: '✅ 此技術條件過去 14 個月具正期望值優勢', c: 'var(--bull)' }
     : r.pf >= 1.0
@@ -3672,7 +3701,8 @@ function renderBacktest() {
     <div style="padding:9px 12px;border-radius:8px;background:${verdict.c}0d;border-left:3px solid ${verdict.c};font-size:0.78rem;color:${verdict.c};font-weight:600;margin-bottom:8px">${verdict.t}</div>
     ${r.base ? `<div style="font-size:0.73rem;color:var(--text3);margin-bottom:8px;padding:7px 11px;border-radius:8px;background:rgba(255,255,255,0.03)">
       對照｜基準版（無濾網、固定 2R）：${r.base.trades} 筆・勝率 ${r.base.winRate}%・平均 R ${r.base.avgR > 0 ? '+' : ''}${r.base.avgR}・獲利因子 ${r.base.pf ?? '∞'}・最大連虧 ${r.base.maxConsec} 筆<br>
-      調整版加入：大盤站上 50 日均線才進場${r.hasRegime ? '' : '（本輪大盤資料未到位，此濾網未生效）'}・RSI 上限 65・乖離 EMA20 逾 5% 不追・達 1R 先減半並保本
+      調整版加入：大盤站上 50 日均線才進場${r.hasRegime ? '' : '（本輪大盤資料未到位，此濾網未生效）'}・RSI 上限 65・乖離 EMA20 逾 5% 不追・達 1R 先減半並保本・停利改用真實壓力區（前波高點/樞紐；無壓力則續抱移動出場、壓力不足 1R 不進場）<br>
+      <span style="font-size:0.66rem">壓力區依據為價格結構 — 歷史新聞與歷史掛單無免費資料可回測；實盤推薦另有新聞面與盤中五檔掛單判斷</span>
     </div>` : ''}
     <div style="font-size:0.74rem;color:var(--text2);line-height:1.7">
       出場分佈：${Object.entries(r.byWhy).map(([w, n]) => `${whyName[w] || w} ${n} 筆`).join('・')}<br>
