@@ -177,9 +177,136 @@ function findSwings(ohlcv, span = 3) {
   return { hi, lo };
 }
 
+// ── ZigZag 擺動點（ATR 自適應門檻）────────────────────────────────────────
+// 固定視窗的分形擺動會把雜訊小波動當轉折 → HH/HL 判定被污染。
+// 改用「反轉幅度須超過 max(2×ATR, 3%)」的 ZigZag：只留真正的波段轉折。
+function zigzagSwings(ohlcv) {
+  if (!ohlcv || ohlcv.length < 30) return [];
+  const n = ohlcv.length;
+  let atr = 0;
+  for (let i = Math.max(1, n - 14); i < n; i++)
+    atr += Math.max(ohlcv[i].high - ohlcv[i].low,
+      Math.abs(ohlcv[i].high - ohlcv[i-1].close), Math.abs(ohlcv[i].low - ohlcv[i-1].close));
+  atr /= Math.min(14, n - 1);
+  const pivots = [];
+  let dir = 0;                       // 1=找高點中 -1=找低點中
+  let extI = 0, extV = ohlcv[0].close;
+  for (let i = 1; i < n; i++) {
+    const b = ohlcv[i];
+    const th = Math.max(atr * 2, extV * 0.03);
+    if (dir >= 0) {
+      if (b.high > extV || dir === 0) { if (b.high > extV) { extV = b.high; extI = i; } }
+      if (dir === 0 && b.close < extV - th) { dir = -1; pivots.push({ i: extI, v: extV, type: 'H' }); extV = b.low; extI = i; continue; }
+      if (dir === 1 && b.close < extV - th) { pivots.push({ i: extI, v: extV, type: 'H' }); dir = -1; extV = b.low; extI = i; continue; }
+      if (dir === 0 && b.close > extV) dir = 1;
+    }
+    if (dir === -1) {
+      if (b.low < extV) { extV = b.low; extI = i; }
+      if (b.close > extV + Math.max(atr * 2, extV * 0.03)) { pivots.push({ i: extI, v: extV, type: 'L' }); dir = 1; extV = b.high; extI = i; }
+    }
+  }
+  pivots.push({ i: extI, v: extV, type: dir === -1 ? 'L' : 'H' }); // 進行中的極值
+  return pivots;
+}
+
+// ── 趨勢判定引擎：市況分類 + 品質 + 成熟度 ─────────────────────────────────
+// 五個維度綜合：均線排列與斜率、趨勢持續性、ADX 水平與方向、
+// Choppiness（盤整度）、ZigZag 段數 — 輸出可解釋的趨勢判定。
+function classifyTrend(ohlcv) {
+  if (!ohlcv || ohlcv.length < 60) return null;
+  const closes = ohlcv.map(b => b.close), highs = ohlcv.map(b => b.high), lows = ohlcv.map(b => b.low);
+  const n = closes.length;
+  const e20a = calcEMA(closes, 20), e50a = calcEMA(closes, 50), e200a = calcEMA(closes, 200);
+  const price = closes[n-1], e20 = e20a[n-1], e50 = e50a[n-1];
+  const e200 = e200a[n-1] || null;
+  const slope = (arr, k) => { const a = arr[arr.length-1], b = arr[arr.length-1-k]; return a && b ? (a - b) / b * 100 : 0; };
+  const s20 = slope(e20a, 10);                       // EMA20 十日斜率 %
+  const s50 = slope(e50a, 15);
+  // 趨勢持續性：近 20 根收在 EMA20 上方的比例
+  let above = 0;
+  for (let i = n - 20; i < n; i++) if (closes[i] > e20a[i]) above++;
+  const persist = above / 20;
+  // ADX 水平與方向（現在 vs 5 根前）
+  const adxNow = calcADX(highs, lows, closes);
+  const adxPrev = calcADX(highs.slice(0, -5), lows.slice(0, -5), closes.slice(0, -5));
+  const adxRising = adxNow != null && adxPrev != null && adxNow > adxPrev + 1;
+  // Choppiness Index（近 20 根）：>61.8 盤整、<38.2 順暢趨勢
+  let sumTR = 0;
+  for (let i = n - 20; i < n; i++)
+    sumTR += Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i-1]), Math.abs(lows[i] - closes[i-1]));
+  const rng = Math.max(...highs.slice(-20)) - Math.min(...lows.slice(-20));
+  const chop = rng > 0 ? 100 * Math.log10(sumTR / rng) / Math.log10(20) : 50;
+
+  // ZigZag 段數：從最近一次結構翻轉起，連續 HH+HL（或 LH+LL）的波段數
+  const piv = zigzagSwings(ohlcv);
+  let legs = 0, legDir = 0;
+  if (piv.length >= 4) {
+    const hi = piv.filter(p => p.type === 'H'), lo = piv.filter(p => p.type === 'L');
+    for (let k = 1; k < Math.min(hi.length, lo.length); k++) {
+      const up = hi[hi.length-k].v > hi[hi.length-k-1]?.v && lo[lo.length-k]?.v > lo[lo.length-k-1]?.v;
+      const dn = hi[hi.length-k].v < hi[hi.length-k-1]?.v && lo[lo.length-k]?.v < lo[lo.length-k-1]?.v;
+      if (k === 1) { legDir = up ? 1 : dn ? -1 : 0; if (!legDir) break; legs = 1; }
+      else if ((legDir > 0 && up) || (legDir < 0 && dn)) legs++;
+      else break;
+    }
+  }
+
+  // 綜合計分
+  let pts = 0;
+  if (price > e20 && e20 > e50) pts += 2; else if (price < e20 && e20 < e50) pts -= 2;
+  if (e200) pts += price > e200 ? 1 : -1;
+  pts += s20 >= 0.8 ? 1 : s20 <= -0.8 ? -1 : 0;
+  pts += s50 >= 1 ? 0.5 : s50 <= -1 ? -0.5 : 0;
+  pts += persist >= 0.75 ? 1 : persist <= 0.25 ? -1 : 0;
+  if (adxNow >= 25 && adxRising) pts += price > e20 ? 1 : -1;
+  pts += legDir > 0 ? Math.min(legs, 2) * 0.5 : legDir < 0 ? -Math.min(legs, 2) * 0.5 : 0;
+
+  const isChoppy = chop >= 61.8 || (adxNow != null && adxNow < 18 && Math.abs(s20) < 0.5);
+  let phase;
+  if (isChoppy && Math.abs(pts) < 3.5) phase = 'range';
+  else if (pts >= 4.5) phase = 'strong-up';
+  else if (pts >= 2) phase = 'up';
+  else if (pts <= -4.5) phase = 'strong-down';
+  else if (pts <= -2) phase = 'down';
+  else phase = 'range';
+
+  const quality = Math.max(0, Math.min(100, Math.round(50 + pts * 8 - Math.max(0, chop - 50))));
+  const ext200 = e200 ? +((price - e200) / e200 * 100).toFixed(1) : null;
+
+  // 成熟度：段數 + 乖離年線（末段 = 追價風險最高的階段）
+  let maturity = null, maturityTxt = null;
+  if (phase === 'up' || phase === 'strong-up') {
+    if (legs >= 5 || (ext200 != null && ext200 >= 40)) { maturity = 'late'; maturityTxt = `已走第 ${legs} 段上升${ext200 != null ? `、乖離年線 +${ext200}%` : ''} — 屬末升段，追價風險高、宜守緊停損`; }
+    else if (legs >= 3) { maturity = 'main'; maturityTxt = `第 ${legs} 段上升 — 主升段，順勢持有為主`; }
+    else { maturity = 'early'; maturityTxt = '趨勢初段 — 若結構確立，上方空間相對較大'; }
+  } else if (phase === 'down' || phase === 'strong-down') {
+    if (legs >= 5) { maturity = 'late'; maturityTxt = `已走第 ${legs} 段下跌 — 跌勢末段，留意止跌訊號但勿提前接刀`; }
+    else if (legs >= 3) { maturity = 'main'; maturityTxt = `第 ${legs} 段下跌 — 主跌段，反彈皆屬逃命波`; }
+    else { maturity = 'early'; maturityTxt = '跌勢初段 — 結構剛轉壞，勿急於低接'; }
+  }
+
+  const phaseTxt = {
+    'strong-up': `強勢上升趨勢（品質 ${quality}/100${adxRising ? '、ADX 走升趨勢增強' : ''}）`,
+    'up': `上升趨勢（品質 ${quality}/100）`,
+    'range': `盤整市（Choppiness ${chop.toFixed(0)}、ADX ${adxNow?.toFixed(0) ?? '--'}）— 趨勢類訊號此時參考價值低，區間高賣低買為主`,
+    'down': `下降趨勢（品質 ${quality}/100）`,
+    'strong-down': `強勢下降趨勢（品質 ${quality}/100${adxRising ? '、ADX 走升跌勢增強' : ''}）`,
+  }[phase];
+
+  return { phase, phaseTxt, quality, pts: +pts.toFixed(1), legs, legDir, maturity, maturityTxt,
+           adx: adxNow != null ? +adxNow.toFixed(1) : null, adxRising, chop: +chop.toFixed(1),
+           s20: +s20.toFixed(2), s50: +s50.toFixed(2), persist: Math.round(persist * 100), ext200 };
+}
+
 function analyzeStructure(ohlcv) {
   if (!ohlcv || ohlcv.length < 40) return null;
-  const { hi, lo } = findSwings(ohlcv.slice(-90));
+  // 優先用 ATR 自適應 ZigZag（濾掉雜訊擺動）；轉折不足再退回固定視窗分形
+  const zz = zigzagSwings(ohlcv.slice(-120));
+  let hi = zz.filter(p => p.type === 'H').map(p => ({ i: p.i, v: p.v }));
+  let lo = zz.filter(p => p.type === 'L').map(p => ({ i: p.i, v: p.v }));
+  if (hi.length < 2 || lo.length < 2) {
+    ({ hi, lo } = findSwings(ohlcv.slice(-90)));
+  }
   if (hi.length < 2 || lo.length < 2) return null;
   const h2 = hi.slice(-2), l2 = lo.slice(-2);
   const hh = h2[1].v > h2[0].v;   // higher high
@@ -625,6 +752,7 @@ function calculateScore(ohlcv) {
   const paCtx = priceActionContext(ohlcv, ema20arr[ema20arr.length - 1]);
   const gaps = detectGaps(ohlcv);
   const falseBreak = detectFalseBreak(ohlcv);
+  const trend = classifyTrend(ohlcv);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -742,7 +870,7 @@ function calculateScore(ohlcv) {
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
            diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
-           vForce, pctile, paCtx, gaps, falseBreak, price, prevClose, lastVol };
+           vForce, pctile, paCtx, gaps, falseBreak, trend, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────
