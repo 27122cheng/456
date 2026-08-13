@@ -1382,6 +1382,19 @@ function buildManagerAnalysis(s) {
   }
 
   // ── 彙總：淨方向、一致性、信心度 ──
+  // ⑧ 新聞面（保守小權重）：本週新聞明確點名此股或其產業才注入，
+  // 關鍵字判讀非語意理解 — 權重刻意壓低，只作佐證不作主導
+  if (_newsSignals) {
+    const st = _newsSignals.stocks[s.id];
+    if (st && st.score !== 0) {
+      add(1.2, st.score > 0 ? 1 : -1,
+        `新聞面${st.score > 0 ? '利多' : '利空'}：「${st.items[0]}」${st.items.length > 1 ? `等 ${st.items.length} 則` : ''}`, 'news');
+    } else if (s.sector && _newsSignals.sectors[s.sector] && Math.abs(_newsSignals.sectors[s.sector].score) >= 2) {
+      const sec = _newsSignals.sectors[s.sector];
+      add(0.6, sec.score > 0 ? 1 : -1, `${s.sector}族群本週新聞面${sec.score > 0 ? '偏多' : '偏空'}（${sec.n} 則相關）`, 'news');
+    }
+  }
+
   let dir = ev.reduce((acc, e) => acc + e.w * e.d, 0);
   const totalW = ev.reduce((acc, e) => acc + e.w, 0);
   const agr = totalW > 0 ? Math.abs(dir) / totalW : 0;   // 0=完全矛盾, 1=完全一致
@@ -5301,13 +5314,70 @@ function renderFocusStocks() {
 // ── 本週重點財經新聞 ────────────────────────────────────────────────────────
 
 
+// ── 新聞指向解析：辨識每則新聞針對的產業/公司，彙整多空傾向 ────────────────
+let _newsSignals = null;
+
+const SECTOR_NEWS_KW = {
+  '半導體': /半導體|晶圓|晶片|先進製程|晶圓代工/,
+  'IC設計': /IC設計|晶片設計/,
+  '記憶體': /記憶體|DRAM|NAND|快閃/,
+  '封測': /封測|封裝測試|CoWoS/,
+  '伺服器': /伺服器|資料中心|輝達|NVIDIA|GPU|AI ?算力/,
+  '面板': /面板|LCD|OLED/,
+  'PCB': /PCB|載板|銅箔基板/,
+  '被動元件': /被動元件|MLCC/,
+  '網通': /網通|交換器/,
+  '電腦': /筆電|PC市場/,
+  '光學': /光學鏡頭|鏡頭廠/,
+  '航運': /航運|貨櫃|運價|海運|散裝/,
+  '航空': /航空|客運需求/,
+  '金融': /金控|銀行股|壽險|升息|降息|利差|聯準會|Fed/,
+  '電信': /電信/,
+  '塑化': /塑化|油價|乙烯/,
+  '鋼鐵': /鋼鐵|鋼價|不鏽鋼/,
+  '水泥': /水泥/,
+  '汽車': /車市|電動車/,
+  '生技': /生技|新藥|藥證|臨床/,
+  '遊戲': /遊戲股|手遊/,
+  '電子紙': /電子紙/,
+  '紡織': /紡織|成衣/,
+  '製鞋': /製鞋|運動鞋代工/,
+};
+
+function buildNewsSignals(news) {
+  if (!news?.length) { _newsSignals = null; return; }
+  const sig = { stocks: {}, sectors: {} };
+  const list = getStockList();
+  for (const n of news) {
+    const d = n.cls === 'bull' ? 1 : n.cls === 'bear' ? -1 : 0;
+    // 個股指向：標題直接點名股票名稱
+    for (const st of list) {
+      if (st.name.length >= 2 && n.headline.includes(st.name)) {
+        const o = sig.stocks[st.id] = sig.stocks[st.id] || { name: st.name, score: 0, items: [] };
+        o.score += d;
+        o.items.push(n.headline.slice(0, 32));
+      }
+    }
+    // 產業指向：關鍵字對應到掃描清單的族群
+    for (const [sec, re] of Object.entries(SECTOR_NEWS_KW)) {
+      if (re.test(n.headline)) {
+        const o = sig.sectors[sec] = sig.sectors[sec] || { score: 0, n: 0 };
+        o.score += d;
+        o.n++;
+      }
+    }
+  }
+  _newsSignals = sig;
+}
+
 async function renderWeeklyNews() {
   const el = document.getElementById('weekly-news-body');
   if (!el) return;
 
-  // 只用真實新聞（Google News RSS 台股 近 7 日）
-  const news = (await fetchNewsRSS('台股 股市', 7).catch(() => null) || [])
+  // 只用真實新聞（Google News RSS 台股 近 7 日）；多抓幾則提高產業覆蓋
+  const news = (await fetchNewsRSS('台股 股市', 12).catch(() => null) || [])
     .map(n => ({ impact: n.source || '台股', ...n }));
+  buildNewsSignals(news);
   if (!news.length) {
     el.innerHTML = `<h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞</h3>
       <p style="font-size:0.8rem;color:var(--text3);margin-top:8px">新聞來源暫時無法取得，稍後自動重試</p>`;
@@ -5337,7 +5407,27 @@ async function renderWeeklyNews() {
     </div>
     <div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.82rem;font-weight:600;color:${overall.c}">
       AI 週判讀：${overall.t}（利多 ${bullCount} 則 / 利空 ${bearCount} 則）
-    </div>`;
+    </div>
+    ${(() => {
+      // 🧭 新聞解讀大綱：這週新聞點名了哪些產業/公司、各自偏多偏空
+      if (!_newsSignals) return '';
+      const secs = Object.entries(_newsSignals.sectors)
+        .filter(([, v]) => v.score !== 0)
+        .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score))
+        .slice(0, 6);
+      const stks = Object.entries(_newsSignals.stocks)
+        .filter(([, v]) => v.score !== 0)
+        .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score))
+        .slice(0, 6);
+      if (!secs.length && !stks.length) return '';
+      const chip = (label, sc) => `<span style="font-size:0.72rem;padding:2px 9px;border-radius:10px;background:${sc > 0 ? 'rgba(34,197,94,0.12)' : 'rgba(239,68,68,0.12)'};color:${sc > 0 ? 'var(--bull)' : 'var(--bear)'};margin:0 6px 6px 0;display:inline-block">${label} ${sc > 0 ? '偏多' : '偏空'}</span>`;
+      return `<div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:rgba(0,212,255,0.04);border:1px solid rgba(0,212,255,0.12)">
+        <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:6px">🧭 新聞指向解讀（已納入個股研判）</div>
+        ${secs.length ? `<div style="margin-bottom:2px"><span style="font-size:0.7rem;color:var(--text3)">產業：</span>${secs.map(([sec, v]) => chip(`${sec}（${v.n} 則）`, v.score)).join('')}</div>` : ''}
+        ${stks.length ? `<div><span style="font-size:0.7rem;color:var(--text3)">個股：</span>${stks.map(([id, v]) => chip(`${v.name}(${id})`, v.score)).join('')}</div>` : ''}
+        <div style="font-size:0.66rem;color:var(--text3);margin-top:4px">被點名的個股以小權重（±1.2）注入研判、族群偏向需 ≥2 則同向才注入（±0.6）— 關鍵字判讀非語意理解，僅作佐證不主導方向</div>
+      </div>`;
+    })()}`;
 }
 
 // ── Telegram Notification ──────────────────────────────────────────────────
