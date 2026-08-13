@@ -3560,6 +3560,11 @@ function recordAiSignals() {
         agr: +m.agr.toFixed(2), pctile: s.analysis.pctile?.zone ?? null,
         mktNorm: Math.round(outlookData.norm ?? 0),
         sector: getStockList().find(x => x.id === s.id)?.sector ?? null,
+        // 進場條件學習用：ADX/乖離/趨勢階段/成熟度 — 讓實績回饋能評估「進場邏輯」本身
+        adx: s.analysis.adx != null ? +s.analysis.adx.toFixed(1) : null,
+        ext20: s.analysis.ema20 ? +((s.analysis.price / s.analysis.ema20 - 1) * 100).toFixed(1) : null,
+        trend: s.analysis.trend?.phase ?? null,
+        maturity: s.analysis.trend?.maturity ?? null,
       },
     });
     added++;
@@ -3637,11 +3642,13 @@ function renderAiSignals() {
       const rules = signalPerfStats();
       return rules.length
         ? `<div style="margin-top:9px;padding:8px 11px;border-radius:8px;background:rgba(0,212,255,0.05);border-left:3px solid var(--blue)">
-            <div style="font-size:0.72rem;font-weight:700;color:var(--blue)">🔁 實績回饋規則（已自動生效）</div>
-            <div style="font-size:0.73rem;color:var(--text2);margin-top:3px;line-height:1.7">${rules.map(r => `・「${r.label}」實測勝率僅 ${r.winRate}%（n=${r.n}）→ 同情境的推薦自動扣分`).join('<br>')}</div>
+            <div style="font-size:0.72rem;font-weight:700;color:var(--blue)">🔁 實績回饋規則（已自動生效 — 進場邏輯持續學習中）</div>
+            <div style="font-size:0.73rem;color:var(--text2);margin-top:3px;line-height:1.7">${rules.map(r => r.kind === 'bad'
+              ? `・🔻「${r.label}」實測勝率僅 ${r.winRate}%（n=${r.n}）→ 同情境推薦自動扣分`
+              : `・🔺「${r.label}」實測勝率 ${r.winRate}%（n=${r.n}）→ 同情境推薦自動加分`).join('<br>')}</div>
           </div>`
         : done.length
-          ? `<div style="font-size:0.68rem;color:var(--text3);margin-top:8px">實績回饋：各情境樣本滿 8 筆且勝率 &lt;40% 時，會自動對同情境推薦扣分（目前樣本累積中）</div>`
+          ? `<div style="font-size:0.68rem;color:var(--text3);margin-top:8px">實績回饋：追蹤 10 種進場情境（RSI/位階/一致性/大盤/ADX/乖離/趨勢階段/成熟度），樣本滿 8 筆後勝率 &lt;40% 自動扣分、≥60% 自動加分（目前樣本累積中）</div>`
           : '';
     })()}`;
 }
@@ -4204,13 +4211,22 @@ function addWatchStock(id, name) {
   try { renderCustomStocksList(); } catch {}
 }
 
-// 通過陷阱檢查的大戶訊號 → Telegram（每檔每日一次），附交易分析
+// 通知去重一律用「資料日期」而非日曆日期：法人/日 K 是盤後資料，
+// 過午夜日曆換日但資料沒換 — 用日曆去重會在半夜把同一份資料重推一次。
+function notifyDataDate() {
+  const t86 = localStorage.getItem('t86-last-date');
+  if (t86) return t86;
+  const s = allStocks.find(x => x.ohlcv?.length);
+  return s ? s.ohlcv[s.ohlcv.length - 1].time.slice(0, 10) : new Date().toISOString().slice(0, 10);
+}
+
+// 通過陷阱檢查的大戶訊號 → Telegram（每份法人資料每檔一次），附交易分析
 function notifyWhales() {
   if (!tgWants('sig')) return;
-  const today = new Date().toISOString().slice(0, 10);
+  const dataDate = notifyDataDate();
   let sent;
   try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
-  if (sent.date !== today) sent = { date: today, ids: [] };
+  if (sent.date !== dataDate) sent = { date: dataDate, ids: [] };
   const clean = _whaleResults.filter(r => !r.trap.length && !sent.ids.includes(r.s.id));
   if (!clean.length) return;
 
@@ -4386,6 +4402,9 @@ function addHolding(stockId, kind = 'long') {
       adx: s.analysis.adx != null ? +s.analysis.adx.toFixed(1) : null,
       stance: m?.stance ?? null, agr: m ? +m.agr.toFixed(2) : null,
       pctile: s.analysis.pctile?.zone ?? null,
+      ext20: s.analysis.ema20 ? +((s.analysis.price / s.analysis.ema20 - 1) * 100).toFixed(1) : null,
+      trend: s.analysis.trend?.phase ?? null,
+      maturity: s.analysis.trend?.maturity ?? null,
       sector: getStockList().find(x => x.id === stockId)?.sector ?? null,
       mktNorm: Math.round(outlookData.norm ?? 0),
       reasons: (m?.bull ?? []).slice(0, 3),
@@ -4471,6 +4490,9 @@ async function addManualHolding() {
       adx: s.analysis.adx != null ? +s.analysis.adx.toFixed(1) : null,
       stance: m?.stance ?? null, agr: m ? +m.agr.toFixed(2) : null,
       pctile: s.analysis.pctile?.zone ?? null,
+      ext20: s.analysis.ema20 ? +((s.analysis.price / s.analysis.ema20 - 1) * 100).toFixed(1) : null,
+      trend: s.analysis.trend?.phase ?? null,
+      maturity: s.analysis.trend?.maturity ?? null,
       sector: getStockList().find(x => x.id === id)?.sector ?? null,
       mktNorm: Math.round(outlookData.norm ?? 0),
       reasons: (m?.bull ?? []).slice(0, 3),
@@ -4853,7 +4875,8 @@ function notifyHoldingExits() {
   const holdings = getHoldings();
   if (!holdings.length) return;
   const today = new Date().toISOString().slice(0, 10);
-  if (localStorage.getItem('tg-holdings-date') === today) return;
+  const dataDate = notifyDataDate();
+  if (localStorage.getItem('tg-holdings-date') === dataDate) return;
 
   const rows = holdings.map(checkHoldingExit).filter(Boolean);
   if (rows.length < holdings.length) return; // 資料未齊，等下輪再推
@@ -4868,7 +4891,7 @@ function notifyHoldingExits() {
   tgPush(`📋 台股雷達 每日持倉檢查\n${today}\n\n` +
     (exits ? `⚠ 有 ${exits} 檔出現出場訊號\n` : watches ? `留意 ${watches} 檔\n` : '全部續抱，無出場訊號\n') +
     `\n${lines}\n\n⚠ 僅供參考，非投資建議`);
-  localStorage.setItem('tg-holdings-date', today);
+  localStorage.setItem('tg-holdings-date', dataDate);
 }
 
 // ── 實績回饋權重：用「已結算的真實成績」自動修正評分，讓系統越用越準 ──────
@@ -4879,18 +4902,27 @@ function signalPerfStats() {
     .map(t => ({ win: (t.retPct ?? 0) > 0, ctx: t.ctx }));
   const jt = getJournal().filter(t => t.ctx).map(t => ({ win: t.retPct > 0, ctx: t.ctx }));
   const all = [...done, ...jt];
+  // 進場情境條件 — 涵蓋「進場邏輯」本身（ADX/乖離/趨勢階段/成熟度），
+  // 每一條都雙向學習：實測勝率 <40% 扣分、≥60% 加分（樣本 ≥8 筆才下結論）
   const conds = [
     { label: 'RSI≥70 進場', fn: c => c.rsi >= 70 },
     { label: '長期高位階進場', fn: c => c.pctile === 'high' },
     { label: '證據一致性<40% 進場', fn: c => c.agr != null && c.agr < 0.4 },
     { label: '大盤偏空時做多', fn: c => c.mktNorm != null && c.mktNorm <= -15 },
+    { label: 'ADX<20 無趨勢進場', fn: c => c.adx != null && c.adx < 20 },
+    { label: '乖離 EMA20>5% 追高進場', fn: c => c.ext20 != null && c.ext20 > 5 },
+    { label: '貼近均線進場（乖離≤2%）', fn: c => c.ext20 != null && c.ext20 >= -2 && c.ext20 <= 2 },
+    { label: '盤整市進場', fn: c => c.trend === 'range' },
+    { label: '末升段進場', fn: c => c.maturity === 'late' },
+    { label: '主升段進場', fn: c => c.maturity === 'main' },
   ];
   const out = [];
   for (const cd of conds) {
     const hit = all.filter(x => { try { return cd.fn(x.ctx); } catch { return false; } });
     if (hit.length < 8) continue;                      // 樣本不足不下結論（與教訓學習同一誠實標準）
     const winRate = hit.filter(x => x.win).length / hit.length;
-    if (winRate < 0.40) out.push({ label: cd.label, n: hit.length, winRate: Math.round(winRate * 100), fn: cd.fn });
+    if (winRate < 0.40) out.push({ label: cd.label, n: hit.length, winRate: Math.round(winRate * 100), fn: cd.fn, kind: 'bad' });
+    else if (winRate >= 0.60) out.push({ label: cd.label, n: hit.length, winRate: Math.round(winRate * 100), fn: cd.fn, kind: 'good' });
   }
   return out;
 }
@@ -4910,19 +4942,27 @@ function computeEntrySignals() {
     if (s.analysis.price > p.hi * 1.02) continue;    // 已明顯追高不推
     const d = scoreStockDimensions(s, marketRet20() ?? 0);
     if (!d || d.excluded) continue;
-    // 實績回饋：目前情境命中「實證低勝率」規則 → 每項扣 6 分再過門檻
+    // 實績回饋（雙向）：命中「實證低勝率」情境每項 −6、「實證高勝率」情境每項 +4
     if (perfRules.length) {
       const ctxNow = {
         rsi: s.analysis.rsi != null ? +s.analysis.rsi : null,
         pctile: s.analysis.pctile?.zone ?? null,
         agr: +m.agr.toFixed(2), mktNorm: mktNow,
+        adx: s.analysis.adx != null ? +s.analysis.adx : null,
+        ext20: s.analysis.ema20 ? +((s.analysis.price / s.analysis.ema20 - 1) * 100).toFixed(1) : null,
+        trend: s.analysis.trend?.phase ?? null,
+        maturity: s.analysis.trend?.maturity ?? null,
       };
       for (const r of perfRules) {
         let hit = false;
         try { hit = r.fn(ctxNow); } catch {}
-        if (hit) {
+        if (!hit) continue;
+        if (r.kind === 'bad') {
           d.total -= 6;
           d.reasons.push(`實績回饋：「${r.label}」歷史勝率僅 ${r.winRate}%（n=${r.n}）→ 已扣分`);
+        } else {
+          d.total += 4;
+          d.reasons.push(`實績回饋：「${r.label}」歷史勝率 ${r.winRate}%（n=${r.n}）→ 加分`);
         }
       }
     }
@@ -4937,7 +4977,8 @@ function computeEntrySignals() {
 function notifyEntrySignals() {
   if (!tgWants('sig')) return;
   const today = new Date().toISOString().slice(0, 10);
-  if (localStorage.getItem('tg-entry-date') === today) return;
+  const dataDate = notifyDataDate();
+  if (localStorage.getItem('tg-entry-date') === dataDate) return;
   const picks = computeEntrySignals();
   if (!picks.length) return;
 
@@ -4961,7 +5002,7 @@ function notifyEntrySignals() {
     : '';
 
   tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}\n\n⚠ 僅供參考，非投資建議`);
-  localStorage.setItem('tg-entry-date', today);
+  localStorage.setItem('tg-entry-date', dataDate);
 }
 
 // ── 交易總結頁 ─────────────────────────────────────────────────────────────

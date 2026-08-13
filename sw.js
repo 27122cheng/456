@@ -1,5 +1,5 @@
 // 台股雷達 Service Worker — 靜態資源快取（App Shell）
-const CACHE = 'taistock-v39';
+const CACHE = 'taistock-v40';
 const ASSETS = ['./', './index.html', './css/styles.css', './js/app.js', './js/api.js', './js/indicators.js', './manifest.json'];
 
 self.addEventListener('install', e => {
