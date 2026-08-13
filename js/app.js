@@ -313,7 +313,7 @@ async function runScan() {
   after('結算預測', resolvePredictions);
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
-  after('我的持倉', renderHoldings);
+  after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
   after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
@@ -1725,7 +1725,9 @@ function buildEntryPlan(s, m) {
         (pat.label === '高檔位階追價' && a.pctile?.zone === 'high') ||
         (pat.label === '大盤逆風做多' && (outlookData.norm ?? 0) <= -15) ||
         (pat.label.includes('族群連續虧損') && pat.label.startsWith(getStockList().find(x => x.id === s.id)?.sector ?? '∅'));
-      if (hit) lessonWarns.push(`過去在「${pat.label}」情境已虧損 ${pat.n} 筆 — ${pat.advice}`);
+      if (hit) lessonWarns.push(pat.grade === 'firm'
+        ? `過去在「${pat.label}」情境已虧損 ${pat.n} 筆 — ${pat.advice}`
+        : `「${pat.label}」情境已虧損 ${pat.n} 筆（樣本少，參考性低）— ${pat.advice}`);
     }
   } catch {}
 
@@ -3630,7 +3632,18 @@ function renderAiSignals() {
         <span style="color:var(--text3);font-size:0.68rem">${t.date} → ${t.exitDate}</span>
         <span style="color:var(--text3);font-size:0.68rem">${t.exitReason}</span>
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${t.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${t.retPct >= 0 ? '+' : ''}${t.retPct}%</span>
-      </div>`).join('')}`;
+      </div>`).join('')}
+    ${(() => {
+      const rules = signalPerfStats();
+      return rules.length
+        ? `<div style="margin-top:9px;padding:8px 11px;border-radius:8px;background:rgba(0,212,255,0.05);border-left:3px solid var(--blue)">
+            <div style="font-size:0.72rem;font-weight:700;color:var(--blue)">🔁 實績回饋規則（已自動生效）</div>
+            <div style="font-size:0.73rem;color:var(--text2);margin-top:3px;line-height:1.7">${rules.map(r => `・「${r.label}」實測勝率僅 ${r.winRate}%（n=${r.n}）→ 同情境的推薦自動扣分`).join('<br>')}</div>
+          </div>`
+        : done.length
+          ? `<div style="font-size:0.68rem;color:var(--text3);margin-top:8px">實績回饋：各情境樣本滿 8 筆且勝率 &lt;40% 時，會自動對同情境推薦扣分（目前樣本累積中）</div>`
+          : '';
+    })()}`;
 }
 
 // ── 技術訊號歷史回測 ────────────────────────────────────────────────────────
@@ -4233,7 +4246,9 @@ function classifyExit(h, exitPrice, s) {
 function rateTrade(h, exit, retPct, reason, s) {
   const notes = [];
   let stars = 3; // 基準：有進場、有停損、正常出場
-  const risk = h.entry - h.stop;
+  // 評分一律用「原始停損」：移動停損上移後 h.stop 可能等於成本，
+  // 若用它算 R 會失真（risk→0），凹單/紀律判定也要對原始計畫衡量
+  const risk = h.entry - (h.stop0 ?? h.stop);
   const rMult = risk > 0 ? (exit - h.entry) / risk : null; // R 倍數
 
   // ── 加分項 ──
@@ -4319,9 +4334,10 @@ function journalInsights() {
     .map(t => ({ ...t, retPct: t.retPct ?? -1 }));
   const losses = [...getJournal().filter(t => t.retPct < 0 && t.ctx), ...aiLosses];
   const pat = [];
+  // 樣本分級：2~4 筆僅屬「觀察中」（統計上不足以下結論），滿 5 筆才是正式警告
   const count = (label, fn, advice) => {
     const n = losses.filter(fn).length;
-    if (n >= 2) pat.push({ label, n, advice });
+    if (n >= 2) pat.push({ label, n, advice, grade: n >= 5 ? 'firm' : 'weak' });
   };
   count('RSI 過熱時進場', t => t.ctx.rsi >= 70, '進場前 RSI ≥70 的虧損已重複發生，等回檔至 60 以下再進場');
   count('訊號分歧仍進場', t => t.ctx.agr != null && t.ctx.agr < 0.4, '證據一致性 <40% 時進場的虧損偏多，等訊號收斂');
@@ -4331,7 +4347,7 @@ function journalInsights() {
   const bySector = {};
   losses.forEach(t => { if (t.ctx.sector) bySector[t.ctx.sector] = (bySector[t.ctx.sector] || 0) + 1; });
   Object.entries(bySector).filter(([, n]) => n >= 3)
-    .forEach(([sec, n]) => pat.push({ label: `${sec}族群連續虧損`, n, advice: `在${sec}族群已虧損 ${n} 筆，該族群的判斷模型可能失準，暫時降低該族群部位` }));
+    .forEach(([sec, n]) => pat.push({ label: `${sec}族群連續虧損`, n, advice: `在${sec}族群已虧損 ${n} 筆，該族群的判斷模型可能失準，暫時降低該族群部位`, grade: n >= 5 ? 'firm' : 'weak' }));
   return pat;
 }
 
@@ -4573,6 +4589,43 @@ function exDivAdjust(ohlcv, sinceDate) {
   return +adj.toFixed(2);
 }
 
+// ── 移動停損自動化：把「大賺小賠」變成機制而不是紀律口號 ──────────────────
+// 獲利 ≥1R → 停損上移至成本（保本）；≥2R → 跟隨結構（max(現價-2ATR, EMA20)）。
+// 停損只上移不下移；原始停損保留在 stop0 供評分（凹單/紀律判定）使用。
+function updateTrailingStops() {
+  const holdings = getHoldings();
+  if (!holdings.length) return;
+  let changed = false;
+  for (const h of holdings) {
+    const s = allStocks.find(x => x.id === h.id);
+    if (!s?.analysis) continue;
+    if (h.stop0 == null) { h.stop0 = h.stop; changed = true; }  // 首次記錄原始停損
+    const a = s.analysis;
+    const price = a.price;
+    const div = exDivAdjust(s.ohlcv, h.addedAt);
+    const risk0 = h.entry - h.stop0;
+    if (risk0 <= 0) continue;
+    const rNow = (price + div - h.entry) / risk0;
+    let target = null, note = null;
+    if (rNow >= 2) {
+      const m = buildManagerAnalysis(s);
+      const atr = m?.atr || price * 0.02;
+      const structTrail = Math.max(price - atr * 2, a.ema20 || 0) ;
+      target = +Math.max(h.entry - div, structTrail).toFixed(2);
+      note = `已達 +${rNow.toFixed(1)}R，停損上移至結構位 ${target}（鎖住獲利跟隨趨勢）`;
+    } else if (rNow >= 1) {
+      target = +(h.entry - div).toFixed(2);
+      note = `已達 +${rNow.toFixed(1)}R，停損上移至成本 ${target}（保本單）`;
+    }
+    if (target != null && target > h.stop) {
+      h.stop = target;
+      h.trailNote = note;
+      changed = true;
+    }
+  }
+  if (changed) saveHoldings(holdings);
+}
+
 // 對單一持倉做出場研判
 function checkHoldingExit(h) {
   const s = allStocks.find(x => x.id === h.id);
@@ -4589,6 +4642,7 @@ function checkHoldingExit(h) {
   let level = 'hold';  // hold | watch | exit
 
   if (div > 0) reasons.push(`持有期間除息 ${div} 元已還原（停損調整為 ${stopAdj}）`);
+  if (h.trailNote) reasons.push(`🔒 ${h.trailNote}`);
   if (price <= stopAdj) { level = 'exit'; reasons.push(`跌破停損 ${stopAdj}`); }
   if (m && m.dir <= -1) { level = 'exit'; reasons.push(`研判轉為「${m.stance}」，多方結構失效`); }
   if (a.ema20 && price < a.ema20 && a.ema50 && price < a.ema50) {
@@ -4817,10 +4871,36 @@ function notifyHoldingExits() {
   localStorage.setItem('tg-holdings-date', today);
 }
 
+// ── 實績回饋權重：用「已結算的真實成績」自動修正評分，讓系統越用越準 ──────
+// AI 訊號 + 交易紀錄的已結算樣本，按進場情境統計實際勝率；某情境樣本 ≥8 筆
+// 且勝率 <40% → 之後同情境的推薦自動扣分。教訓學習只「警告」，這裡真的改行為。
+function signalPerfStats() {
+  const done = getAiSignals().filter(t => t.status !== 'open' && t.ctx)
+    .map(t => ({ win: (t.retPct ?? 0) > 0, ctx: t.ctx }));
+  const jt = getJournal().filter(t => t.ctx).map(t => ({ win: t.retPct > 0, ctx: t.ctx }));
+  const all = [...done, ...jt];
+  const conds = [
+    { label: 'RSI≥70 進場', fn: c => c.rsi >= 70 },
+    { label: '長期高位階進場', fn: c => c.pctile === 'high' },
+    { label: '證據一致性<40% 進場', fn: c => c.agr != null && c.agr < 0.4 },
+    { label: '大盤偏空時做多', fn: c => c.mktNorm != null && c.mktNorm <= -15 },
+  ];
+  const out = [];
+  for (const cd of conds) {
+    const hit = all.filter(x => { try { return cd.fn(x.ctx); } catch { return false; } });
+    if (hit.length < 8) continue;                      // 樣本不足不下結論（與教訓學習同一誠實標準）
+    const winRate = hit.filter(x => x.win).length / hit.length;
+    if (winRate < 0.40) out.push({ label: cd.label, n: hit.length, winRate: Math.round(winRate * 100), fn: cd.fn });
+  }
+  return out;
+}
+
 // 今日符合進場條件的推薦交易（持有中頁與 Telegram 推送共用同一套標準）
 function computeEntrySignals() {
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length < 5) return [];
+  const perfRules = signalPerfStats();
+  const mktNow = Math.round(outlookData.norm ?? 0);
   const picks = [];
   for (const s of ready) {
     const m = buildManagerAnalysis(s);
@@ -4829,7 +4909,24 @@ function computeEntrySignals() {
     if (!p?.ok) continue;
     if (s.analysis.price > p.hi * 1.02) continue;    // 已明顯追高不推
     const d = scoreStockDimensions(s, marketRet20() ?? 0);
-    if (!d || d.excluded || d.total < 65) continue;  // 需通過五維度綜合門檻
+    if (!d || d.excluded) continue;
+    // 實績回饋：目前情境命中「實證低勝率」規則 → 每項扣 6 分再過門檻
+    if (perfRules.length) {
+      const ctxNow = {
+        rsi: s.analysis.rsi != null ? +s.analysis.rsi : null,
+        pctile: s.analysis.pctile?.zone ?? null,
+        agr: +m.agr.toFixed(2), mktNorm: mktNow,
+      };
+      for (const r of perfRules) {
+        let hit = false;
+        try { hit = r.fn(ctxNow); } catch {}
+        if (hit) {
+          d.total -= 6;
+          d.reasons.push(`實績回饋：「${r.label}」歷史勝率僅 ${r.winRate}%（n=${r.n}）→ 已扣分`);
+        }
+      }
+    }
+    if (d.total < 65) continue;                      // 扣分後仍需通過五維度綜合門檻
     picks.push({ s, m, p, d });
   }
   picks.sort((a, b) => b.d.total - a.d.total);
@@ -5010,10 +5107,10 @@ function renderJournalLessons() {
     return;
   }
   el.innerHTML = `
-    ${pat.map(p => `<div style="padding:9px 12px;border-radius:8px;background:rgba(245,158,11,0.07);border-left:3px solid var(--yellow);margin-bottom:7px">
-      <div style="font-size:0.8rem;font-weight:700;color:var(--yellow)">⚠ ${p.label}（虧損 ${p.n} 筆）</div>
+    ${pat.map(p => `<div style="padding:9px 12px;border-radius:8px;background:${p.grade === 'firm' ? 'rgba(245,158,11,0.07)' : 'rgba(255,255,255,0.03)'};border-left:3px solid ${p.grade === 'firm' ? 'var(--yellow)' : 'var(--text3)'};margin-bottom:7px">
+      <div style="font-size:0.8rem;font-weight:700;color:${p.grade === 'firm' ? 'var(--yellow)' : 'var(--text3)'}">${p.grade === 'firm' ? '⚠' : '👁'} ${p.label}（虧損 ${p.n} 筆${p.grade === 'firm' ? '' : '・觀察中'}）</div>
       <div style="font-size:0.76rem;color:var(--text2);margin-top:3px;line-height:1.6">${p.advice}<br>
-        <span style="color:var(--text3);font-size:0.7rem">此規則已回饋至進場建議：相同情境再出現時會直接警告</span></div>
+        <span style="color:var(--text3);font-size:0.7rem">${p.grade === 'firm' ? '樣本已滿 5 筆 — 正式警告，相同情境再出現時進場建議會直接提醒' : `樣本僅 ${p.n} 筆，統計上不足以下結論 — 滿 5 筆升級為正式警告`}</span></div>
     </div>`).join('')}
     ${manual.map(t => `<div style="padding:8px 12px;border-radius:8px;background:rgba(255,255,255,0.02);margin-bottom:6px">
       <div style="font-size:0.74rem;color:var(--text3)">${t.name}（${t.retPct >= 0 ? '+' : ''}${t.retPct}%・${t.reason}）</div>
