@@ -247,7 +247,122 @@ function detectCandlePatterns(ohlcv) {
       ? { name: '長紅棒', dir: 1, txt: '大實體陽線，買盤一路推升無明顯抵抗' }
       : { name: '長黑棒', dir: -1, txt: '大實體陰線，賣壓一路傾洩' });
   }
-  return out.slice(0, 3);
+
+  // ── 雙根補充：母子線（內包）、貫穿線／烏雲蓋頂 ──
+  if (pBody > 0 && body < pBody * 0.6 && Math.max(b.open, b.close) <= Math.max(p.open, p.close) && Math.min(b.open, b.close) >= Math.min(p.open, p.close)) {
+    out.push(p.close < p.open
+      ? { name: '多頭母子線', dir: 1, txt: '大陰線後的內包小 K，賣壓竭盡的初步訊號' }
+      : { name: '空頭母子線', dir: -1, txt: '大陽線後的內包小 K，攻勢暫歇留意轉弱' });
+  }
+  if (pBody > 0 && body > pBody * 0.6) {
+    const pMid = (p.open + p.close) / 2;
+    if (p.close < p.open && b.close > b.open && b.open <= p.close && b.close > pMid && b.close < p.open)
+      out.push({ name: '貫穿線', dir: 1, txt: '陽線深入前陰線一半以上，買方展開反攻' });
+    if (p.close > p.open && b.close < b.open && b.open >= p.close && b.close < pMid && b.close > p.open)
+      out.push({ name: '烏雲蓋頂', dir: -1, txt: '陰線吃掉前陽線一半以上，賣壓明顯轉強' });
+  }
+
+  // ── 三根組合：晨星／夜星、紅三兵／三烏鴉 ──
+  if (n >= 4) {
+    const p2 = ohlcv[n-3];
+    const p2Body = Math.abs(p2.close - p2.open);
+    const pRange = p.high - p.low;
+    const pSmall = pRange > 0 && Math.abs(p.close - p.open) / pRange < 0.35; // 中間星形小實體
+    if (p2Body > 0 && pSmall) {
+      // 晨星：大陰 → 小實體 → 大陽收復前陰一半以上
+      if (p2.close < p2.open && b.close > b.open && body > p2Body * 0.6 && b.close > (p2.open + p2.close) / 2)
+        out.push({ name: '晨星', dir: 1, txt: '三根組合止跌反轉：陰線 → 變盤星 → 陽線收復失土' });
+      // 夜星：大陽 → 小實體 → 大陰吃掉前陽一半以上
+      if (p2.close > p2.open && b.close < b.open && body > p2Body * 0.6 && b.close < (p2.open + p2.close) / 2)
+        out.push({ name: '夜星', dir: -1, txt: '三根組合見頂轉弱：陽線 → 變盤星 → 陰線吞回漲幅' });
+    }
+    // 紅三兵／三烏鴉：連三根同向中大實體、逐步推進
+    const trio = [p2, p, b];
+    const allUp = trio.every(x => x.close > x.open && (x.high - x.low) > 0 && (x.close - x.open) / (x.high - x.low) >= 0.5)
+      && b.close > p.close && p.close > p2.close;
+    const allDn = trio.every(x => x.close < x.open && (x.high - x.low) > 0 && (x.open - x.close) / (x.high - x.low) >= 0.5)
+      && b.close < p.close && p.close < p2.close;
+    if (allUp) out.push({ name: '紅三兵', dir: 1, txt: '連三根中大陽線步步推升，買方接力明確' });
+    if (allDn) out.push({ name: '三烏鴉', dir: -1, txt: '連三根中大陰線持續下殺，賣方全面掌控' });
+  }
+  return out.slice(0, 4);
+}
+
+// ── 裸 K 位置語境：最後一根 K 站在什麼位置（支撐/壓力/半空中）────────────────
+// 正統價格行為的核心：同一個型態出現在關鍵位置才有意義，半空中的雜訊居多。
+function priceActionContext(ohlcv, ema20) {
+  if (!ohlcv || ohlcv.length < 20) return null;
+  const b = ohlcv[ohlcv.length - 1];
+  const price = b.close;
+  const sr = calcSR(ohlcv);
+  const near = (level) => level > 0 && Math.abs(price - level) / level <= 0.02;
+  // 支撐：樞紐支撐、EMA20、前 20 日低
+  const lows = ohlcv.slice(-21, -1).map(x => x.low);
+  const supCands = [...(sr.supports || []), ema20 || 0, Math.min(...lows)].filter(v => v > 0 && v <= price * 1.02);
+  const resCands = [...(sr.resistances || []), Math.max(...ohlcv.slice(-21, -1).map(x => x.high))].filter(v => v >= price * 0.98);
+  const sup = supCands.filter(near).sort((a, b2) => b2 - a)[0] ?? null;
+  const res = resCands.filter(near).sort((a, b2) => a - b2)[0] ?? null;
+  if (sup != null && (res == null || price - sup < res - price)) return { at: 'support', level: +sup.toFixed(2) };
+  if (res != null) return { at: 'resistance', level: +res.toFixed(2) };
+  return { at: 'mid', level: null };
+}
+
+// ── 跳空缺口：未回補缺口 = 最乾淨的支撐壓力（排除除權息缺口）─────────────────
+function detectGaps(ohlcv, lookback = 60) {
+  if (!ohlcv || ohlcv.length < 10) return { list: [], recent: null };
+  const start = Math.max(1, ohlcv.length - lookback);
+  const gaps = [];
+  for (let i = start; i < ohlcv.length; i++) {
+    const b = ohlcv[i], p = ohlcv[i - 1];
+    if (b.exDiv) continue; // 除息缺口不是市場行為
+    if (b.low > p.high * 1.003) gaps.push({ type: 'up', top: +b.low.toFixed(2), bottom: +p.high.toFixed(2), i, time: b.time });
+    else if (b.high < p.low * 0.997) gaps.push({ type: 'down', top: +p.low.toFixed(2), bottom: +b.high.toFixed(2), i, time: b.time });
+  }
+  // 回補判定：之後任何一根觸及缺口另一端即視為回補
+  const unfilled = gaps.filter(g => {
+    for (let j = g.i + 1; j < ohlcv.length; j++) {
+      if (g.type === 'up' && ohlcv[j].low <= g.bottom) return false;
+      if (g.type === 'down' && ohlcv[j].high >= g.top) return false;
+    }
+    return true;
+  });
+  const last = ohlcv[ohlcv.length - 1];
+  const recent = unfilled.find(g => g.i >= ohlcv.length - 3) || null; // 最近 3 根內的新缺口（突破/竭盡訊號）
+  const price = last.close;
+  return {
+    list: unfilled.map(({ type, top, bottom, time }) => ({ type, top, bottom, time })),
+    recent: recent ? { type: recent.type, top: recent.top, bottom: recent.bottom } : null,
+    supportGap: unfilled.filter(g => g.type === 'up' && g.top <= price).sort((a, b2) => b2.top - a.top)[0] || null,
+    resistGap: unfilled.filter(g => g.type === 'down' && g.bottom >= price).sort((a, b2) => a.bottom - b2.bottom)[0] || null,
+  };
+}
+
+// ── 假突破偵測（Spring / Upthrust）：勝率最高的裸 K 訊號之一 ─────────────────
+// Spring：影線刺破支撐（>0.3%）但收盤收回支撐之上 → 掃完停損單的洗盤，偏多
+// Upthrust：影線刺穿壓力但收盤跌回壓力之下 → 誘多出貨，偏空
+function detectFalseBreak(ohlcv) {
+  if (!ohlcv || ohlcv.length < 25) return null;
+  const sr = calcSR(ohlcv);
+  const prior = ohlcv.slice(0, -3);
+  const lo20 = Math.min(...prior.slice(-20).map(x => x.low));
+  const hi20 = Math.max(...prior.slice(-20).map(x => x.high));
+  const sups = [...(sr.supports || []), lo20].filter(v => v > 0);
+  const ress = [...(sr.resistances || []), hi20].filter(v => v > 0);
+  // 只看最近 3 根，訊號要新鮮
+  for (let k = ohlcv.length - 1; k >= ohlcv.length - 3; k--) {
+    const b = ohlcv[k];
+    for (const s0 of sups) {
+      if (b.low < s0 * 0.997 && b.close > s0 && ohlcv[ohlcv.length - 1].close > s0)
+        return { type: 'spring', level: +s0.toFixed(2), time: b.time,
+                 txt: `假跌破反轉（Spring）：影線刺破支撐 ${s0.toFixed(2)} 後收回其上 — 掃停損洗盤特徵，偏多` };
+    }
+    for (const r0 of ress) {
+      if (b.high > r0 * 1.003 && b.close < r0 && ohlcv[ohlcv.length - 1].close < r0)
+        return { type: 'upthrust', level: +r0.toFixed(2), time: b.time,
+                 txt: `假突破回落（Upthrust）：刺穿壓力 ${r0.toFixed(2)} 後收回其下 — 誘多出貨特徵，偏空` };
+    }
+  }
+  return null;
 }
 
 // ── RSI 背離（價格創新高/低但動能未跟上）────────────────────────────────────
@@ -507,6 +622,9 @@ function calculateScore(ohlcv) {
   const vpRegime = volumePriceRegime(ohlcv);
   const vForce = volumeForce(ohlcv);
   const pctile = pricePercentile(ohlcv);
+  const paCtx = priceActionContext(ohlcv, ema20arr[ema20arr.length - 1]);
+  const gaps = detectGaps(ohlcv);
+  const falseBreak = detectFalseBreak(ohlcv);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -624,7 +742,7 @@ function calculateScore(ohlcv) {
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
            diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
-           vForce, pctile, price, prevClose, lastVol };
+           vForce, pctile, paCtx, gaps, falseBreak, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────
