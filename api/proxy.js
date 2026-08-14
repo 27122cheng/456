@@ -11,6 +11,7 @@ const ALLOW = [
   /^https:\/\/news\.google\.com\//,
   /^https:\/\/stooq\.com\/q\//,
   /^https:\/\/mis\.twse\.com\.tw\//,
+  /^https:\/\/opendata\.tdcc\.com\.tw\//,
 ];
 
 export default async function handler(req, res) {

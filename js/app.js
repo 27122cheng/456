@@ -224,6 +224,13 @@ async function runScan() {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
   }).catch(() => {});
+  // 集保股權分散（週更）：千張大戶持股比率 — 比單日法人買賣超更穩定的大戶證據
+  fetchTDCCAll(new Set(allStocks.map(s => s.id))).then(m => {
+    if (!m) return;
+    allStocks.forEach(s => { if (m[s.id]) s._tdcc = m[s.id]; });
+    accumulateTDCCHist(m);
+    allStocks.forEach(s => { if (m[s.id]) s._tdccTrend = tdccTrend(s.id); });
+  }).catch(() => {});
   // 預熱官方加權指數日線（供相對強弱、Beta、市場面計算；不再依賴 Yahoo）
   fetchTWIIOHLC(5).then(bars => {
     if (bars?.length) { _twiiSeries = bars; renderFocusStocks(); }
@@ -1142,6 +1149,48 @@ function rankingRow(s, rank) {
   </tr>`;
 }
 
+// ── 集保股權分散：週度快照累積與趨勢 ──────────────────────────────────────
+// 官方只提供最新一週，故逐週累積本機歷史（週更 → 一週開一次網頁即可，
+// 不像法人買賣超需要每天開）。保留最近 12 週。
+function accumulateTDCCHist(map) {
+  try {
+    const hist = JSON.parse(localStorage.getItem('tdcc-hist') || '{}');
+    let changed = false;
+    for (const [id, v] of Object.entries(map)) {
+      if (!v?.d) continue;
+      const arr = hist[id] = hist[id] || [];
+      if (arr.some(r => r.d === v.d)) continue;
+      arr.push({ d: v.d, big: v.big, mid: v.mid, retail: v.retail, holders: v.holders });
+      arr.sort((a, b) => String(a.d).localeCompare(String(b.d)));
+      hist[id] = arr.slice(-12);
+      changed = true;
+    }
+    if (changed) localStorage.setItem('tdcc-hist', JSON.stringify(hist));
+  } catch {}
+}
+
+// 千張大戶持股比率的週變化（需累積 ≥2 週才有結論 — 樣本不足就誠實回 null）
+function tdccTrend(stockId) {
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem('tdcc-hist') || '{}')[stockId] || []; } catch {}
+  if (arr.length < 2) return null;
+  const last = arr[arr.length - 1], prev = arr[arr.length - 2];
+  const dBig = +(last.big - prev.big).toFixed(2);
+  const dHolders = last.holders != null && prev.holders != null
+    ? Math.round((last.holders - prev.holders) / prev.holders * 1000) / 10 : null;
+  // 連續增加/減少的週數
+  let streak = 0;
+  const dir = dBig > 0 ? 1 : dBig < 0 ? -1 : 0;
+  if (dir) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const d = arr[i].big - arr[i - 1].big;
+      if (dir > 0 ? d > 0 : d < 0) streak++; else break;
+    }
+  }
+  return { big: last.big, mid: last.mid, retail: last.retail, dBig, dir, streak,
+           weeks: arr.length, dHolders, date: last.d };
+}
+
 // 法人連續買/賣超天數（依 inst-hist 逐日累積的真實資料）
 function instStreak(stockId) {
   let hist = [];
@@ -1360,6 +1409,21 @@ function buildManagerAnalysis(s) {
     add(0.8, 1, '外資與投信同步買超（雙引擎籌碼）', 'chip');
   } else if (foreign != null && inv != null && foreign < -500 && inv < -300) {
     add(0.8, -1, '外資與投信同步賣超（法人一致撤退）', 'chip');
+  }
+
+  // 集保千張大戶持股變化（週更、官方完整快照 — 比單日法人買賣超穩定）
+  const td = s._tdccTrend;
+  if (td && Math.abs(td.dBig) >= 0.1) {
+    const w = Math.abs(td.dBig) >= 0.5 ? 1.5 : 0.8;
+    add(w, td.dir, `千張大戶持股 ${td.dBig > 0 ? '增加' : '減少'} ${Math.abs(td.dBig)} 個百分點` +
+      `（現 ${td.big}%${td.streak >= 2 ? `、連 ${td.streak} 週${td.dir > 0 ? '增' : '減'}` : ''}）`, 'chip');
+  } else if (s._tdcc && !td) {
+    notes.push(`千張大戶持股 ${s._tdcc.big}%（集保週報 ${s._tdcc.d}）— 尚未累積前週資料，無法比較增減`);
+  }
+  if (td?.dHolders != null && Math.abs(td.dHolders) >= 1) {
+    // 股東人數減少 = 籌碼集中（大戶收集）；增加 = 籌碼分散（散戶接手）
+    add(0.6, td.dHolders < 0 ? 1 : -1,
+      `股東人數週${td.dHolders < 0 ? '減' : '增'} ${Math.abs(td.dHolders)}% — 籌碼${td.dHolders < 0 ? '趨於集中' : '轉為分散'}`, 'chip');
   }
 
   const streak = instStreak(s.id);
@@ -2706,6 +2770,27 @@ async function renderAnalysisPanels(s, inst) {
       if (ic) bits.push(ic.txt);
       return bits.length ? `<div style="margin-top:10px;padding:9px 12px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.78rem;color:var(--text2);line-height:1.7">🧭 籌碼解讀：${bits.join('；')}</div>` : '';
     })()}
+    ${(() => {
+      const td = s._tdccTrend, tc = s._tdcc;
+      if (!tc) return '';
+      const c = td ? (td.dir > 0 ? 'var(--bull)' : td.dir < 0 ? 'var(--bear)' : 'var(--text2)') : 'var(--text2)';
+      return `<div style="padding-top:12px;border-top:1px solid var(--border);margin-top:12px">
+        <div class="fund-block-ttl">🐋 集保股權分散（週報 ${tc.d}）</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px">
+          <div class="inst-card"><div class="inst-card-lbl">千張大戶持股</div>
+            <div class="inst-card-val" style="color:${c}">${tc.big}%${td ? `<span style="font-size:0.7rem"> ${td.dBig > 0 ? '▲' : td.dBig < 0 ? '▼' : ''}${Math.abs(td.dBig)}</span>` : ''}</div></div>
+          <div class="inst-card"><div class="inst-card-lbl">400張以上</div>
+            <div class="inst-card-val">${tc.mid != null ? tc.mid + '%' : '--'}</div></div>
+          <div class="inst-card"><div class="inst-card-lbl">散戶(5張以下)</div>
+            <div class="inst-card-val">${tc.retail}%</div></div>
+        </div>
+        <div style="font-size:0.74rem;color:var(--text2);margin-top:7px;line-height:1.7">
+          ${td
+            ? `${td.dir > 0 ? '大戶增持中' : td.dir < 0 ? '大戶減碼中' : '大戶持股持平'}${td.streak >= 2 ? `，已連 ${td.streak} 週` : ''}${td.dHolders != null ? `；股東人數週${td.dHolders < 0 ? '減' : '增'} ${Math.abs(td.dHolders)}%（籌碼${td.dHolders < 0 ? '集中' : '分散'}）` : ''}<span style="color:var(--text3)">（已累積 ${td.weeks} 週）</span>`
+            : '<span style="color:var(--text3)">尚未累積前週資料，下週再開即可比較增減（集保為週更資料）</span>'}
+        </div>
+      </div>`;
+    })()}
     <div style="padding-top:12px;border-top:1px solid var(--border);margin-top:12px">
       <div class="fund-block-ttl">${inst5.length} 日累計買賣超</div>
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:8px">
@@ -3379,7 +3464,7 @@ function getThreshold(type) {
 // 不會自動互通。這裡提供打包匯出／匯入，讓兩邊保持一致。
 const SYNC_KEYS = [
   'my-holdings', 'price-alerts', 'custom-stocks', 'pred-log',
-  'inst-hist', 'fin-hist',
+  'inst-hist', 'fin-hist', 'tdcc-hist',
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
   'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
@@ -3508,6 +3593,14 @@ async function runDiagnostics() {
         const b = await fetchTWSEHistory('2330', 2);
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
                          : { ok: false, msg: '無資料' };
+      } },
+    { name: '集保股權分散 (TDCC 週報)', run: async () => {
+        const m = await fetchTDCCAll(new Set(['2330', '2317', '2454'])).catch(() => null);
+        if (!m || !Object.keys(m).length) return { ok: false, msg: '無回應或格式無法解析（端點/欄位可能已變更，大戶週度證據將略過）' };
+        const t = m['2330'] || Object.values(m)[0];
+        return { ok: true, msg: `${Object.keys(m).length} 檔｜資料日 ${t.d}｜千張大戶 ${t.big}%` +
+          (t.mid != null ? `、400張以上 ${t.mid}%` : '（級距數非 15，400張級距略過）') +
+          `｜級距 ${t.levels} 段` };
       } },
     { name: '隔夜訊號 (台積電ADR/EWT)', run: async () => {
         const day = await fetchTWDayAll().catch(() => null);
@@ -4123,6 +4216,10 @@ async function detectWhales() {
       sig.push(`法人大量買超 ${net.toLocaleString()} 張`);
     if (st?.dir > 0 && st.days >= 3)
       sig.push(`法人連續 ${st.days} 日買超（累計 ${st.total.toLocaleString()} 張）`);
+    // 集保千張大戶增持：週度證據，可獨立成立（不需當日法人買超）
+    const td = s._tdccTrend;
+    if (td?.dir > 0 && td.dBig >= 0.3)
+      sig.push(`集保千張大戶持股週增 ${td.dBig} 個百分點至 ${td.big}%${td.streak >= 2 ? `（連 ${td.streak} 週增持）` : ''}`);
     if (!sig.length) continue;
     if (avg20 > 0 && last.volume >= avg20 * 2.2 && last.close > last.open)
       sig.push(`今日量能為均量 ${(last.volume / avg20).toFixed(1)} 倍且收紅`);
@@ -4157,6 +4254,9 @@ async function detectWhales() {
       trap.push(`技術結構為「${m.stance}」— 買超與結構背離，可能是接刀或對倒`);
     if (m?.oi?.dFin > 0 && avgZ > 0 && m.oi.dFin >= avgZ * 0.1)
       trap.push(`融資單日大增 ${m.oi.dFin.toLocaleString()} 張 — 散戶跟風重，籌碼轉髒`);
+    // 最強的陷阱訊號之一：帳面法人買超但集保大戶其實在減碼（單日買超掩護出貨）
+    if (td?.dir < 0 && td.dBig <= -0.3)
+      trap.push(`集保千張大戶持股週減 ${Math.abs(td.dBig)} 個百分點 — 單日法人買超與大戶減碼背離，慎防買超掩護出貨`);
     if (s._alert?.level === 'punish') trap.push('處置股 — 分盤交易，流動性陷阱');
     else if (s._alert) trap.push('注意股 — 波動異常已被交易所警示');
     if (book && book.ratio >= 2 && book.price != null && book.low != null && book.price <= book.low * 1.005)

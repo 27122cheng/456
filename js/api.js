@@ -670,6 +670,79 @@ async function fetchTWIIQuoteOfficial() {
 }
 
 // Fetch a single index quote: 官方(僅台股) → Yahoo → Stooq 三層備援
+// ── TDCC 集保戶股權分散表（每週公布）───────────────────────────────────────
+// 官方每週公布各股「持股分級」的人數與股數占比。千張大戶持股比率的變化，
+// 比單日法人買賣超更穩定的大戶進出證據 —— 且官方一次給完整快照，
+// 不像 T86 需要本機逐日累積。
+// 防禦式解析：欄位名模糊比對；級距邊界不寫死 —— 以「排序後最高級距
+// （排除合計列）」認定千張大戶，避免官方調整級距數量時整段解析錯誤。
+let _tdccPromise = null;
+
+async function fetchTDCCAll(ids) {
+  if (_tdccPromise) return _tdccPromise;
+  _tdccPromise = (async () => {
+    const key = 'cache:tdcc';
+    const cached = cacheGet(key, 3 * 24 * 60 * 60 * 1000);   // 週更資料 → 快取 3 天
+    if (cached) return cached;
+    const stale = () => cacheGetStale(key, 21 * 24 * 60 * 60 * 1000); // 最多用 3 週前的舊資料
+    if (srcDead('tdcc')) return stale();
+
+    const rows = await officialJSON('https://opendata.tdcc.com.tw/getOD.ashx?id=1-5', 'tdcc', 15000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return stale();
+
+    // 欄位名模糊比對（官方欄位名曾變動，且有全形/英文版本）
+    const sample = rows[0];
+    const findKey = (re) => Object.keys(sample).find(k => re.test(k)) || null;
+    const kId = findKey(/證券代號|股票代號|Code|證券代碼/i);
+    const kLvl = findKey(/分級|Level|級距/i);
+    const kPct = findKey(/比例|占集保|Percent|Ratio/i);
+    const kPpl = findKey(/人數|People|Holder/i);
+    const kDate = findKey(/日期|Date/i);
+    if (!kId || !kLvl || !kPct) { srcMarkDead('tdcc', 60); return stale(); }
+
+    const want = ids instanceof Set ? ids : new Set(ids || []);
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const byId = {};
+    let dataDate = null;
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!/^\d{4,6}$/.test(id)) continue;
+      if (want.size && !want.has(id)) continue;           // 只留掃描清單，避免佔滿儲存空間
+      const lvl = num(r[kLvl]);
+      const pct = num(r[kPct]);
+      if (lvl == null || pct == null) continue;
+      (byId[id] = byId[id] || []).push({ lvl, pct, ppl: num(r[kPpl]) ?? null });
+      if (!dataDate && kDate) dataDate = String(r[kDate] ?? '').trim();
+    }
+    if (!Object.keys(byId).length) { srcMarkDead('tdcc', 60); return stale(); }
+
+    const iso = /^\d{8}$/.test(dataDate || '')
+      ? `${dataDate.slice(0,4)}-${dataDate.slice(4,6)}-${dataDate.slice(6,8)}`
+      : (dataDate || new Date().toISOString().slice(0, 10));
+
+    const out = {};
+    for (const [id, lv] of Object.entries(byId)) {
+      lv.sort((a, b) => a.lvl - b.lvl);
+      // 合計列：占比接近 100 者（官方通常放在最後一級）
+      const totalRow = lv.find(x => x.pct >= 99.5) || null;
+      const data = lv.filter(x => x !== totalRow);
+      if (!data.length) continue;
+      const big = +data[data.length - 1].pct.toFixed(2);        // 最高級距 = 千張(1,000,001股)以上
+      // 400 張以上需要級距邊界對得上：官方為 15 級時，最高 4 級即 400 張以上
+      const mid = data.length === 15
+        ? +data.slice(-4).reduce((n, x) => n + x.pct, 0).toFixed(2) : null;
+      const retail = +data.slice(0, 2).reduce((n, x) => n + x.pct, 0).toFixed(2); // 最低兩級 ≈ 散戶
+      out[id] = { d: iso, big, mid, retail, holders: totalRow?.ppl ?? null, levels: data.length };
+    }
+    if (!Object.keys(out).length) return stale();
+    srcMarkAlive('tdcc');
+    cacheSet(key, out);
+    return out;
+  })();
+  try { return await _tdccPromise; } finally { _tdccPromise = null; }
+}
+
 // ── 隔夜訊號：台積電 ADR + 台灣 ETF（EWT）─────────────────────────────────
 // 台積電佔加權指數約三成，其 ADR 於美股時段交易，是台股開盤方向最直接的
 // 領先指標。另計 ADR 溢價率：1 ADR = 5 股普通股，換算成台幣後與 2330
