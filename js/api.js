@@ -639,6 +639,8 @@ function quoteFromCloses(closes) {
 const STOOQ_SYM = {
   '^TWII': '^twse', '^SOX': '^sox', '^GSPC': '^spx',
   '^IXIC': '^ndq', '^DJI': '^dji', '^VIX': '^vix', 'TWD=X': 'usdtwd',
+  // 隔夜訊號：台積電 ADR 與台灣 ETF（美股時段交易，反映台股開盤預期）
+  'TSM': 'tsm.us', 'EWT': 'ewt.us',
 };
 
 async function fetchStooqCloses(sym) {
@@ -668,6 +670,36 @@ async function fetchTWIIQuoteOfficial() {
 }
 
 // Fetch a single index quote: 官方(僅台股) → Yahoo → Stooq 三層備援
+// ── 隔夜訊號：台積電 ADR + 台灣 ETF（EWT）─────────────────────────────────
+// 台積電佔加權指數約三成，其 ADR 於美股時段交易，是台股開盤方向最直接的
+// 領先指標。另計 ADR 溢價率：1 ADR = 5 股普通股，換算成台幣後與 2330
+// 收盤比較 — 溢價擴大代表外資對台積電評價高於台股現價（開盤有補漲壓力）。
+async function fetchOvernightSignals(tsmcClose) {
+  const key = 'cache:overnight';
+  const cached = cacheGet(key, 20 * 60 * 1000);
+  if (cached) return cached;
+
+  const [adr, ewt, fx] = await Promise.all([
+    fetchIndexQuote('TSM').catch(() => null),
+    fetchIndexQuote('EWT').catch(() => null),
+    fetchIndexQuote('TWD=X').catch(() => null),
+  ]);
+  if (!adr && !ewt) return null;
+
+  const out = { adr: null, ewt: null, premium: null };
+  if (adr?.price) out.adr = { price: +adr.price.toFixed(2), chg1: +adr.chg1.toFixed(2), chg5: +adr.chg5.toFixed(2) };
+  if (ewt?.price) out.ewt = { price: +ewt.price.toFixed(2), chg1: +ewt.chg1.toFixed(2), chg5: +ewt.chg5.toFixed(2) };
+  // 溢價率需要匯率與 2330 收盤；缺任一項就不給（不猜）
+  if (adr?.price && fx?.price > 0 && tsmcClose > 0) {
+    const impliedTWD = adr.price * fx.price / 5;   // 1 ADR = 5 股
+    out.premium = +((impliedTWD / tsmcClose - 1) * 100).toFixed(2);
+    out.impliedTWD = +impliedTWD.toFixed(1);
+    out.fxRate = +fx.price.toFixed(3);
+  }
+  cacheSet(key, out);
+  return out;
+}
+
 async function fetchIndexQuote(sym) {
   if (sym === '^TWII') {
     const official = await fetchTWIIQuoteOfficial().catch(() => null);

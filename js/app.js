@@ -433,11 +433,52 @@ async function loadMarketOutlook() {
   }));
   outlookData.factors = results.filter(Boolean);
   renderMarketOutlook();
+  // 隔夜訊號（台積電 ADR / EWT）— 需要 2330 收盤價算溢價，抓到再刷新
+  loadOvernight();
   // 大盤量能（無量下跌／爆量止跌）— 另外抓，回來再刷新一次
   fetchMarketTurnover().then(rows => {
     const t = analyzeTurnover(rows);
     if (t) { outlookData.turnover = t; renderMarketOutlook(); }
   }).catch(() => {});
+}
+
+// 隔夜訊號載入：台積電 ADR 溢價需要 2330 收盤價（掃描或官方行情皆可）
+async function loadOvernight() {
+  try {
+    let tsmcClose = allStocks.find(s => s.id === '2330')?.analysis?.price ?? null;
+    if (!tsmcClose) {
+      const day = await fetchTWDayAll().catch(() => null);
+      tsmcClose = day?.['2330']?.close ?? null;
+    }
+    const o = await fetchOvernightSignals(tsmcClose);
+    if (o) { outlookData.overnight = o; renderMarketOutlook(); }
+  } catch (e) { console.warn('隔夜訊號載入失敗:', e); }
+}
+
+// 隔夜訊號評分：ADR 漲跌 + 溢價率，並與費半去重（同向時不重複計分）
+// 誠實界限：隔夜訊號對「開盤方向」預測力強，對「收盤」弱 → 權重控制在 1.5
+function scoreOvernight(o, soxPts) {
+  if (!o?.adr) return null;
+  const adrChg = o.adr.chg1;
+  let pts = 0;
+  if (adrChg > 2) pts = 1.5; else if (adrChg > 0.8) pts = 1;
+  else if (adrChg < -2) pts = -1.5; else if (adrChg < -0.8) pts = -1;
+  // 溢價率：>3% 台股開盤有補漲空間、<-2% ADR 已先反映利空
+  if (o.premium != null) {
+    if (o.premium > 3) pts += 0.5; else if (o.premium < -2) pts -= 0.5;
+  }
+  // EWT 佐證（涵蓋台積電以外）
+  if (o.ewt) {
+    if (o.ewt.chg1 > 1 && pts > 0) pts += 0.3;
+    else if (o.ewt.chg1 < -1 && pts < 0) pts -= 0.3;
+  }
+  // 去重：費半與 ADR 同向時，隔夜訊號只計一半（兩者本質是同一件事）
+  if (soxPts != null && Math.sign(soxPts) === Math.sign(pts) && pts !== 0) pts *= 0.5;
+  pts = Math.max(-2, Math.min(2, pts));
+  const parts = [`ADR ${adrChg >= 0 ? '+' : ''}${adrChg}%`];
+  if (o.premium != null) parts.push(`溢價 ${o.premium >= 0 ? '+' : ''}${o.premium}%`);
+  if (o.ewt) parts.push(`EWT ${o.ewt.chg1 >= 0 ? '+' : ''}${o.ewt.chg1}%`);
+  return { pts, display: parts.join('・'), dir: pts > 0.05 ? 'up' : pts < -0.05 ? 'dn' : 'flat' };
 }
 
 // Score one factor: returns { pts, dir } where dir is 'up'|'dn'|'flat' for display
@@ -484,6 +525,15 @@ function renderMarketOutlook() {
     return { f, pts, dir };
   });
 
+  // 隔夜訊號 factor（台積電 ADR / 溢價 / EWT）— 與費半去重後計分
+  const soxRow = rows.find(r => r.f.sym === '^SOX');
+  const ov = scoreOvernight(outlookData.overnight, soxRow?.pts ?? null);
+  if (ov) {
+    totalPts += ov.pts; maxPts += 2;
+    rows.push({ f: { name: '隔夜訊號(台積電ADR)', price: null, chg1: null, display: ov.display },
+                pts: ov.pts, dir: ov.dir });
+  }
+
   // 三大法人 factor
   if (instTotal !== null) {
     let pts = 0;
@@ -520,7 +570,7 @@ function renderMarketOutlook() {
   // Composite verdict: normalize to -100..+100
   // 分母用「完整因子組」的理論總權重，而非只用抓到的因子 —
   // 否則只成功 3~4 項時，全部同向就會給出 ±100 的假滿分（與實際盤勢矛盾）
-  const fullMax = OUTLOOK_SYMBOLS.reduce((n, c) => n + Math.abs(c.weight) * (c.type === 'vix' ? 2 : 1), 0) + 2 + 2;
+  const fullMax = OUTLOOK_SYMBOLS.reduce((n, c) => n + Math.abs(c.weight) * (c.type === 'vix' ? 2 : 1), 0) + 2 + 2 + 2;
   const denom = Math.max(maxPts, fullMax * 0.75); // 資料齊全度低於 75% 時分母不再縮水
   const norm = denom ? Math.round((totalPts / denom) * 100) : 0;
   const coverage = fullMax ? Math.round(maxPts / fullMax * 100) : 0;
@@ -1456,6 +1506,20 @@ function buildManagerAnalysis(s) {
       const sec = _newsSignals.sectors[s.sector];
       add(0.6, sec.score > 0 ? 1 : -1, `${s.sector}族群本週新聞面${sec.score > 0 ? '偏多' : '偏空'}（${sec.n} 則相關）`, 'news');
     }
+  }
+
+  // ⑨ 隔夜訊號（僅台積電與半導體族群，小權重）：ADR 於美股時段已先反映
+  // 國際評價，對半導體開盤方向有直接領先性；其他族群不注入以免稀釋個股訊號
+  const ovn = outlookData.overnight;
+  if (ovn?.adr && (s.id === '2330' || ['半導體', 'IC設計', '記憶體', '封測', '砷化鎵', '半導體檢測'].includes(s.sector))) {
+    const c = ovn.adr.chg1;
+    if (Math.abs(c) >= 1.5)
+      add(s.id === '2330' ? 0.8 : 0.5, c > 0 ? 1 : -1,
+        `隔夜台積電 ADR ${c > 0 ? '+' : ''}${c}%${ovn.premium != null ? `（溢價 ${ovn.premium > 0 ? '+' : ''}${ovn.premium}%）` : ''}`, 'macro');
+    if (s.id === '2330' && ovn.premium != null && Math.abs(ovn.premium) >= 4)
+      notes.push(ovn.premium > 0
+        ? `ADR 溢價 +${ovn.premium}% — 外資評價高於台股現價，開盤具補漲拉力`
+        : `ADR 折價 ${ovn.premium}% — 外資評價低於台股現價，開盤有補跌壓力`);
   }
 
   let dir = ev.reduce((acc, e) => acc + e.w * e.d, 0);
@@ -3445,6 +3509,14 @@ async function runDiagnostics() {
         return b?.length ? { ok: true, msg: `${b.length} 根日 K，最新收盤 ${b[b.length-1].close}` }
                          : { ok: false, msg: '無資料' };
       } },
+    { name: '隔夜訊號 (台積電ADR/EWT)', run: async () => {
+        const day = await fetchTWDayAll().catch(() => null);
+        const o = await fetchOvernightSignals(day?.['2330']?.close ?? null);
+        if (!o?.adr) return { ok: false, msg: 'ADR 無回應（Yahoo 與 Stooq 皆失敗，隔夜訊號將略過）' };
+        return { ok: true, msg: `ADR ${o.adr.price}（${o.adr.chg1 >= 0 ? '+' : ''}${o.adr.chg1}%）` +
+          (o.premium != null ? `｜溢價 ${o.premium >= 0 ? '+' : ''}${o.premium}%` : '｜溢價無法計算（缺匯率或 2330 收盤）') +
+          (o.ewt ? `｜EWT ${o.ewt.chg1 >= 0 ? '+' : ''}${o.ewt.chg1}%` : '') };
+      } },
     { name: '櫃買日線備援 (tradingStock)', run: async () => {
         // 5483 中美晶為上櫃指標股 — 此項失敗代表上櫃自選股在 Yahoo 限流時會掃不出來
         const b = await fetchTPExHistory('5483', 2);
@@ -4755,6 +4827,25 @@ function classifyLongTerm(s) {
   return why;
 }
 
+// 隔夜跳空預判：ADR/EWT 隱含的開盤方向 → 當沖執行紀律的事前提示。
+// 半導體族群與 2330 受 ADR 影響最直接，其他股票以 EWT（整體台股）為準。
+function overnightGapNote(s) {
+  const o = outlookData.overnight;
+  if (!o?.adr) return null;
+  const semi = s.id === '2330' || ['半導體', 'IC設計', '記憶體', '封測', '砷化鎵', '半導體檢測'].includes(s.sector);
+  const chg = semi ? o.adr.chg1 : (o.ewt?.chg1 ?? o.adr.chg1 * 0.6);
+  const src = semi ? '台積電 ADR' : 'EWT 台灣 ETF';
+  if (chg > 2.5)
+    return { pts: -6, txt: `⚠ 隔夜${src} ${chg >= 0 ? '+' : ''}${chg}% — 明日大機率開高逾 2%，依當沖紀律應放棄追進（開高走低風險）` };
+  if (chg > 1)
+    return { pts: -1, txt: `隔夜${src} +${chg}% — 明日可能開高，開盤價超過建議區上緣就別追` };
+  if (chg < -2)
+    return { pts: -5, txt: `⚠ 隔夜${src} ${chg}% — 明日大機率開低，動能訊號已失效` };
+  if (chg < -0.5)
+    return { pts: -2, txt: `隔夜${src} ${chg}% — 明日恐開低，開低逾 0.5% 依紀律放棄` };
+  return { pts: 1, txt: `隔夜${src} ${chg >= 0 ? '+' : ''}${chg}% 持平 — 無不利跳空，訊號有效性維持` };
+}
+
 function computeDayTradePicks() {
   const ready = allStocks.filter(s => s.analysis && s.ohlcv?.length >= 21);
   const out = [];
@@ -4792,12 +4883,16 @@ function computeDayTradePicks() {
     const finWarn = dFin != null && dFin > 0 && volZ > 0 && dFin >= volZ * 0.08
       ? `⚠ 融資大增 ${dFin.toLocaleString()} 張，散戶追價籌碼偏髒` : null;
 
+    // ── 隔夜跳空預判：當沖規則是「開高逾 2% 不追」，ADR 大漲時前一晚就能預知 ──
+    const gapWarn = overnightGapNote(s);
+
     out.push({ s, m, hasChips: net > 0 ? 1 : 0, why: [
       `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
       chips,
       ...(finWarn ? [finWarn] : []),
+      ...(gapWarn ? [gapWarn.txt] : []),
       `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
-    ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct });
+    ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct + (gapWarn?.pts ?? 0) });
   }
   // 有法人籌碼支撐者優先
   out.sort((x, y) => (y.hasChips - x.hasChips) || (y.score - x.score));
