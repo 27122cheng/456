@@ -325,10 +325,12 @@ async function runScan() {
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
   after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
   after('價格警報', checkAlerts);
+  after('本週開盤佈局', () => { renderWeeklyBrief(); });
   after('Telegram 推送', () => {
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyEntrySignals();   // 適合進場的訊號
     notifyHoldingExits();   // 持倉出場檢查
+    notifyWeeklyBrief();    // 週一 08:00 開盤前佈局簡報
   });
 }
 
@@ -4343,6 +4345,203 @@ function renderBacktest() {
       ${r.worst?.length ? `最不適合：${r.worst.map(x => `${x.name}（均 ${x.avgR > 0 ? '+' : ''}${x.avgR}R）`).join('、')}<br>` : ''}
       <span style="color:var(--text3);font-size:0.7rem">${r.at} 回測｜${r.universe} 檔｜僅回測技術核心（次日開盤進場、除息已還原）；實盤另有籌碼/基本面/大盤過濾，結果會不同</span>
     </div>${btn}`;
+}
+
+// ── 週一開盤前情勢簡報 ──────────────────────────────────────────────────────
+// 每週一 08:00（台北時間）自動生成：上週收在哪、隔夜與國際情勢、本週有什麼
+// 事件與數據、持倉怎麼佈局、有哪些交易機會 —— 並推送 Telegram。
+// 全部取自系統既有資料，不新增外部相依；沒有的資料就誠實標明「無」。
+
+function twNow() {
+  // 取台北時區的年/月/日/時/分/星期
+  const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'short' })
+    .formatToParts(new Date());
+  const g = t => p.find(x => x.type === t)?.value;
+  return { date: `${g('year')}-${g('month')}-${g('day')}`, hour: +g('hour'), minute: +g('minute'), wd: g('weekday') };
+}
+
+// 以「本週一的日期」當識別，確保同一週只推一次
+function weekKey() {
+  const t = twNow();
+  const d = new Date(`${t.date}T00:00:00Z`);
+  const dow = d.getUTCDay();                        // 0=Sun
+  const back = dow === 0 ? 6 : dow - 1;
+  d.setUTCDate(d.getUTCDate() - back);
+  return d.toISOString().slice(0, 10);
+}
+
+// 本週內的既有行事曆事件（資金流動事件表已涵蓋法說會、除權息、結算、作帳等）
+function weekEvents() {
+  const out = [];
+  const now = new Date();
+  const end = new Date(now.getTime() + 7 * 86400000);
+  for (const e of getCapitalFlowEvents()) if (e.date >= new Date(now.getTime() - 86400000) && e.date <= end) out.push(e);
+  // 每月 10 日前為上市櫃月營收公布期
+  const t = twNow();
+  const dom = +t.date.slice(8, 10);
+  if (dom <= 10) out.push({ name: '月營收公布期', desc: '上市櫃公司需於每月 10 日前公布上月營收，個股易因營收數字跳動', dir: 'mix', date: now });
+  return out;
+}
+
+function buildWeeklyBrief() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return null;
+  const t = twNow();
+
+  // ① 大盤與國際情勢
+  const norm = Math.round(outlookData.norm ?? 0);
+  const regime = norm >= 35 ? '偏多' : norm >= 15 ? '中性偏多' : norm <= -35 ? '偏空' : norm <= -15 ? '中性偏空' : '中性盤整';
+  const fac = sym => outlookData.factors?.find(f => f.sym === sym);
+  const intl = [];
+  for (const [sym, label] of [['^SOX', '費半'], ['^GSPC', 'S&P500'], ['^IXIC', '那斯達克']]) {
+    const f = fac(sym);
+    if (f?.chg5 != null) intl.push(`${label} 週線 ${f.chg5 >= 0 ? '+' : ''}${f.chg5.toFixed(1)}%`);
+  }
+  const vix = fac('^VIX');
+  const ov = outlookData.overnight;
+
+  // ② 上週市場寬度（掃描池）
+  const bullN = ready.filter(s => verdictScore(s) >= getThreshold('bull')).length;
+  const bearN = ready.filter(s => verdictScore(s) <= getThreshold('bear')).length;
+
+  // ③ 新聞指向（近 7 日，已由新聞解讀模組彙整）
+  const newsSec = _newsSignals ? Object.entries(_newsSignals.sectors)
+    .filter(([, v]) => Math.abs(v.score) >= 2)
+    .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 4) : [];
+  const newsStk = _newsSignals ? Object.entries(_newsSignals.stocks)
+    .filter(([, v]) => v.score !== 0)
+    .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 4) : [];
+
+  // ④ 本週事件
+  const evts = weekEvents();
+
+  // ⑤ 持倉佈局
+  const holdRows = getHoldings().map(h => {
+    const r = checkHoldingExit(h);
+    const s = allStocks.find(x => x.id === h.id);
+    if (!r) return { h, plan: '尚未取得分析資料，等本輪掃描完成後再評估', level: 'hold', pending: true };
+    const v = s ? getVerdict(s) : null;
+    const sec = s?.sector;
+    const newsHit = sec && _newsSignals?.sectors[sec] && Math.abs(_newsSignals.sectors[sec].score) >= 2
+      ? `（${sec}族群本週新聞面${_newsSignals.sectors[sec].score > 0 ? '偏多' : '偏空'}）` : '';
+    let plan;
+    if (r.level === 'exit') plan = `本週優先處理：${r.reasons[0]}。反彈即減碼，不要凹`;
+    else if (r.level === 'watch') plan = `留意：${r.reasons[0]}。續抱但停損上移，跌破 ${r.h.stop} 出場`;
+    else plan = norm <= -15
+      ? `結構仍健康，但大盤偏空 — 續抱不加碼，停損守 ${r.h.stop}`
+      : `結構健康，續抱。停損 ${r.h.stop}${r.h.t1 ? `，接近 ${r.h.t1} 可減碼一半` : '，上方無壓力則移動停利'}`;
+    return { h, r, v, plan: plan + newsHit, level: r.level, retPct: r.retPct };
+  });
+
+  // ⑥ 交易機會（沿用推薦引擎的同一套標準，維持全站一致）
+  const picks = computeEntrySignals();
+  const longs = [], swings = [];
+  for (const pk of picks.slice(0, 6)) (classifyLongTerm(pk.s) ? longs : swings).push(pk);
+
+  // ⑦ 本週操作基調
+  let tone;
+  if (norm >= 15 && bullN > bearN) tone = '順勢偏多：可依建議區間分批進場，但仍守紀律停損';
+  else if (norm <= -15 || bearN > bullN * 1.5) tone = '保守應對：降低部位與進場頻率，優先處理弱勢持股';
+  else tone = '中性觀望：等突破表態再加碼，區間內高賣低買為主';
+  if (vix?.price >= 25) tone += `；VIX ${vix.price.toFixed(1)} 偏高，波動放大請縮小單筆部位`;
+
+  return { t, norm, regime, intl, vix, ov, bullN, bearN, total: ready.length,
+           newsSec, newsStk, evts, holdRows, longs, swings, tone, at: new Date().toISOString().slice(0, 16).replace('T', ' ') };
+}
+
+function renderWeeklyBrief() {
+  const el = document.getElementById('weekly-brief-body');
+  if (!el) return;
+  const b = buildWeeklyBrief();
+  if (!b) { el.innerHTML = '<div class="adv-loading">等待掃描完成後生成本週佈局...</div>'; return; }
+  const c = b.norm >= 15 ? 'var(--bull)' : b.norm <= -15 ? 'var(--bear)' : 'var(--yellow)';
+  const lvIcon = { exit: '🔴', watch: '🟡', hold: '🟢' };
+
+  el.innerHTML = `
+    <div style="padding:10px 12px;border-radius:8px;background:${c}0d;border-left:3px solid ${c};margin-bottom:10px">
+      <div style="font-size:0.84rem;font-weight:700;color:${c}">本週基調：${b.tone}</div>
+      <div style="font-size:0.73rem;color:var(--text3);margin-top:3px">
+        大盤研判 ${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total} 檔
+        ${b.intl.length ? `<br>國際：${b.intl.join('・')}` : ''}
+        ${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}
+        ${b.ov?.adr ? `<br>隔夜：台積電 ADR ${b.ov.adr.chg1 >= 0 ? '+' : ''}${b.ov.adr.chg1}%${b.ov.premium != null ? `（溢價 ${b.ov.premium >= 0 ? '+' : ''}${b.ov.premium}%）` : ''}` : ''}
+      </div>
+    </div>
+
+    ${b.evts.length ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">📅 本週事件</div>
+      <div style="font-size:0.75rem;color:var(--text2);line-height:1.7">${b.evts.map(e => `・<b>${e.name}</b> — ${e.desc}`).join('<br>')}</div>
+    </div>` : ''}
+
+    ${(b.newsSec.length || b.newsStk.length) ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">📰 近一週新聞指向</div>
+      <div style="font-size:0.75rem;color:var(--text2);line-height:1.7">
+        ${b.newsSec.length ? `產業：${b.newsSec.map(([s, v]) => `<span style="color:${v.score > 0 ? 'var(--bull)' : 'var(--bear)'}">${s}${v.score > 0 ? '偏多' : '偏空'}</span>`).join('・')}<br>` : ''}
+        ${b.newsStk.length ? `個股：${b.newsStk.map(([id, v]) => `<span style="color:${v.score > 0 ? 'var(--bull)' : 'var(--bear)'}">${v.name}(${id})</span>`).join('・')}` : ''}
+      </div>
+    </div>` : '<div style="font-size:0.73rem;color:var(--text3);margin-bottom:9px">📰 近一週無明確指向特定產業或個股的新聞</div>'}
+
+    <div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">📌 持倉佈局（${b.holdRows.length} 檔）</div>
+      ${b.holdRows.length ? b.holdRows.map(r => `
+        <div style="font-size:0.75rem;color:var(--text2);line-height:1.65;padding:4px 0;border-bottom:1px solid var(--border)">
+          ${lvIcon[r.level] || '⏳'} <b>${r.h.name}(${r.h.id})</b>
+          ${r.retPct != null ? `<span style="font-family:var(--mono);color:${r.retPct >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%</span>` : ''}
+          <br><span style="color:var(--text3)">${r.plan}</span>
+        </div>`).join('')
+        : '<div style="font-size:0.75rem;color:var(--text3)">目前無持倉 — 可從下方交易機會挑選，或維持空手等待更好的進場點</div>'}
+    </div>
+
+    <div>
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">🎯 本週交易機會</div>
+      ${(b.longs.length || b.swings.length) ? `
+        ${b.longs.length ? `<div style="font-size:0.75rem;color:var(--text2);line-height:1.7">🏛 可長期持有：${b.longs.map(p => `${p.s.name}(${p.s.id}) 進場 ${p.p.lo}~${p.p.hi}／停損 ${p.p.stop}`).join('；')}</div>` : ''}
+        ${b.swings.length ? `<div style="font-size:0.75rem;color:var(--text2);line-height:1.7">📈 短期波段：${b.swings.map(p => `${p.s.name}(${p.s.id}) 進場 ${p.p.lo}~${p.p.hi}／停損 ${p.p.stop}`).join('；')}</div>` : ''}`
+        : '<div style="font-size:0.75rem;color:var(--text3)">本週開盤前無符合條件的標的 — 標準較嚴，寧可空手也不硬給訊號</div>'}
+    </div>
+    <div style="font-size:0.66rem;color:var(--text3);margin-top:8px">生成於 ${b.at}｜⚠ 規則化分析，僅供參考，非投資建議</div>`;
+  return b;
+}
+
+// 週一 08:00 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
+function notifyWeeklyBrief() {
+  const t = twNow();
+  if (t.wd !== 'Mon' || t.hour < 8) return;
+  const wk = weekKey();
+  if (localStorage.getItem('tg-weekly') === wk) return;
+  const b = buildWeeklyBrief();
+  if (!b) return;                                  // 資料未就緒，下輪再試
+  localStorage.setItem('tg-weekly', wk);
+  if (!tgWants('sig')) return;
+
+  const lvIcon = { exit: '🔴', watch: '🟡', hold: '🟢' };
+  const lines = [];
+  lines.push(`🗓 本週開盤佈局　${t.date}（週一）`);
+  lines.push('');
+  lines.push(`【大盤】${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total} 檔`);
+  if (b.intl.length) lines.push(`【國際】${b.intl.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
+  if (b.ov?.adr) lines.push(`【隔夜】台積電 ADR ${b.ov.adr.chg1 >= 0 ? '+' : ''}${b.ov.adr.chg1}%${b.ov.premium != null ? `（溢價 ${b.ov.premium >= 0 ? '+' : ''}${b.ov.premium}%）` : ''}`);
+  if (b.evts.length) { lines.push(''); lines.push('【本週事件】'); b.evts.forEach(e => lines.push(`・${e.name} — ${e.desc}`)); }
+  if (b.newsSec.length || b.newsStk.length) {
+    lines.push(''); lines.push('【近一週新聞指向】');
+    if (b.newsSec.length) lines.push(`產業：${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
+    if (b.newsStk.length) lines.push(`個股：${b.newsStk.map(([id, v]) => `${v.name}(${id})${v.score > 0 ? '利多' : '利空'}`).join('、')}`);
+  }
+  lines.push(''); lines.push('【持倉佈局】');
+  if (b.holdRows.length) b.holdRows.forEach(r => {
+    lines.push(`${lvIcon[r.level] || '⏳'} ${r.h.name}(${r.h.id})${r.retPct != null ? ` ${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%` : ''}`);
+    lines.push(`　${r.plan}`);
+  });
+  else lines.push('目前無持倉');
+  lines.push(''); lines.push('【本週交易機會】');
+  if (b.longs.length || b.swings.length) {
+    b.longs.forEach(p => lines.push(`🏛 ${p.s.name}(${p.s.id})　進場 ${p.p.lo}~${p.p.hi}｜停損 ${p.p.stop}｜${p.p.holdOn ? '無壓力續抱' : `目標 ${p.p.t1}`}`));
+    b.swings.forEach(p => lines.push(`📈 ${p.s.name}(${p.s.id})　進場 ${p.p.lo}~${p.p.hi}｜停損 ${p.p.stop}｜${p.p.holdOn ? '無壓力續抱' : `目標 ${p.p.t1}`}`));
+  } else lines.push('無符合條件的標的（標準較嚴，寧可空手）');
+  lines.push(''); lines.push(`【本週基調】${b.tone}`);
+  lines.push(''); lines.push('⚠ 規則化分析，僅供參考，非投資建議');
+  tgPush(lines.join('\n'));
 }
 
 // ── 大戶動向偵測：大量買超/大單掛買 → 陷阱判斷 → Telegram ──────────────────

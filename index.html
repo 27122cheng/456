@@ -203,6 +203,16 @@
         </div>
       </div>
 
+      <!-- 週一開盤前情勢簡報（恐慌指數下方） -->
+      <div class="market-outlook-card">
+        <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+          <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin:0">🗓 本週開盤佈局</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">每週一 08:00 自動生成並推送 Telegram</span>
+          <button class="btn-ghost" style="margin-left:auto;padding:3px 12px;font-size:0.7rem" onclick="renderWeeklyBrief()">立即生成</button>
+        </div>
+        <div id="weekly-brief-body" style="margin-top:10px"><div class="adv-loading">掃描完成後生成本週佈局...</div></div>
+      </div>
+
       <!-- 市場多空總覽 -->
       <div class="market-outlook-card">
         <div id="market-outlook-body"><div class="adv-loading">載入市場多空分析...</div></div>
