@@ -177,6 +177,121 @@ function findSwings(ohlcv, span = 3) {
   return { hi, lo };
 }
 
+// ── 均線結構：排列、位置、糾結、發散、斜率 ────────────────────────────────
+// 舊版只做零散加分且多空不對稱（多頭 5 項加分、空頭僅 2 項扣分），
+// 導致空頭股票的分數被系統性高估。這裡改為完全對稱，並補上三件事：
+//   1. 「完整排列」單獨認定（價 > EMA20 > EMA50 > EMA200 才算真多頭排列）
+//   2. K 棒站在幾條均線之上／之下（位置本身就是訊號強度）
+//   3. 均線糾結（三線收斂）→ 排列無意義，分數收斂回中性
+function maStructure(price, ema20, ema50, ema200, e20Series) {
+  if (!ema20 || !ema50) return null;
+  const has200 = !!ema200;
+  const lines = has200 ? [ema20, ema50, ema200] : [ema20, ema50];
+
+  // 糾結度：均線最大間距佔價格比例，<1.5% 視為黏合（盤整，排列不具意義）
+  const spread = (Math.max(...lines) - Math.min(...lines)) / price * 100;
+  const tangled = spread < 1.5;
+
+  // K 棒位置：站上幾條均線（-3 ~ +3）
+  let above = 0;
+  for (const lv of lines) above += price > lv ? 1 : -1;
+
+  const bullStack = has200 ? (price > ema20 && ema20 > ema50 && ema50 > ema200)
+                           : (price > ema20 && ema20 > ema50);
+  const bearStack = has200 ? (price < ema20 && ema20 < ema50 && ema50 < ema200)
+                           : (price < ema20 && ema20 < ema50);
+
+  // EMA20 斜率（10 根）：排列要搭配斜率才是「活的」趨勢
+  let slope = 0;
+  if (e20Series && e20Series.length > 11) {
+    const a = e20Series[e20Series.length - 1], b = e20Series[e20Series.length - 11];
+    if (a && b) slope = (a - b) / b * 100;
+  }
+
+  let pts = 0, reason = null;
+  if (bullStack) { pts += 14; reason = `完整多頭排列（價 > EMA20 > EMA50${has200 ? ' > EMA200' : ''}）`; }
+  else if (bearStack) { pts -= 14; reason = `完整空頭排列（價 < EMA20 < EMA50${has200 ? ' < EMA200' : ''}）`; }
+  else {
+    // 非完整排列：逐條對稱計分
+    if (ema20 > ema50) pts += 5; else pts -= 5;
+    if (has200) { if (ema50 > ema200) pts += 4; else pts -= 4; }
+    reason = ema20 > ema50 ? '短中均線偏多但排列未完整' : '短中均線偏空但排列未完整';
+  }
+
+  // 位置分（對稱）
+  pts += above * 3;
+  const posReason = above === lines.length ? `股價站上全部 ${lines.length} 條均線`
+                  : above === -lines.length ? `股價跌破全部 ${lines.length} 條均線`
+                  : `股價位於 ${lines.filter(l => price > l).length}/${lines.length} 條均線之上`;
+
+  // 斜率加成（對稱）
+  if (slope >= 1) pts += 3; else if (slope <= -1) pts -= 3;
+
+  // 糾結時排列不具意義 → 分數收斂回中性（保留 40%）
+  if (tangled) pts = Math.round(pts * 0.4);
+
+  return {
+    pts, reason: tangled ? `${reason} — 但三線糾結（間距 ${spread.toFixed(1)}%），排列意義有限` : reason,
+    posReason, bullStack, bearStack, tangled, spread: +spread.toFixed(2),
+    above, slope: +slope.toFixed(2),
+  };
+}
+
+// ── 突破與量能確認：帶量進場 vs 無量假突破 vs 高檔出貨 ──────────────────────
+// 「突破有沒有量」是多空研判最關鍵的一問，舊版完全沒做。
+// 量能倍數 × 收盤在當日振幅的位置 → 區分四種情境。
+function detectBreakout(bars) {
+  if (!bars || bars.length < 25) return null;
+  const n = bars.length, b = bars[n - 1];
+  const prior = bars.slice(0, -1);
+  const hi20 = Math.max(...prior.slice(-20).map(x => x.high));
+  const lo20 = Math.min(...prior.slice(-20).map(x => x.low));
+  const hi60 = prior.length >= 60 ? Math.max(...prior.slice(-60).map(x => x.high)) : null;
+  const vols = prior.slice(-20).map(x => x.volume || 0);
+  const avgV = vols.reduce((a, c) => a + c, 0) / Math.max(1, vols.length);
+  if (!(avgV > 0)) return null;
+  const volRatio = (b.volume || 0) / avgV;
+  const range = b.high - b.low;
+  const closePos = range > 0 ? (b.close - b.low) / range : 0.5;   // 收在振幅的哪個位置
+
+  const upBreak = b.close > hi20;
+  const dnBreak = b.close < lo20;
+  const nearHi = b.high > hi20 && b.close <= hi20;                 // 盤中觸及但收不上去
+
+  if (upBreak) {
+    if (volRatio >= 1.5 && closePos >= 0.6)
+      return { type: 'breakout-vol', dir: 1, pts: 12, volRatio: +volRatio.toFixed(2),
+        txt: `帶量突破${hi60 && b.close > hi60 ? '三個月' : '20日'}高點（量能 ${volRatio.toFixed(1)} 倍、收於高檔）— 多頭進場訊號` };
+    if (volRatio < 1.0)
+      return { type: 'breakout-novol', dir: 0, pts: -4, volRatio: +volRatio.toFixed(2),
+        txt: `突破 20 日高點但量能僅 ${volRatio.toFixed(1)} 倍（量縮）— 無量突破，慎防假突破` };
+    return { type: 'breakout-weak', dir: 1, pts: 4, volRatio: +volRatio.toFixed(2),
+      txt: `突破 20 日高點（量能 ${volRatio.toFixed(1)} 倍）— 突破成立但量能未明顯放大` };
+  }
+  if (dnBreak) {
+    if (volRatio >= 1.5)
+      return { type: 'breakdown-vol', dir: -1, pts: -12, volRatio: +volRatio.toFixed(2),
+        txt: `帶量跌破 20 日低點（量能 ${volRatio.toFixed(1)} 倍）— 賣壓宣洩，空方主導` };
+    return { type: 'breakdown', dir: -1, pts: -6, volRatio: +volRatio.toFixed(2),
+      txt: `跌破 20 日低點（量能 ${volRatio.toFixed(1)} 倍）` };
+  }
+  // 未突破但爆量 → 判斷是承接還是出貨
+  if (volRatio >= 2) {
+    if (closePos <= 0.35)
+      return { type: 'distribution', dir: -1, pts: -10, volRatio: +volRatio.toFixed(2),
+        txt: `爆量 ${volRatio.toFixed(1)} 倍但收在振幅低檔（長上影）— 高檔出貨跡象` };
+    if (closePos >= 0.7 && b.close > b.open)
+      return { type: 'accumulation', dir: 1, pts: 6, volRatio: +volRatio.toFixed(2),
+        txt: `爆量 ${volRatio.toFixed(1)} 倍且收在高檔紅K — 買盤積極承接` };
+    return { type: 'churn', dir: 0, pts: -2, volRatio: +volRatio.toFixed(2),
+      txt: `爆量 ${volRatio.toFixed(1)} 倍但收盤位置中性 — 多空換手激烈，方向未明` };
+  }
+  if (nearHi && volRatio >= 1.3)
+    return { type: 'failed-break', dir: -1, pts: -8, volRatio: +volRatio.toFixed(2),
+      txt: `盤中觸及 20 日高點但收盤未站上（量能 ${volRatio.toFixed(1)} 倍）— 突破失敗，賣壓沉重` };
+  return null;
+}
+
 // ── ZigZag 擺動點（ATR 自適應門檻）────────────────────────────────────────
 // 固定視窗的分形擺動會把雜訊小波動當轉折 → HH/HL 判定被污染。
 // 改用「反轉幅度須超過 max(2×ATR, 3%)」的 ZigZag：只留真正的波段轉折。
@@ -753,6 +868,8 @@ function calculateScore(ohlcv) {
   const gaps = detectGaps(ohlcv);
   const falseBreak = detectFalseBreak(ohlcv);
   const trend = classifyTrend(ohlcv);
+  const maStruct = maStructure(closes[closes.length - 1], ema20, ema50, ema200, ema20arr);
+  const brk = detectBreakout(ohlcv);
 
   const price   = closes[closes.length - 1];
   const prevClose = closes[closes.length - 2];
@@ -761,16 +878,17 @@ function calculateScore(ohlcv) {
   let score = 50;
   const reasons = [];
 
-  // Trend: EMA alignment
-  if (ema20 && ema50 && ema20 > ema50) { score += 8; reasons.push('EMA20 > EMA50 多頭排列'); }
-  if (ema50 && ema200 && ema50 > ema200) { score += 7; reasons.push('EMA50 > EMA200 長線多頭'); }
-  if (price > (ema20 || 0)) { score += 5; reasons.push('股價站上 EMA20'); }
-  if (price > (ema50 || 0)) { score += 5; reasons.push('股價站上 EMA50'); }
-  if (ema200 && price > ema200) { score += 5; reasons.push('股價站上 EMA200'); }
-
-  // Downtrend
-  if (ema20 && ema50 && ema20 < ema50) { score -= 8; }
-  if (price < (ema20 || Infinity)) { score -= 5; }
+  // Trend: 均線結構（多空對稱計分 —— 舊版空頭只扣兩項，形成嚴重多頭偏誤）
+  if (maStruct) {
+    score += maStruct.pts;
+    if (maStruct.reason) reasons.push(maStruct.reason);
+    if (maStruct.posReason) reasons.push(maStruct.posReason);
+  }
+  // 突破與量能確認：帶量突破加分、無量假突破與高檔出貨扣分
+  if (brk) {
+    score += brk.pts;
+    reasons.push(brk.txt);
+  }
 
   // RSI
   if (rsi !== null) {
@@ -870,7 +988,7 @@ function calculateScore(ohlcv) {
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
            diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
-           vForce, pctile, paCtx, gaps, falseBreak, trend, price, prevClose, lastVol };
+           vForce, pctile, paCtx, gaps, falseBreak, trend, maStruct, brk, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────

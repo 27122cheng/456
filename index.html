@@ -267,6 +267,24 @@
         </div>
       </div>
 
+      <!-- 族群排名（依成交量）→ 點入細分上市／上櫃 -->
+      <div class="tbl-card full-tbl" id="sector-card">
+        <div class="tbl-head">
+          <div class="tbl-title"><span class="dot dot-bull"></span>族群排名 · 依成交量</div>
+          <span class="tbl-badge" id="sector-count">0</span>
+        </div>
+        <div id="sector-body" style="padding:4px 0"><div class="adv-loading">掃描完成後統計各族群成交量...</div></div>
+      </div>
+
+      <!-- 點入族群後的個股清單（上市 / 上櫃兩排） -->
+      <div class="tbl-card full-tbl" id="sector-detail" style="display:none">
+        <div class="tbl-head">
+          <div class="tbl-title"><span id="sector-detail-name">族群</span></div>
+          <button class="btn-ghost" style="margin-left:auto;padding:4px 14px;font-size:0.74rem" onclick="closeSectorDetail()">← 返回族群排名</button>
+        </div>
+        <div id="sector-detail-body"></div>
+      </div>
+
       <div class="tbl-card full-tbl">
         <div class="tbl-scroll">
           <table class="data-tbl ranking-tbl" id="ranking-tbl">
