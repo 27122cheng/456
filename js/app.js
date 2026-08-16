@@ -20,10 +20,10 @@ const DEFAULT_STOCKS = [
   { id:'2449', name:'京元電子',  sector:'封測',   mkt:'twse' },
   // ── 上市：電子製造/AI 供應鏈 ──
   { id:'2317', name:'鴻海',      sector:'電子製造', mkt:'twse' },
-  { id:'2382', name:'廣達',      sector:'伺服器', mkt:'twse' },
-  { id:'6669', name:'緯穎',      sector:'伺服器', mkt:'twse' },
-  { id:'3231', name:'緯創',      sector:'伺服器', mkt:'twse' },
-  { id:'2356', name:'英業達',    sector:'伺服器', mkt:'twse' },
+  { id:'2382', name:'廣達',      sector:'AI伺服器', mkt:'twse' },
+  { id:'6669', name:'緯穎',      sector:'AI伺服器', mkt:'twse' },
+  { id:'3231', name:'緯創',      sector:'AI伺服器', mkt:'twse' },
+  { id:'2356', name:'英業達',    sector:'AI伺服器', mkt:'twse' },
   { id:'2308', name:'台達電',    sector:'電子零組件', mkt:'twse' },
   { id:'2301', name:'光寶科',    sector:'電子零組件', mkt:'twse' },
   { id:'2385', name:'群光',      sector:'電子零組件', mkt:'twse' },
@@ -337,9 +337,9 @@ async function runScan() {
 function renderDashboard() {
   const ready = allStocks.filter(s => s.analysis);
 
-  const bull   = ready.filter(s => s.analysis.score >= getThreshold('bull'));
-  const bear   = ready.filter(s => s.analysis.score <= getThreshold('bear'));
-  const neutral = ready.filter(s => s.analysis.score > getThreshold('bear') && s.analysis.score < getThreshold('bull'));
+  const bull   = ready.filter(s => verdictScore(s) >= getThreshold('bull'));
+  const bear   = ready.filter(s => verdictScore(s) <= getThreshold('bear'));
+  const neutral = ready.filter(s => verdictScore(s) > getThreshold('bear') && verdictScore(s) < getThreshold('bull'));
 
   // Counters
   document.getElementById('ov-total').textContent   = ready.length;
@@ -348,14 +348,14 @@ function renderDashboard() {
   document.getElementById('ov-neutral').textContent = neutral.length;
 
   // Bull table
-  const bullSorted = [...bull].sort((a, b) => b.analysis.score - a.analysis.score).slice(0, 10);
+  const bullSorted = [...bull].sort((a, b) => verdictScore(b) - verdictScore(a)).slice(0, 10);
   document.getElementById('bull-count').textContent = bull.length;
   document.getElementById('bull-tbody').innerHTML = bullSorted.length
     ? bullSorted.map(s => stockTableRow(s)).join('')
     : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:16px">目前無多頭訊號</td></tr>';
 
   // Bear table
-  const bearSorted = [...bear].sort((a, b) => a.analysis.score - b.analysis.score).slice(0, 10);
+  const bearSorted = [...bear].sort((a, b) => verdictScore(a) - verdictScore(b)).slice(0, 10);
   document.getElementById('bear-count').textContent = bear.length;
   document.getElementById('bear-tbody').innerHTML = bearSorted.length
     ? bearSorted.map(s => stockTableRow(s)).join('')
@@ -377,7 +377,10 @@ function stockTableRow(s) {
   const chgHtml = chg !== null
     ? `<span class="${chg >= 0 ? 'change-up' : 'change-dn'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>`
     : '--';
-  const scoreColor = scoreToColor(a.score);
+  const v = getVerdict(s);
+  const vScore = v?.score ?? a.score;
+  const vSignal = v?.signal ?? a.signal;
+  const scoreColor = scoreToColor(vScore);
 
   return `<tr onclick="openStock('${s.id}')">
     <td>
@@ -390,11 +393,11 @@ function stockTableRow(s) {
       </div>
     </td>
     <td class="price-mono">${price}</td>
-    <td><span class="trend-badge trend-${signalClass(a.signal)}">${a.signal}</span></td>
+    <td><span class="trend-badge trend-${signalClass(vSignal)}">${vSignal}</span></td>
     <td>
       <div class="score-inline">
-        <div class="score-mini-bar"><div class="score-mini-fill" style="width:${a.score}%;background:${scoreColor}"></div></div>
-        <span class="score-val">${a.score}</span>
+        <div class="score-mini-bar"><div class="score-mini-fill" style="width:${vScore}%;background:${scoreColor}"></div></div>
+        <span class="score-val">${vScore}</span>
       </div>
     </td>
     <td class="${rsiClass(a.rsi)}">${a.rsi?.toFixed(1) ?? '--'}</td>
@@ -559,8 +562,8 @@ function renderMarketOutlook() {
   // 市場寬度 factor (from scanned stocks)
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length >= 10) {
-    const bullN = ready.filter(s => s.analysis.score >= getThreshold('bull')).length;
-    const bearN = ready.filter(s => s.analysis.score <= getThreshold('bear')).length;
+    const bullN = ready.filter(s => verdictScore(s) >= getThreshold('bull')).length;
+    const bearN = ready.filter(s => verdictScore(s) <= getThreshold('bear')).length;
     const pct = bullN / ready.length;
     let pts = 0;
     if (pct > 0.5) pts = 2; else if (pct > 0.35) pts = 1;
@@ -679,7 +682,7 @@ function computeFearGreed() {
   // Breadth
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length >= 10) {
-    const bullPct = ready.filter(s => s.analysis.score >= getThreshold('bull')).length / ready.length;
+    const bullPct = ready.filter(s => verdictScore(s) >= getThreshold('bull')).length / ready.length;
     score += (bullPct - 0.3) * 40;
   }
 
@@ -1073,6 +1076,151 @@ function renderMarketIndex(data) {
     </div>`;
 }
 
+// ── 權威研判：全站唯一結論來源 ─────────────────────────────────────────────
+// 過去有三套獨立評分並存 —— 排名頁用 calculateScore（純技術）、交易員視角與
+// AI 研判用 buildManagerAnalysis（證據加權，含籌碼／基本面／趨勢引擎／新聞）、
+// 推薦交易用 scoreStockDimensions（五維度）。同一檔股票因此會在不同頁面得到
+// 相反結論。現在一律以 buildManagerAnalysis 為準，排名分數由其淨方向換算，
+// 五維度僅用於「推薦與否」的額外門檻，不再影響方向判定。
+function getVerdict(s) {
+  if (!s?.analysis) return null;
+  if (s._verdict && s._verdictOf === s.analysis) return s._verdict;
+  // 再入防護：研判的任何輸入若不慎回頭呼叫本函式，退回技術分而非無限遞迴
+  if (s._verdictBusy) return { score: s.analysis.score, signal: s.analysis.signal, dir: 0,
+                               stance: s.analysis.signal, agr: 0, conf: 0, m: null };
+  s._verdictBusy = true;
+  let m = null;
+  try { m = buildManagerAnalysis(s); } finally { s._verdictBusy = false; }
+  if (!m) return null;
+  // 淨方向 → 0~100（dir 實務區間約 ±10；±6 已是極端）
+  const score = Math.max(0, Math.min(100, Math.round(50 + m.dir * 6)));
+  const bull = getThreshold('bull'), bear = getThreshold('bear');
+  const signal = score >= bull + 15 ? '強勢多頭' : score >= bull ? '多頭'
+               : score <= bear - 10 ? '強勢空頭' : score <= bear ? '空頭' : '中性';
+  const v = { score, signal, dir: m.dir, stance: m.stance, stanceColor: m.stanceColor,
+              agr: m.agr, conf: m.conf, m };
+  s._verdict = v; s._verdictOf = s.analysis;
+  return v;
+}
+// 排名／寬度等處統一取用（取不到研判時退回技術分，並標記來源）
+function verdictScore(s) { return getVerdict(s)?.score ?? s.analysis?.score ?? 50; }
+function verdictSignal(s) { return getVerdict(s)?.signal ?? s.analysis?.signal ?? '中性'; }
+
+// ── 族群排名（依成交量）─────────────────────────────────────────────────────
+// 先看資金流向哪個族群，再看族群內誰最強 —— 比一次攤開 100 檔更符合實際選股順序。
+// 成交金額（價 × 量）比成交張數公平：低價股的張數天生較大。
+let sectorOpen = null;
+
+function sectorStats() {
+  const ready = allStocks.filter(s => s.analysis && s.ohlcv?.length);
+  const map = {};
+  for (const s of ready) {
+    const sec = s.sector || '其他';
+    const g = map[sec] = map[sec] || { sector: sec, value: 0, vol: 0, n: 0, bull: 0, bear: 0, chgSum: 0, stocks: [] };
+    const a = s.analysis;
+    const vol = a.lastVol || 0;                    // 股
+    g.value += vol * a.price;                      // 成交金額（元）
+    g.vol += vol;
+    g.n++;
+    const sig = verdictSignal(s);
+    if (sig.includes('多')) g.bull++;
+    else if (sig.includes('空')) g.bear++;
+    const chg = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : 0;
+    g.chgSum += chg;
+    g.stocks.push(s);
+  }
+  return Object.values(map)
+    .map(g => ({ ...g, avgChg: g.n ? g.chgSum / g.n : 0,
+                 score: g.n ? Math.round(g.stocks.reduce((x, s) => x + verdictScore(s), 0) / g.n) : 50 }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function renderSectorRanking() {
+  const el = document.getElementById('sector-body');
+  if (!el) return;
+  const cnt = document.getElementById('sector-count');
+  const list = sectorStats();
+  if (cnt) cnt.textContent = list.length;
+  if (!list.length) { el.innerHTML = '<div class="adv-loading">等待掃描完成...</div>'; return; }
+  const maxVal = Math.max(...list.map(g => g.value), 1);
+  const fmtVal = v => v >= 1e8 ? `${(v / 1e8).toFixed(1)} 億` : `${Math.round(v / 1e4).toLocaleString()} 萬`;
+
+  el.innerHTML = list.map((g, i) => {
+    const pct = g.value / maxVal * 100;
+    const c = g.avgChg >= 0 ? 'var(--bull)' : 'var(--bear)';
+    return `
+    <div style="display:flex;align-items:center;gap:12px;padding:9px 14px;border-bottom:1px solid var(--border);cursor:pointer"
+         onclick="openSector('${g.sector.replace(/'/g, "\\'")}')">
+      <span style="font-family:var(--mono);font-size:0.72rem;color:var(--text3);min-width:22px">${i + 1}</span>
+      <div style="min-width:104px">
+        <div style="font-size:0.85rem;font-weight:700">${g.sector}</div>
+        <div style="font-size:0.68rem;color:var(--text3)">${g.n} 檔・多 ${g.bull} / 空 ${g.bear}</div>
+      </div>
+      <div style="flex:1;min-width:70px">
+        <div style="height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden">
+          <div style="height:100%;width:${pct}%;background:var(--blue)"></div>
+        </div>
+      </div>
+      <span style="font-family:var(--mono);font-size:0.76rem;min-width:74px;text-align:right">${fmtVal(g.value)}</span>
+      <span style="font-family:var(--mono);font-size:0.76rem;color:${c};min-width:56px;text-align:right">${g.avgChg >= 0 ? '+' : ''}${g.avgChg.toFixed(2)}%</span>
+      <span style="font-size:0.72rem;color:var(--text3);min-width:44px;text-align:right">評分 ${g.score}</span>
+    </div>`;
+  }).join('');
+}
+
+function openSector(sector) {
+  sectorOpen = sector;
+  const card = document.getElementById('sector-detail');
+  const secCard = document.getElementById('sector-card');
+  const body = document.getElementById('sector-detail-body');
+  const title = document.getElementById('sector-detail-name');
+  if (!card || !body) return;
+  if (title) title.textContent = `${sector} · 依成交量排名`;
+  if (secCard) secCard.style.display = 'none';
+  card.style.display = '';
+
+  const inSector = allStocks.filter(s => s.analysis && (s.sector || '其他') === sector);
+  const byMkt = { twse: [], tpex: [] };
+  inSector.forEach(s => { (byMkt[stockMarket(s)] || byMkt.twse).push(s); });
+  const sortVol = arr => arr.sort((a, b) => (b.analysis.lastVol * b.analysis.price) - (a.analysis.lastVol * a.analysis.price));
+
+  const block = (label, arr) => {
+    if (!arr.length) return `<div style="padding:10px 14px"><div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:4px">${label}</div>
+      <div style="font-size:0.76rem;color:var(--text3)">此族群無${label}標的</div></div>`;
+    return `<div style="padding:10px 14px 4px">
+      <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:6px">${label}（${arr.length} 檔）</div>
+      <div class="tbl-scroll"><table class="data-tbl" style="width:100%">
+        <thead><tr><th>#</th><th>股票</th><th>股價</th><th>今日漲跌</th><th>成交量</th><th>成交金額</th><th>研判</th><th>評分</th></tr></thead>
+        <tbody>${sortVol(arr).map((s, i) => {
+          const a = s.analysis;
+          const chg = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : null;
+          const val = (a.lastVol || 0) * a.price;
+          const sig = verdictSignal(s), sc = verdictScore(s);
+          return `<tr onclick="openStock('${s.id}')">
+            <td style="color:var(--text3)">${i + 1}</td>
+            <td><div class="stock-cell"><div class="stock-cell-info">
+              <span class="stock-cell-id">${s.id}</span><span class="stock-cell-name">${s.name}</span></div></div></td>
+            <td class="price-mono">${a.price?.toFixed(2) ?? '--'}</td>
+            <td>${chg != null ? `<span class="${chg >= 0 ? 'change-up' : 'change-dn'}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>` : '--'}</td>
+            <td class="vol-cell">${fmtVol(a.lastVol)}</td>
+            <td class="price-mono" style="color:var(--text2)">${val >= 1e8 ? (val / 1e8).toFixed(2) + ' 億' : Math.round(val / 1e4).toLocaleString() + ' 萬'}</td>
+            <td><span class="trend-badge trend-${signalClass(sig)}">${sig}</span></td>
+            <td><span class="score-val" style="color:${scoreToColor(sc)}">${sc}</span></td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div></div>`;
+  };
+  body.innerHTML = block('上市', byMkt.twse) + block('上櫃', byMkt.tpex);
+}
+
+function closeSectorDetail() {
+  sectorOpen = null;
+  const card = document.getElementById('sector-detail');
+  const secCard = document.getElementById('sector-card');
+  if (card) card.style.display = 'none';
+  if (secCard) secCard.style.display = '';
+}
+
 // ── Ranking ────────────────────────────────────────────────────────────────
 
 // 市場別判定：清單標記優先，其次看掃描過程記住的來源（自選股）
@@ -1089,7 +1237,7 @@ let rankingMarket = 'all';
 
 function renderRanking() {
   const ready = allStocks.filter(s => s.analysis);
-  let filtered = rankingFilter === 'all' ? ready : ready.filter(s => s.analysis.signal === rankingFilter);
+  let filtered = rankingFilter === 'all' ? ready : ready.filter(s => verdictSignal(s) === rankingFilter);
   if (rankingMarket !== 'all') filtered = filtered.filter(s => stockMarket(s) === rankingMarket);
 
   // Search filter
@@ -1099,15 +1247,17 @@ function renderRanking() {
   // Sort
   filtered.sort((a, b) => {
     let va, vb;
-    if (rankingSort.col === 'score') { va = a.analysis.score; vb = b.analysis.score; }
+    if (rankingSort.col === 'score') { va = verdictScore(a); vb = verdictScore(b); }
     else if (rankingSort.col === 'price') { va = a.analysis.price; vb = b.analysis.price; }
     else if (rankingSort.col === 'rsi') { va = a.analysis.rsi || 0; vb = b.analysis.rsi || 0; }
     else if (rankingSort.col === 'adx') { va = a.analysis.adx || 0; vb = b.analysis.adx || 0; }
-    else { va = a.analysis.score; vb = b.analysis.score; }
+    else { va = verdictScore(a); vb = verdictScore(b); }
     return rankingSort.dir * (vb - va);
   });
 
-  document.getElementById('ranking-subtitle').textContent = `共 ${filtered.length} 檔 · 依評分排名`;
+  renderSectorRanking();
+  if (sectorOpen) openSector(sectorOpen);   // 掃描更新時保持已展開的族群
+  document.getElementById('ranking-subtitle').textContent = `共 ${filtered.length} 檔 · 依評分排名（研判與交易員視角同源）`;
   document.getElementById('ranking-tbody').innerHTML = filtered.length
     ? filtered.map((s, i) => rankingRow(s, i + 1)).join('')
     : '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:24px">無符合條件的股票</td></tr>';
@@ -1224,6 +1374,8 @@ function sectorComparison(stockId) {
     const c = s.ohlcv.map(d => d.close);
     return c.length >= 21 ? (c[c.length-1] - c[c.length-21]) / c[c.length-21] * 100 : 0;
   };
+  // 注意：此處必須用原始技術分，不可用 getVerdict —
+  // sectorComparison 是 buildManagerAnalysis 的輸入，用 verdict 會造成無限遞迴
   const rows = peers.map(s => ({
     id: s.id, name: s.name, score: s.analysis.score, ret: ret20(s),
     foreign: s.foreign ?? null,
@@ -1350,9 +1502,26 @@ function buildManagerAnalysis(s) {
     else if (t.maturityTxt) notes.push(t.maturityTxt);
   }
 
-  // ① 均線結構
-  if (a.ema20 > a.ema50 && price > a.ema20) add(2, 1, '均線多頭排列且站穩 EMA20');
+  // ① 均線結構（完整排列／位置／糾結，多空對稱）
+  if (a.maStruct) {
+    const ms = a.maStruct;
+    if (ms.bullStack) add(ms.tangled ? 1 : 2.4, 1, `${ms.reason}｜${ms.posReason}`);
+    else if (ms.bearStack) add(ms.tangled ? 1 : 2.4, -1, `${ms.reason}｜${ms.posReason}`);
+    else if (Math.abs(ms.above) >= 2) add(1.2, ms.above > 0 ? 1 : -1, `${ms.reason}｜${ms.posReason}`);
+    else notes.push(`${ms.reason}｜${ms.posReason}`);
+    if (ms.tangled) notes.push(`均線糾結（三線間距僅 ${ms.spread}%）— 方向未明，突破前不宜重倉`);
+    else if (Math.abs(ms.slope) >= 1)
+      add(0.6, ms.slope > 0 ? 1 : -1, `EMA20 斜率 ${ms.slope > 0 ? '+' : ''}${ms.slope}%／10日（均線${ms.slope > 0 ? '上揚' : '下彎'}）`);
+  } else if (a.ema20 > a.ema50 && price > a.ema20) add(2, 1, '均線多頭排列且站穩 EMA20');
   else if (price < a.ema20) add(1.5, -1, '跌破 EMA20 短均');
+
+  // ①-b 突破與量能確認（帶量突破 vs 無量假突破 vs 高檔出貨）
+  if (a.brk) {
+    const w = { 'breakout-vol': 2.2, 'breakdown-vol': 2.2, 'distribution': 2, 'failed-break': 1.6,
+                'accumulation': 1.4, 'breakout-novol': 1.2, 'breakdown': 1.2, 'breakout-weak': 0.8, 'churn': 0.5 }[a.brk.type] ?? 1;
+    if (a.brk.dir !== 0) add(w, a.brk.dir, a.brk.txt);
+    else notes.push(a.brk.txt);
+  }
   if (a.ema200 && price > a.ema200) add(1, 1, '股價在年線 EMA200 之上（長多結構）');
   else if (a.ema200 && price < a.ema200) add(1, -1, '股價在年線之下（長空結構）');
 
@@ -2084,12 +2253,13 @@ function renderTraderView(s) {
   const el = document.getElementById('trader-view-body');
   if (!el || currentStockId !== s.id) return;
   const a = s.analysis;
-  const m = a ? buildManagerAnalysis(s) : null;
+  const v = a ? getVerdict(s) : null;      // 與市場排名同一個結論來源
+  const m = v?.m ?? null;
   if (!m) { el.innerHTML = '<p style="color:var(--text3);font-size:0.85rem">資料不足，無法生成判讀</p>'; return; }
   const p = buildEntryPlan(s, m);
   const sec = sectorComparison(s.id);
-  const bias = m.dir >= 2 ? '偏多' : m.dir <= -1 ? '偏空' : '中性';
-  const biasColor = m.dir >= 2 ? 'var(--bull)' : m.dir <= -1 ? 'var(--bear)' : 'var(--yellow)';
+  const bias = v.signal;
+  const biasColor = v.signal.includes('多') ? 'var(--bull)' : v.signal.includes('空') ? 'var(--bear)' : 'var(--yellow)';
 
   // 該注意的事項（風險優先排序）
   const watch = [];
@@ -5720,7 +5890,7 @@ function renderFocusStocks() {
       <div class="event-countdown" style="min-width:56px">${f.s.id}</div>
       <div style="flex:1;min-width:0">
         <div class="event-name">${f.s.name}
-          <span class="trend-badge trend-${signalClass(f.s.analysis.signal)}" style="font-size:0.62rem;padding:1px 7px;margin-left:4px">${f.s.analysis.signal}</span>
+          <span class="trend-badge trend-${signalClass(verdictSignal(f.s))}" style="font-size:0.62rem;padding:1px 7px;margin-left:4px">${verdictSignal(f.s)}</span>
           ${f.d ? `<span style="font-size:0.62rem;padding:1px 7px;border-radius:8px;background:rgba(0,212,255,0.12);color:var(--blue);font-weight:700;margin-left:3px">綜合 ${f.d.total}</span>` : ''}
         </div>
         <div class="event-date">${f.reasons.join('・') || '綜合動能領先'}</div>
@@ -5980,10 +6150,10 @@ function autoNotifyTelegram() {
   if (localStorage.getItem('tg-strong-sent') === today) return; // 每日一次，避免刷屏
 
   const bullThresh = getThreshold('bull') + 15;
-  const strong = allStocks.filter(s => s.analysis?.score >= bullThresh);
+  const strong = allStocks.filter(s => s.analysis && verdictScore(s) >= bullThresh);
   if (!strong.length) return;
 
-  const lines = strong.map(s => `${s.name}(${s.id}) 評分 ${s.analysis.score}｜${s.analysis.signal}`).join('\n');
+  const lines = strong.map(s => `${s.name}(${s.id}) 評分 ${verdictScore(s)}｜${verdictSignal(s)}`).join('\n');
   tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
   localStorage.setItem('tg-strong-sent', today);
 }
@@ -6302,7 +6472,7 @@ function manualSendDailyBriefing(silent = false) {
     return `・${e.name}（${days <= 0 ? '今日' : days + '天後'}）`;
   }).join('\n');
   const bulls = allStocks.filter(s => s.analysis?.score >= getThreshold('bull')).length;
-  const bears = allStocks.filter(s => s.analysis && s.analysis.score <= getThreshold('bear')).length;
+  const bears = allStocks.filter(s => s.analysis && verdictScore(s) <= getThreshold('bear')).length;
 
   tgPush(`📊 台股雷達 每日市場簡報\n${now.toLocaleDateString('zh-TW')}\n\n🌡 大盤環境：${mkt}（多空總覽 ${Math.round(norm)} 分）\n市場寬度：多頭 ${bulls} 檔 / 空頭 ${bears} 檔\n\n⭐ 今日重點關注\n${dLines}\n\n🗓 即將公布\n${events}\n\n⚠ 僅供參考，非投資建議`);
   return true;
