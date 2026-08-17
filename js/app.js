@@ -1270,6 +1270,19 @@ function renderRanking() {
 
   renderSectorRanking();
   if (sectorOpen) openSector(sectorOpen);   // 掃描更新時保持已展開的族群
+
+  // 搜尋時把結果表移到族群排名上方 —— 否則結果落在下方看不見，像是「查不到」
+  const rankCard = document.getElementById('ranking-results');
+  const secCard = document.getElementById('sector-card');
+  const detCard = document.getElementById('sector-detail');
+  if (rankCard?.parentNode && secCard && rankCard.parentNode === secCard.parentNode) {
+    if (q) {
+      if (rankCard.nextElementSibling !== secCard) secCard.parentNode.insertBefore(rankCard, secCard);
+    } else {
+      const anchor = detCard && detCard.parentNode === rankCard.parentNode ? detCard.nextElementSibling : secCard.nextElementSibling;
+      if (rankCard !== anchor) rankCard.parentNode.insertBefore(rankCard, anchor);
+    }
+  }
   document.getElementById('ranking-subtitle').textContent = q
     ? `搜尋「${q}」· 找到 ${filtered.length} 檔（搜尋時不套用多空／市場篩選）`
     : `共 ${filtered.length} 檔 · 依評分排名（研判與交易員視角同源）`;
