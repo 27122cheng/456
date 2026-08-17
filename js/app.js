@@ -327,10 +327,14 @@ async function runScan() {
   after('價格警報', checkAlerts);
   after('本週開盤佈局', () => { renderWeeklyBrief(); });
   after('Telegram 推送', () => {
+    // 假日（週六日）一律不推播 —— 沒有開盤就沒有可行動的資訊
+    if (!isTradingDayTW()) return;
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyEntrySignals();   // 適合進場的訊號
     notifyHoldingExits();   // 持倉出場檢查
-    notifyWeeklyBrief();    // 週一 08:00 開盤前佈局簡報
+    notifyWeeklyBrief();    // 週一 08:30 盤前佈局
+    notifyDailyBrief();     // 每日 09:00 市場簡報
+    notifyPostOpen();       // 每日 09:30 開盤後追蹤
   });
 }
 
@@ -4384,6 +4388,78 @@ function weekEvents() {
   return out;
 }
 
+// 交易日判定：週六日一律不推播。國定假日盤前無法從資料判定，
+// 但 09:00 之後可用「今日是否有即時成交」偵測（見 marketTradedToday）。
+function isTradingDayTW() {
+  const wd = twNow().wd;
+  return wd !== 'Sat' && wd !== 'Sun';
+}
+
+// 今天市場是否真的有開（僅盤中之後可判定）：任一檔有今日的即時分鐘資料即為有開盤
+function marketTradedToday() {
+  const today = twNow().date;
+  for (const s of allStocks.slice(0, 12)) {
+    const bars = getIntradayBars(s.id, 5);
+    if (bars.length && String(bars[bars.length - 1].time).slice(0, 10) === today) return true;
+  }
+  return null;   // 無法判定（尚未累積盤中資料）
+}
+
+// 三大法人與量能的白話摘要（多份報告共用）
+function instAndVolumeSummary() {
+  const out = [];
+  const it = outlookData.instTotal;
+  if (it) {
+    const f = (n) => `${n >= 0 ? '+' : ''}${Math.round(n).toLocaleString()} 張`;
+    out.push(`外資 ${f(it.foreign)}／投信 ${f(it.investment)}／自營商 ${f(it.dealer)}`);
+  }
+  const tv = outlookData.turnover;
+  if (tv) out.push(`大盤成交 ${(tv.amount / 1e8).toFixed(0)} 億（20 日均量的 ${tv.ratio.toFixed(2)} 倍）— ${tv.verdict.split(' —')[0]}`);
+  // 掃描池的量能變化（今日量 vs 20 日均量的中位數）
+  const ratios = allStocks.filter(s => s.analysis?.volMA > 0)
+    .map(s => s.analysis.lastVol / s.analysis.volMA).sort((a, b) => a - b);
+  if (ratios.length >= 5) {
+    const med = ratios[Math.floor(ratios.length / 2)];
+    out.push(`個股量能中位數為均量的 ${med.toFixed(2)} 倍（${med >= 1.2 ? '普遍放量' : med <= 0.8 ? '普遍量縮' : '量能持平'}）`);
+  }
+  return out;
+}
+
+// 大戶掛單真假判定摘要（盤中才有五檔資料；盤前誠實說明無資料）
+function whaleOrderSummary() {
+  if (!_whaleResults?.length) return { has: false, txt: '目前未偵測到大戶大量買超或掛單訊號' };
+  const withBook = _whaleResults.filter(r => r.book);
+  const fake = _whaleResults.filter(r => r.trap.some(x => x.includes('掛單撐盤假象')));
+  const clean = _whaleResults.filter(r => !r.trap.length);
+  const lines = [];
+  if (clean.length) lines.push(`通過陷阱檢查：${clean.slice(0, 3).map(r => `${r.s.name}(${r.s.id})`).join('、')}`);
+  if (fake.length) lines.push(`⚠ 疑似假掛單（大量掛買但股價貼盤中低點）：${fake.map(r => `${r.s.name}(${r.s.id})`).join('、')}`);
+  const trapped = _whaleResults.filter(r => r.trap.length && !fake.includes(r));
+  if (trapped.length) lines.push(`⚠ 其他陷阱跡象：${trapped.slice(0, 3).map(r => `${r.s.name}(${r.s.id})：${r.trap[0].split(' —')[0]}`).join('；')}`);
+  if (!withBook.length) lines.push('（盤前無五檔掛單資料，掛單真假需開盤後才能判定）');
+  return { has: true, txt: lines.join('\n'), clean, fake };
+}
+
+// AI 推薦（紙上追蹤中）的持倉是否需要平倉
+function checkAiSignalExits() {
+  const open = getAiSignals().filter(t => t.status === 'open');
+  const out = [];
+  for (const t of open) {
+    const s = allStocks.find(x => x.id === t.id);
+    if (!s?.analysis) continue;
+    const px = s.analysis.price;
+    const div = exDivAdjust(s.ohlcv, t.date);
+    const stop = t.stop - div, tgt = t.t1 != null ? t.t1 - div : null;
+    const ret = (px + div - t.entry) / t.entry * 100;
+    let action = null;
+    if (px <= stop) action = `🔴 已跌破停損 ${stop.toFixed(2)} — 訊號失效，若有跟單應平倉`;
+    else if (tgt != null && px >= tgt) action = `🟢 已達目標 ${tgt.toFixed(2)} — 可減碼鎖利`;
+    else if (px <= stop * 1.02) action = `🟡 逼近停損 ${stop.toFixed(2)} — 留意跌破`;
+    if (action) out.push({ t, px, ret, action });
+  }
+  return out;
+}
+
 function buildWeeklyBrief() {
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length < 5) return null;
@@ -4416,6 +4492,25 @@ function buildWeeklyBrief() {
   // ④ 本週事件
   const evts = weekEvents();
 
+  // ④-b 假日期間（週五收盤後至今）發布的新聞 —— 週一開盤前最需要消化的部分
+  const holidayNews = (() => {
+    const news = _newsRaw || [];
+    const now = Date.now();
+    const cutoff = now - 3.2 * 86400000;          // 約週五盤後至今
+    return news.filter(n => n.ts && n.ts >= cutoff)
+      .filter(n => { const d = new Date(n.ts).getDay(); return d === 0 || d === 6 || d === 5; })
+      .slice(0, 6);
+  })();
+
+  // ④-c 美股（夜盤／週五收盤）與法人量能
+  const usClose = [];
+  for (const [sym, label] of [['^DJI', '道瓊'], ['^GSPC', 'S&P500'], ['^IXIC', '那斯達克'], ['^SOX', '費半']]) {
+    const f = fac(sym);
+    if (f?.chg1 != null) usClose.push(`${label} ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(2)}%`);
+  }
+  const instVol = instAndVolumeSummary();
+  const whale = whaleOrderSummary();
+
   // ⑤ 持倉佈局
   const holdRows = getHoldings().map(h => {
     const r = checkHoldingExit(h);
@@ -4447,7 +4542,8 @@ function buildWeeklyBrief() {
   if (vix?.price >= 25) tone += `；VIX ${vix.price.toFixed(1)} 偏高，波動放大請縮小單筆部位`;
 
   return { t, norm, regime, intl, vix, ov, bullN, bearN, total: ready.length,
-           newsSec, newsStk, evts, holdRows, longs, swings, tone, at: new Date().toISOString().slice(0, 16).replace('T', ' ') };
+           newsSec, newsStk, evts, holidayNews, usClose, instVol, whale,
+           holdRows, longs, swings, tone, at: new Date().toISOString().slice(0, 16).replace('T', ' ') };
 }
 
 function renderWeeklyBrief() {
@@ -4468,6 +4564,26 @@ function renderWeeklyBrief() {
         ${b.ov?.adr ? `<br>隔夜：台積電 ADR ${b.ov.adr.chg1 >= 0 ? '+' : ''}${b.ov.adr.chg1}%${b.ov.premium != null ? `（溢價 ${b.ov.premium >= 0 ? '+' : ''}${b.ov.premium}%）` : ''}` : ''}
       </div>
     </div>
+
+    ${b.usClose?.length ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">🌙 美股最新收盤</div>
+      <div style="font-size:0.75rem;color:var(--text2)">${b.usClose.join('・')}</div>
+    </div>` : ''}
+
+    ${b.instVol?.length ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">💰 籌碼與量能</div>
+      <div style="font-size:0.75rem;color:var(--text2);line-height:1.7">${b.instVol.map(x => '・' + x).join('<br>')}</div>
+    </div>` : ''}
+
+    ${b.whale?.txt ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">🐋 大戶動向與掛單判定</div>
+      <div style="font-size:0.75rem;color:var(--text2);line-height:1.7">${b.whale.txt.replace(/\n/g, '<br>')}</div>
+    </div>` : ''}
+
+    ${b.holidayNews?.length ? `<div style="margin-bottom:9px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">🗞 假日期間發布的新聞</div>
+      <div style="font-size:0.75rem;color:var(--text2);line-height:1.7">${b.holidayNews.map(n => `・${n.headline}<span style="color:var(--text3)">（${n.date}${n.source ? '・' + n.source : ''}）</span>`).join('<br>')}</div>
+    </div>` : ''}
 
     ${b.evts.length ? `<div style="margin-bottom:9px">
       <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:3px">📅 本週事件</div>
@@ -4504,10 +4620,12 @@ function renderWeeklyBrief() {
   return b;
 }
 
-// 週一 08:00 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
+// 週一 08:30 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
 function notifyWeeklyBrief() {
   const t = twNow();
-  if (t.wd !== 'Mon' || t.hour < 8) return;
+  if (!isTradingDayTW()) return;                   // 假日不推
+  if (t.wd !== 'Mon') return;
+  if (t.hour * 60 + t.minute < 8 * 60 + 30) return; // 08:30 前不推
   const wk = weekKey();
   if (localStorage.getItem('tg-weekly') === wk) return;
   const b = buildWeeklyBrief();
@@ -4517,7 +4635,7 @@ function notifyWeeklyBrief() {
 
   const lvIcon = { exit: '🔴', watch: '🟡', hold: '🟢' };
   const lines = [];
-  lines.push(`🗓 本週開盤佈局　${t.date}（週一）`);
+  lines.push(`🗓 週一盤前分析・本週佈局　${t.date} 08:30`);
   lines.push('');
   lines.push(`【大盤】${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total} 檔`);
   if (b.intl.length) lines.push(`【國際】${b.intl.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
@@ -4527,6 +4645,13 @@ function notifyWeeklyBrief() {
     lines.push(''); lines.push('【近一週新聞指向】');
     if (b.newsSec.length) lines.push(`產業：${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
     if (b.newsStk.length) lines.push(`個股：${b.newsStk.map(([id, v]) => `${v.name}(${id})${v.score > 0 ? '利多' : '利空'}`).join('、')}`);
+  }
+  if (b.usClose?.length) { lines.push(''); lines.push(`【美股收盤】${b.usClose.join('・')}`); }
+  if (b.instVol?.length) { lines.push(''); lines.push('【籌碼與量能】'); b.instVol.forEach(x => lines.push(`・${x}`)); }
+  if (b.whale?.txt) { lines.push(''); lines.push('【大戶動向與掛單判定】'); lines.push(b.whale.txt); }
+  if (b.holidayNews?.length) {
+    lines.push(''); lines.push('【假日期間發布的新聞】');
+    b.holidayNews.forEach(n => lines.push(`・${n.headline}（${n.date}${n.source ? '・' + n.source : ''}）`));
   }
   lines.push(''); lines.push('【持倉佈局】');
   if (b.holdRows.length) b.holdRows.forEach(r => {
@@ -4542,6 +4667,141 @@ function notifyWeeklyBrief() {
   lines.push(''); lines.push(`【本週基調】${b.tone}`);
   lines.push(''); lines.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(lines.join('\n'));
+}
+
+// ── 每日 09:00 市場簡報 ────────────────────────────────────────────────────
+function buildDailyBrief() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return null;
+  const norm = Math.round(outlookData.norm ?? 0);
+  const regime = norm >= 35 ? '偏多' : norm >= 15 ? '中性偏多' : norm <= -35 ? '偏空' : norm <= -15 ? '中性偏空' : '中性盤整';
+  const fac = sym => outlookData.factors?.find(f => f.sym === sym);
+  const us = [];
+  for (const [sym, label] of [['^SOX', '費半'], ['^GSPC', 'S&P500'], ['^IXIC', '那斯達克']]) {
+    const f = fac(sym);
+    if (f?.chg1 != null) us.push(`${label} ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(2)}%`);
+  }
+  const focus = [...ready].sort((a, b) => verdictScore(b) - verdictScore(a)).slice(0, 5)
+    .map(s => ({ s, v: getVerdict(s) }));
+  const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
+  const exits = holdings.filter(r => r.level === 'exit');
+  const watches = holdings.filter(r => r.level === 'watch');
+  return {
+    norm, regime, us, vix: fac('^VIX'), ov: outlookData.overnight,
+    instVol: instAndVolumeSummary(), focus, holdings, exits, watches,
+    picks: computeEntrySignals().slice(0, 4),
+    date: twNow().date,
+  };
+}
+
+function notifyDailyBrief() {
+  const t = twNow();
+  if (!isTradingDayTW()) return;
+  if (t.hour * 60 + t.minute < 9 * 60) return;             // 09:00 起
+  if (localStorage.getItem('tg-daily-brief') === t.date) return;
+  const b = buildDailyBrief();
+  if (!b) return;
+  localStorage.setItem('tg-daily-brief', t.date);
+  if (!tgWants('sig')) return;
+
+  const L = [];
+  L.push(`📊 每日市場簡報　${b.date} 09:00`);
+  L.push('');
+  L.push(`【大盤】${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）`);
+  if (b.us.length) L.push(`【美股】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
+  if (b.ov?.adr) L.push(`【隔夜】台積電 ADR ${b.ov.adr.chg1 >= 0 ? '+' : ''}${b.ov.adr.chg1}%${b.ov.premium != null ? `（溢價 ${b.ov.premium >= 0 ? '+' : ''}${b.ov.premium}%）` : ''}`);
+  if (b.instVol.length) { L.push(''); L.push('【籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
+  L.push(''); L.push('【今日重點關注】');
+  b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
+  if (b.holdings.length) {
+    L.push(''); L.push('【持倉狀態】');
+    L.push(b.exits.length ? `⚠ ${b.exits.length} 檔出現出場訊號：${b.exits.map(r => r.h.name).join('、')}`
+         : b.watches.length ? `留意 ${b.watches.length} 檔：${b.watches.map(r => r.h.name).join('、')}`
+         : `${b.holdings.length} 檔全部續抱，無出場訊號`);
+  }
+  if (b.picks.length) {
+    L.push(''); L.push('【今日進場機會】');
+    b.picks.forEach(p => L.push(`・${p.s.name}(${p.s.id})　進場 ${p.p.lo}~${p.p.hi}｜停損 ${p.p.stop}`));
+  }
+  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
+  tgPush(L.join('\n'));
+}
+
+// ── 每日 09:30 開盤後追蹤 ──────────────────────────────────────────────────
+// 開盤半小時後才有意義：走勢已表態、五檔掛單可判真假、持倉是否該平倉已有依據。
+function buildPostOpen() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return null;
+  const twii = outlookData.factors?.find(f => f.sym === '^TWII');
+
+  // 開盤後走勢：以盤中分鐘 K 的開盤價與現價比較
+  const movers = [];
+  for (const s of ready) {
+    const bars = getIntradayBars(s.id, 5);
+    if (bars.length < 2) continue;
+    const open = bars[0].open, now = bars[bars.length - 1].close;
+    if (!(open > 0)) continue;
+    movers.push({ s, chg: (now - open) / open * 100, now });
+  }
+  movers.sort((a, b) => b.chg - a.chg);
+
+  const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
+  return {
+    twii, holdings,
+    exits: holdings.filter(r => r.level === 'exit'),
+    watches: holdings.filter(r => r.level === 'watch'),
+    aiExits: checkAiSignalExits(),
+    whale: whaleOrderSummary(),
+    instVol: instAndVolumeSummary(),
+    up: movers.slice(0, 4), down: movers.slice(-4).reverse(),
+    focus: [...ready].sort((a, b) => verdictScore(b) - verdictScore(a)).slice(0, 5).map(s => ({ s, v: getVerdict(s) })),
+    newsSec: _newsSignals ? Object.entries(_newsSignals.sectors)
+      .filter(([, v]) => Math.abs(v.score) >= 2).sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 3) : [],
+    date: twNow().date, hasIntraday: movers.length > 0,
+  };
+}
+
+function notifyPostOpen() {
+  const t = twNow();
+  if (!isTradingDayTW()) return;
+  if (t.hour * 60 + t.minute < 9 * 60 + 30) return;        // 09:30 起
+  if (localStorage.getItem('tg-postopen') === t.date) return;
+  if (marketTradedToday() === false) return;               // 國定假日（無任何盤中成交）
+  const b = buildPostOpen();
+  if (!b) return;
+  localStorage.setItem('tg-postopen', t.date);
+  if (!tgWants('sig')) return;
+
+  const L = [];
+  L.push(`🔔 開盤後追蹤　${b.date} 09:30`);
+  L.push('');
+  if (b.twii?.chg1 != null) L.push(`【大盤】加權 ${b.twii.price?.toLocaleString(undefined, { maximumFractionDigits: 0 })}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1.toFixed(2)}%）`);
+  if (!b.hasIntraday) L.push('（盤中分鐘資料累積中，開盤走勢以日線最新價為準）');
+  if (b.up.length) L.push(`【開盤走強】${b.up.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
+  if (b.down.length) L.push(`【開盤走弱】${b.down.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
+  if (b.newsSec.length) L.push(`【新聞面】${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
+  if (b.instVol.length) { L.push(''); L.push('【籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
+
+  L.push(''); L.push('【自行持倉：是否需平倉】');
+  if (!b.holdings.length) L.push('目前無持倉');
+  else b.holdings.forEach(r => {
+    const icon = r.level === 'exit' ? '🔴' : r.level === 'watch' ? '🟡' : '🟢';
+    const act = r.level === 'exit' ? '建議平倉' : r.level === 'watch' ? '留意，未破停損先續抱' : '續抱';
+    L.push(`${icon} ${r.h.name}(${r.h.id}) ${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%　${act}`);
+    L.push(`　${r.reasons[0]}`);
+  });
+
+  L.push(''); L.push('【系統推薦持倉：是否需平倉】');
+  if (!b.aiExits.length) L.push('追蹤中的推薦訊號均未觸及停損或目標');
+  else b.aiExits.forEach(x => L.push(`・${x.t.name}(${x.t.id}) ${x.ret >= 0 ? '+' : ''}${x.ret.toFixed(2)}%　${x.action}`));
+
+  L.push(''); L.push('【大戶掛單判定】');
+  L.push(b.whale.txt);
+
+  L.push(''); L.push('【今日重點關注】');
+  b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
+  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
+  tgPush(L.join('\n'));
 }
 
 // ── 大戶動向偵測：大量買超/大單掛買 → 陷阱判斷 → Telegram ──────────────────
@@ -4764,6 +5024,7 @@ function notifyDataDate() {
 // 通過陷阱檢查的大戶訊號 → Telegram（每份法人資料每檔一次），附交易分析
 function notifyWhales() {
   if (!tgWants('sig')) return;
+  if (!isTradingDayTW()) return;   // 假日不推播
   const dataDate = notifyDataDate();
   let sent;
   try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
@@ -6121,6 +6382,7 @@ function renderFocusStocks() {
 
 // ── 新聞指向解析：辨識每則新聞針對的產業/公司，彙整多空傾向 ────────────────
 let _newsSignals = null;
+let _newsRaw = null;
 
 const SECTOR_NEWS_KW = {
   '半導體': /半導體|晶圓|晶片|先進製程|晶圓代工/,
@@ -6182,6 +6444,7 @@ async function renderWeeklyNews() {
   // 只用真實新聞（Google News RSS 台股 近 7 日）；多抓幾則提高產業覆蓋
   const news = (await fetchNewsRSS('台股 股市', 12).catch(() => null) || [])
     .map(n => ({ impact: n.source || '台股', ...n }));
+  _newsRaw = news;                 // 供盤前簡報篩「假日期間發布」的新聞
   buildNewsSignals(news);
   if (!news.length) {
     el.innerHTML = `<h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin-bottom:4px">📰 本週重點財經新聞</h3>
