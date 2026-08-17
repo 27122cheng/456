@@ -1472,6 +1472,7 @@ async function fetchNewsRSS(query, limit = 7) {
       return {
         headline, source, link,
         date: `${String(pub.getMonth()+1).padStart(2,'0')}-${String(pub.getDate()).padStart(2,'0')}`,
+        ts: pub.getTime(),   // 供「假日期間發布」等時間篩選使用
         ...classifyNewsDirection(headline),
       };
     }).filter(n => n.headline);
