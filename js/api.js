@@ -861,7 +861,9 @@ function parseT86Row(r, idx) {
 // 只保留真正的股票／ETF：4 位數個股、或 00 開頭的 ETF。
 // 純數字 6 位代號多為權證，若計入會讓全市場買賣超加總嚴重灌水。
 function isRealStockId(id) {
-  return /^\d{4}$/.test(id) || /^00\d{2,4}$/.test(id);
+  // 4 位數個股、4 位數+單一字母的特別股（如 2882A 國泰特）、00 開頭 ETF。
+  // 純數字 6 位多為權證，計入會讓全市場買賣超嚴重灌水。
+  return /^\d{4}[A-Z]?$/.test(id) || /^00\d{2,4}$/.test(id);
 }
 
 async function fetchT86Parsed() {

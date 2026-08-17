@@ -1243,15 +1243,22 @@ let rankingMarket = 'all';
 
 function renderRanking() {
   const ready = allStocks.filter(s => s.analysis);
-  let filtered = rankingFilter === 'all' ? ready : ready.filter(s => verdictSignal(s) === rankingFilter);
-  if (rankingMarket !== 'all') filtered = filtered.filter(s => stockMarket(s) === rankingMarket);
+  const q = (document.getElementById('dash-search')?.value || '').trim().toLowerCase();
 
-  // Search filter
-  const q = document.getElementById('dash-search')?.value?.toLowerCase() || '';
-  if (q) filtered = filtered.filter(s => s.id.includes(q) || s.name.includes(q));
+  let filtered;
+  if (q) {
+    // 搜尋是明確意圖：不受多空/市場篩選限制，且包含尚未取得分析的標的
+    filtered = allStocks.filter(s => s.id.toLowerCase().includes(q) || (s.name || '').toLowerCase().includes(q));
+  } else {
+    filtered = rankingFilter === 'all' ? ready : ready.filter(s => verdictSignal(s) === rankingFilter);
+    if (rankingMarket !== 'all') filtered = filtered.filter(s => stockMarket(s) === rankingMarket);
+  }
 
   // Sort
   filtered.sort((a, b) => {
+    // 尚未取得分析的排在後面（搜尋時才會出現）
+    if (!a.analysis !== !b.analysis) return a.analysis ? -1 : 1;
+    if (!a.analysis) return 0;
     let va, vb;
     if (rankingSort.col === 'score') { va = verdictScore(a); vb = verdictScore(b); }
     else if (rankingSort.col === 'price') { va = a.analysis.price; vb = b.analysis.price; }
@@ -1263,14 +1270,45 @@ function renderRanking() {
 
   renderSectorRanking();
   if (sectorOpen) openSector(sectorOpen);   // 掃描更新時保持已展開的族群
-  document.getElementById('ranking-subtitle').textContent = `共 ${filtered.length} 檔 · 依評分排名（研判與交易員視角同源）`;
-  document.getElementById('ranking-tbody').innerHTML = filtered.length
-    ? filtered.map((s, i) => rankingRow(s, i + 1)).join('')
-    : '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:24px">無符合條件的股票</td></tr>';
+  document.getElementById('ranking-subtitle').textContent = q
+    ? `搜尋「${q}」· 找到 ${filtered.length} 檔（搜尋時不套用多空／市場篩選）`
+    : `共 ${filtered.length} 檔 · 依評分排名（研判與交易員視角同源）`;
+
+  let body;
+  if (filtered.length) body = filtered.map((s, i) => rankingRow(s, i + 1)).join('');
+  else if (q) {
+    // 掃描清單內找不到 → 到全市場找，可一鍵加入掃描
+    const outside = searchStocks(q, 8).filter(x => !x.inList);
+    body = outside.length
+      ? `<tr><td colspan="9" style="padding:12px 14px;color:var(--text3);font-size:0.8rem">掃描清單中無符合項目，以下為全市場搜尋結果：</td></tr>` +
+        outside.map(x => `<tr>
+          <td style="color:var(--text3)">—</td>
+          <td><div class="stock-cell"><div class="stock-cell-info">
+            <span class="stock-cell-id">${x.id}</span><span class="stock-cell-name">${x.name}</span></div></div></td>
+          <td class="price-mono">${x.close != null ? x.close.toFixed(2) : '--'}</td>
+          <td colspan="5" style="color:var(--text3);font-size:0.78rem">未在掃描清單 — 加入後下輪即有完整分析</td>
+          <td><button class="btn-ghost" style="padding:3px 12px;font-size:0.72rem" onclick="event.stopPropagation();openStockAnywhere('${x.id}','${(x.name || '').replace(/'/g, "\\'")}')">＋ 加入</button></td>
+        </tr>`).join('')
+      : '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:24px">查無「' + q + '」— 請確認代號或中文名稱（僅支援上市櫃）</td></tr>';
+  } else {
+    body = '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:24px">無符合條件的股票</td></tr>';
+  }
+  document.getElementById('ranking-tbody').innerHTML = body;
 }
 
 function rankingRow(s, rank) {
   const a = s.analysis;
+  // 搜尋結果可能包含尚未取得分析的標的 —— 顯示載入中而不是整列崩掉
+  if (!a) {
+    return `<tr onclick="openStock('${s.id}')">
+      <td style="color:var(--text3)">${rank}</td>
+      <td><div class="stock-cell"><div class="stock-avatar">${s.id.slice(-2)}</div>
+        <div class="stock-cell-info"><span class="stock-cell-id">${s.id}</span>
+        <span class="stock-cell-name">${s.name || s.id}</span></div></div></td>
+      <td class="price-mono">${s.official?.close != null ? s.official.close.toFixed(2) : '--'}</td>
+      <td colspan="6" style="color:var(--text3);font-size:0.78rem">在掃描清單中，本輪尚未取得歷史資料（下輪自動重試）</td>
+    </tr>`;
+  }
   const price = a.price?.toFixed(2) ?? '--';
   const prev  = a.prevClose;
   const chg   = prev ? ((a.price - prev) / prev * 100) : null;
@@ -3479,21 +3517,62 @@ function initEventListeners() {
 
 // ── Search ─────────────────────────────────────────────────────────────────
 
+// ── 全市場搜尋索引 ─────────────────────────────────────────────────────────
+// 過去搜尋只涵蓋掃描清單（100 檔），清單外的台股一律「查無」。
+// 這裡把官方全市場行情（含中文名）併入索引 —— 上市櫃任何一檔都搜得到，
+// 不在掃描清單的標的可一鍵加入後立即分析。
+function marketSearchIndex() {
+  const out = [];
+  const seen = new Set();
+  for (const s of getStockList()) { out.push({ id: s.id, name: s.name, sector: s.sector || '自訂', inList: true }); seen.add(s.id); }
+  for (const a of getAutoStocks()) if (!seen.has(a.id)) { out.push({ id: a.id, name: a.name || a.id, sector: '法人動向', inList: true }); seen.add(a.id); }
+  const all = typeof _dayAllResolved !== 'undefined' ? _dayAllResolved : null;
+  if (all) {
+    for (const [id, q] of Object.entries(all)) {
+      if (seen.has(id) || !q?.name) continue;
+      if (typeof isRealStockId === 'function' && !isRealStockId(id)) continue;
+      out.push({ id, name: q.name, sector: '未在掃描清單', inList: false, close: q.close });
+    }
+  }
+  return out;
+}
+
+function searchStocks(query, limit = 10) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return [];
+  const idx = marketSearchIndex();
+  const hit = idx.filter(s => s.id.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
+  // 已在掃描清單者優先，其次代號開頭吻合者
+  hit.sort((a, b) => (b.inList - a.inList)
+    || (b.id.toLowerCase().startsWith(q) - a.id.toLowerCase().startsWith(q))
+    || a.id.localeCompare(b.id));
+  return hit.slice(0, limit);
+}
+
+// 開啟任一檔股票：不在掃描清單者先加入自選，下輪掃描即有完整分析
+function openStockAnywhere(id, name) {
+  if (!getStockList().find(x => x.id === id) && !getAutoStocks().find(x => x.id === id)) {
+    addWatchStock(id, name || id);
+  }
+  openStock(id);
+}
+
 function initNavSearch() {
   const input = document.getElementById('nav-search-input');
   const dd    = document.getElementById('search-dropdown');
   if (!input) return;
 
   input.addEventListener('input', () => {
-    const q = input.value.toLowerCase().trim();
+    const q = input.value.trim();
     if (!q) { dd.innerHTML = ''; return; }
-    const list = getStockList().filter(s => s.id.includes(q) || s.name.includes(q)).slice(0, 8);
-    dd.innerHTML = list.map(s => `
-      <div class="search-item" onclick="openStock('${s.id}');document.getElementById('nav-search-input').value='';document.getElementById('search-dropdown').innerHTML=''">
+    const list = searchStocks(q, 8);
+    dd.innerHTML = list.length ? list.map(s => `
+      <div class="search-item" onclick="openStockAnywhere('${s.id}','${(s.name || '').replace(/'/g, "\\'")}');document.getElementById('nav-search-input').value='';document.getElementById('search-dropdown').innerHTML=''">
         <span class="search-item-id">${s.id}</span>
         <span class="search-item-name">${s.name}</span>
-        <span class="search-item-sector">${s.sector}</span>
-      </div>`).join('');
+        <span class="search-item-sector">${s.inList ? s.sector : '＋加入掃描'}</span>
+      </div>`).join('')
+      : '<div class="search-item" style="color:var(--text3)">查無此股票 — 請確認代號或中文名稱（僅支援上市櫃）</div>';
   });
 
   document.addEventListener('click', e => {
