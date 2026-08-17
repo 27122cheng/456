@@ -61,7 +61,9 @@ function srcMarkDead(name, minutes = 10) {
 }
 // 診斷用：清空所有 in-flight/記憶體快取，讓下一輪請求真正重打
 function resetSourceState() {
+  Object.keys(_memoAt).forEach(k => delete _memoAt[k]);
   _dayAllPromise = null; _dayAllResolved = null;
+  _turnoverValue = null; _alertValue = null;
   _t86Memo = null; _t86Promise = null; _t86Fields = null;
   _marginMemo = null; _marginPromise = null;
   _fundAllPromise = null; _revPromise = null; _finPromise = null;
@@ -188,6 +190,15 @@ function cacheSet(key, data) {
   }
 }
 
+// ── 頁面內記憶的有效期 ──────────────────────────────────────────────────────
+// 過去 _xxxPromise / _xxxMemo 只在失敗時清除，成功後整個頁面生命週期都黏住 ——
+// 開著網頁一整天，法人買賣超、大盤量能、新聞都不會更新（localStorage 的 TTL
+// 形同失效）。改為：Promise 僅作「同時多處呼叫」的去重，完成即釋放；
+// 資料新鮮度一律由 TTL 判定。
+const _memoAt = {};
+function memoFresh(name, ttl) { return _memoAt[name] != null && Date.now() - _memoAt[name] < ttl; }
+function memoStamp(name) { _memoAt[name] = Date.now(); }
+
 // ── Yahoo Finance ─────────────────────────────────────────────────────────
 
 function tsToDate(ts) {
@@ -272,6 +283,7 @@ async function officialJSON(url, srcName, timeout = 6000) {
 }
 
 async function fetchTWDayAll() {
+  if (_dayAllResolved && memoFresh('dayall', 10 * 60 * 1000)) return _dayAllResolved;
   if (_dayAllPromise) return _dayAllPromise; // in-flight 去重：掃描 worker 並行時只抓一次
   _dayAllPromise = (async () => {
     const key = 'cache:dayall';
@@ -314,7 +326,8 @@ async function fetchTWDayAll() {
     return stale;
   })();
   const result = await _dayAllPromise;
-  if (!result) _dayAllPromise = null; // 失敗不要黏住，下次重試
+  if (result) memoStamp('dayall');
+  _dayAllPromise = null;              // 僅作 in-flight 去重，完成即釋放
   return result;
 }
 
@@ -874,7 +887,7 @@ async function fetchT86Parsed() {
 }
 
 async function fetchT86All() {
-  if (_t86Memo) return _t86Memo;
+  if (_t86Memo && memoFresh('t86', 60 * 60 * 1000)) return _t86Memo;   // 法人資料每日一次，1 小時內沿用
   if (_t86Promise) return _t86Promise;
   _t86Promise = (async () => {
     const days = recentTradingDays(3);
@@ -918,9 +931,8 @@ async function fetchT86All() {
     }
     return null;
   })();
-  const r = await _t86Promise;
-  if (!r) _t86Promise = null;
-  return r;
+  try { const r = await _t86Promise; if (r) memoStamp('t86'); return r; }
+  finally { _t86Promise = null; }   // 僅作 in-flight 去重，完成即釋放
 }
 
 // 單檔法人：直接查快取的全表，不再重複下載整份 T86
@@ -940,7 +952,7 @@ async function fetchInstitutional(stockId) {
 let _fundAllPromise = null;
 
 async function fetchTWFundAll() {
-  if (_fundAllPromise) return _fundAllPromise;
+  if (_fundAllPromise) return _fundAllPromise;   // 估值每日更新，session 內沿用即可
   _fundAllPromise = (async () => {
     const key = 'cache:fundall';
     const cached = cacheGet(key, 60 * 60 * 1000); // 每日更新一次，快取 1 小時
@@ -982,9 +994,11 @@ async function fetchTWFundamentals(stockId) {
 // ── 大盤成交量能（分辨「無量下跌」與「爆量止跌」）─────────────────────────
 // TWSE FMTQIK：近一個月每日成交股數/金額/加權指數/漲跌點數
 let _turnoverPromise = null;
+let _turnoverValue = null;
 
 async function fetchMarketTurnover() {
-  if (_turnoverPromise) return _turnoverPromise;
+  if (_turnoverValue && memoFresh('turnover', 30 * 60 * 1000)) return _turnoverValue;
+  if (_turnoverPromise) return _turnoverPromise;          // in-flight 去重
   _turnoverPromise = (async () => {
     const key = 'cache:turnover';
     const cached = cacheGet(key, 30 * 60 * 1000);
@@ -1011,9 +1025,11 @@ async function fetchMarketTurnover() {
     cacheSet(key, parsed);
     return parsed;
   })();
-  const r = await _turnoverPromise;
-  if (!r) _turnoverPromise = null;
-  return r;
+  try {
+    const r = await _turnoverPromise;
+    if (r) { _turnoverValue = r; memoStamp('turnover'); }
+    return r;
+  } finally { _turnoverPromise = null; }   // 僅作 in-flight 去重
 }
 
 // 量價研判：今日量能 vs 20 日均量，配合指數漲跌，判斷這根 K 的性質
@@ -1051,7 +1067,7 @@ function pickNum(obj, ...keys) {
 }
 
 async function fetchRevenueAll() {
-  if (_revPromise) return _revPromise;
+  if (_revPromise) return _revPromise;           // 月營收每月公布，session 內沿用
   _revPromise = (async () => {
     const key = 'cache:revall';
     const cached = cacheGet(key, 6 * 60 * 60 * 1000); // 月營收每月更新，快取 6 小時
@@ -1092,7 +1108,7 @@ async function fetchRevenue(stockId) {
 let _finPromise = null;
 
 async function fetchFinancialsAll() {
-  if (_finPromise) return _finPromise;
+  if (_finPromise) return _finPromise;           // 季報每季公布，session 內沿用
   _finPromise = (async () => {
     const key = 'cache:finall';
     const cached = cacheGet(key, 12 * 60 * 60 * 1000); // 季報更新頻率低，快取 12 小時
@@ -1145,7 +1161,7 @@ async function fetchFinancials(stockId) {
 let _bsPromise = null;
 
 async function fetchBalanceSheetAll() {
-  if (_bsPromise) return _bsPromise;
+  if (_bsPromise) return _bsPromise;             // 資產負債表每季公布，session 內沿用
   _bsPromise = (async () => {
     const key = 'cache:bsall';
     const cached = cacheGet(key, 12 * 60 * 60 * 1000);
@@ -1405,9 +1421,11 @@ async function fetchMargin(stockId) {
 // 處置股採分盤撮合（5～20 分鐘一盤），流動性受限且波動劇烈，
 // 進場前必查；注意股則是異常交易的前置警告。
 let _alertPromise = null;
+let _alertValue = null;
 
 async function fetchMarketAlerts() {
-  if (_alertPromise) return _alertPromise;
+  if (_alertValue && memoFresh('alerts', 60 * 60 * 1000)) return _alertValue;
+  if (_alertPromise) return _alertPromise;                // in-flight 去重
   _alertPromise = (async () => {
     const key = 'cache:mktalerts';
     const cached = cacheGet(key, 60 * 60 * 1000);
@@ -1440,9 +1458,11 @@ async function fetchMarketAlerts() {
     cacheSet(key, map);
     return map;
   })();
-  const r = await _alertPromise;
-  if (!r) _alertPromise = null;
-  return r;
+  try {
+    const r = await _alertPromise;
+    if (r) { _alertValue = r; memoStamp('alerts'); }
+    return r;
+  } finally { _alertPromise = null; }
 }
 
 // ── Multi-timeframe snapshot（三時框並行抓取）─────────────────────────────
@@ -1494,10 +1514,10 @@ async function fetchMTFSignals(stockId, dailyBars = null) {
 const _newsMemo = {};
 
 async function fetchNewsRSS(query, limit = 7) {
-  if (_newsMemo[query]) return _newsMemo[query];
+  if (_newsMemo[query] && memoFresh('news:' + query, 30 * 60 * 1000)) return _newsMemo[query];
   const key = `cache:news:${query}`;
   const cached = cacheGet(key, 30 * 60 * 1000); // 新聞快取 30 分鐘
-  if (cached) { _newsMemo[query] = cached; return cached; }
+  if (cached) { _newsMemo[query] = cached; memoStamp('news:' + query); return cached; }
 
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}+when:7d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant`;
   const xml = await proxyFetchText(url, 8000);
@@ -1519,7 +1539,7 @@ async function fetchNewsRSS(query, limit = 7) {
         ...classifyNewsDirection(headline),
       };
     }).filter(n => n.headline);
-    if (items.length) { _newsMemo[query] = items; cacheSet(key, items); return items; }
+    if (items.length) { _newsMemo[query] = items; memoStamp('news:' + query); cacheSet(key, items); return items; }
     return null;
   } catch { return null; }
 }
