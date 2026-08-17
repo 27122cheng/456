@@ -327,8 +327,8 @@ async function runScan() {
   after('價格警報', checkAlerts);
   after('本週開盤佈局', () => { renderWeeklyBrief(); });
   after('Telegram 推送', () => {
-    // 假日（週六日）一律不推播 —— 沒有開盤就沒有可行動的資訊
-    if (!isTradingDayTW()) return;
+    // 只在交易日 08:30–13:35 推播 —— 收盤後與半夜推訊號沒有可行動性
+    if (!inNotifyWindow()) return;
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyEntrySignals();   // 適合進場的訊號
     notifyHoldingExits();   // 持倉出場檢查
@@ -4559,6 +4559,17 @@ function isTradingDayTW() {
   return wd !== 'Sat' && wd !== 'Sun';
 }
 
+// 推播時段守門：只在交易日的 08:30–13:35（台北時間）推播。
+// 過去只擋假日、沒擋時段 —— 掃描在半夜跑到就會推訊號（實際發生過 00:32 推播）。
+// 資料本身（盤後法人、隔夜美股）半夜確實會更新，但那時推播對使用者沒有可行動性，
+// 一律留到隔日盤前的排程報告一起呈現。
+function inNotifyWindow() {
+  if (!isTradingDayTW()) return false;
+  const t = twClock();
+  const m = t.hour * 60 + t.minute;
+  return m >= 8 * 60 + 30 && m <= 13 * 60 + 35;
+}
+
 // 今天市場是否真的有開（僅盤中之後可判定）：任一檔有今日的即時分鐘資料即為有開盤
 function marketTradedToday() {
   const today = twClock().date;
@@ -4787,7 +4798,7 @@ function renderWeeklyBrief() {
 // 週一 09:30 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
 function notifyWeeklyBrief() {
   const t = twClock();
-  if (!isTradingDayTW()) return;                   // 假日不推
+  if (!inNotifyWindow()) return;                   // 假日與非交易時段不推
   if (t.wd !== 'Mon') return;
   // 09:30 才推：五檔掛單是盤中資料，盤前拿不到 —— 等開盤半小時後
   // 大戶掛單真假、開盤走勢、量能才有實際數據可判斷
@@ -4862,7 +4873,7 @@ function buildDailyBrief() {
 
 function notifyDailyBrief() {
   const t = twClock();
-  if (!isTradingDayTW()) return;
+  if (!inNotifyWindow()) return;
   if (t.hour * 60 + t.minute < 9 * 60) return;             // 09:00 起
   if (localStorage.getItem('tg-daily-brief') === t.date) return;
   const b = buildDailyBrief();
@@ -4929,7 +4940,7 @@ function buildPostOpen() {
 
 function notifyPostOpen() {
   const t = twClock();
-  if (!isTradingDayTW()) return;
+  if (!inNotifyWindow()) return;
   if (t.hour * 60 + t.minute < 9 * 60 + 30) return;        // 09:30 起
   if (localStorage.getItem('tg-postopen') === t.date) return;
   if (marketTradedToday() === false) return;               // 國定假日（無任何盤中成交）
@@ -5190,7 +5201,7 @@ function notifyDataDate() {
 // 通過陷阱檢查的大戶訊號 → Telegram（每份法人資料每檔一次），附交易分析
 function notifyWhales() {
   if (!tgWants('sig')) return;
-  if (!isTradingDayTW()) return;   // 假日不推播
+  if (!inNotifyWindow()) return;   // 假日與非交易時段不推播
   const dataDate = notifyDataDate();
   let sent;
   try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
@@ -7109,6 +7120,7 @@ function manualSendDailyBriefing(silent = false) {
 // ── 每日簡報自動發送（每天 9:00，開啟網頁時若已過 9 點且未發送則補發）──
 function startDailyBriefingCheck() {
   const tryDailyBrief = () => {
+    if (!inNotifyWindow()) return;          // 非交易時段不發
     const now = new Date();
     if (now.getHours() < 9) return;
     const today = now.toDateString();
