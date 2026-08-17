@@ -332,7 +332,7 @@ async function runScan() {
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyEntrySignals();   // 適合進場的訊號
     notifyHoldingExits();   // 持倉出場檢查
-    notifyWeeklyBrief();    // 週一 08:30 盤前佈局
+    notifyWeeklyBrief();    // 週一 09:30 本週佈局（含盤中掛單判定）
     notifyDailyBrief();     // 每日 09:00 市場簡報
     notifyPostOpen();       // 每日 09:30 開盤後追蹤
   });
@@ -4620,12 +4620,14 @@ function renderWeeklyBrief() {
   return b;
 }
 
-// 週一 08:30 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
+// 週一 09:30 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
 function notifyWeeklyBrief() {
   const t = twNow();
   if (!isTradingDayTW()) return;                   // 假日不推
   if (t.wd !== 'Mon') return;
-  if (t.hour * 60 + t.minute < 8 * 60 + 30) return; // 08:30 前不推
+  // 09:30 才推：五檔掛單是盤中資料，盤前拿不到 —— 等開盤半小時後
+  // 大戶掛單真假、開盤走勢、量能才有實際數據可判斷
+  if (t.hour * 60 + t.minute < 9 * 60 + 30) return;
   const wk = weekKey();
   if (localStorage.getItem('tg-weekly') === wk) return;
   const b = buildWeeklyBrief();
@@ -4635,7 +4637,7 @@ function notifyWeeklyBrief() {
 
   const lvIcon = { exit: '🔴', watch: '🟡', hold: '🟢' };
   const lines = [];
-  lines.push(`🗓 週一盤前分析・本週佈局　${t.date} 08:30`);
+  lines.push(`🗓 本週佈局　${t.date}（週一）09:30`);
   lines.push('');
   lines.push(`【大盤】${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total} 檔`);
   if (b.intl.length) lines.push(`【國際】${b.intl.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
