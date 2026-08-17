@@ -327,7 +327,9 @@ async function runScan() {
   after('價格警報', checkAlerts);
   after('本週開盤佈局', () => { renderWeeklyBrief(); });
   after('Telegram 推送', () => {
-    // 只在交易日 08:30–13:35 推播 —— 收盤後與半夜推訊號沒有可行動性
+    // 盤後總結（約 16:30 法人資料出爐後，一天一則）
+    notifyAfterClose();
+    // 其餘推播只在可下單的時段：08:30 盤前 ~ 14:30 盤後定價撮合
     if (!inNotifyWindow()) return;
     autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyEntrySignals();   // 適合進場的訊號
@@ -4567,7 +4569,18 @@ function inNotifyWindow() {
   if (!isTradingDayTW()) return false;
   const t = twClock();
   const m = t.hour * 60 + t.minute;
-  return m >= 8 * 60 + 30 && m <= 13 * 60 + 35;
+  // 08:30 盤前 → 13:30 收盤 → 14:30 盤後定價交易撮合。
+  // 盤後定價（14:00–14:30 申報、依收盤價成交）仍可下單，故納入可推播時段。
+  return m >= 8 * 60 + 30 && m <= 14 * 60 + 30;
+}
+
+// 盤後總結時段：三大法人買賣超約 16:00 公布，這才是規劃「明天怎麼做」的關鍵資料。
+// 盤中無法行動的資訊集中在這裡一次送出，一天一則，不洗版。
+function inAfterCloseWindow() {
+  if (!isTradingDayTW()) return false;
+  const t = twClock();
+  const m = t.hour * 60 + t.minute;
+  return m >= 16 * 60 + 30 && m <= 21 * 60;
 }
 
 // 今天市場是否真的有開（僅盤中之後可判定）：任一檔有今日的即時分鐘資料即為有開盤
@@ -4978,6 +4991,90 @@ function notifyPostOpen() {
   L.push(''); L.push('【今日重點關注】');
   b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
+  tgPush(L.join('\n'));
+}
+
+// ── 盤後總結（約 16:30，三大法人買賣超公布後）──────────────────────────────
+// 盤中推播只涵蓋「現在能下單」的資訊；真正決定明天怎麼做的是盤後才出爐的
+// 法人買賣超與集保資料。這裡一天一則，把當日結果與明日佈局一次講完。
+function buildAfterClose() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return null;
+  const twii = outlookData.factors?.find(f => f.sym === '^TWII');
+  const norm = Math.round(outlookData.norm ?? 0);
+
+  // 今日漲跌幅排行（以日 K 收盤 vs 前收）
+  const movers = ready.map(s => {
+    const a = s.analysis;
+    const chg = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : null;
+    return chg == null ? null : { s, chg };
+  }).filter(Boolean).sort((a, b) => b.chg - a.chg);
+
+  const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
+  const picks = computeEntrySignals().slice(0, 5);
+  const longs = [], swings = [];
+  for (const pk of picks) (classifyLongTerm(pk.s) ? longs : swings).push(pk);
+
+  return {
+    date: twClock().date, twii, norm,
+    instVol: instAndVolumeSummary(),
+    whale: whaleOrderSummary(),
+    up: movers.slice(0, 5), down: movers.slice(-5).reverse(),
+    holdings,
+    exits: holdings.filter(r => r.level === 'exit'),
+    watches: holdings.filter(r => r.level === 'watch'),
+    aiExits: checkAiSignalExits(),
+    longs, swings,
+    newsSec: _newsSignals ? Object.entries(_newsSignals.sectors)
+      .filter(([, v]) => Math.abs(v.score) >= 2).sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 3) : [],
+  };
+}
+
+function notifyAfterClose() {
+  if (!inAfterCloseWindow()) return;
+  const dataDate = notifyDataDate();
+  if (localStorage.getItem('tg-afterclose') === dataDate) return;
+  const b = buildAfterClose();
+  if (!b) return;
+  localStorage.setItem('tg-afterclose', dataDate);
+  if (!tgWants('sig')) return;
+
+  const L = [];
+  L.push(`🌇 盤後總結與明日佈局　${b.date}`);
+  L.push('');
+  if (b.twii?.chg1 != null)
+    L.push(`【收盤】加權 ${b.twii.price?.toLocaleString(undefined, { maximumFractionDigits: 0 })}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1.toFixed(2)}%）｜研判分數 ${b.norm > 0 ? '+' : ''}${b.norm}`);
+  if (b.instVol.length) { L.push(''); L.push('【今日籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
+  if (b.up.length) L.push(`\n【今日強勢】${b.up.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
+  if (b.down.length) L.push(`【今日弱勢】${b.down.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
+  if (b.newsSec.length) L.push(`【新聞面】${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
+
+  L.push(''); L.push('【🐋 今日大戶動向】');
+  L.push(b.whale.txt);
+
+  L.push(''); L.push('【持倉：明日該怎麼做】');
+  if (!b.holdings.length) L.push('目前無持倉');
+  else b.holdings.forEach(r => {
+    const icon = r.level === 'exit' ? '🔴' : r.level === 'watch' ? '🟡' : '🟢';
+    const act = r.level === 'exit' ? '明日開盤優先處理，反彈即減碼'
+              : r.level === 'watch' ? `續抱但盯緊，跌破 ${r.h.stop} 出場`
+              : `續抱，停損守 ${r.h.stop}`;
+    L.push(`${icon} ${r.h.name}(${r.h.id}) ${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%　${act}`);
+  });
+  if (b.aiExits.length) {
+    L.push(''); L.push('【系統推薦訊號狀態】');
+    b.aiExits.forEach(x => L.push(`・${x.t.name}(${x.t.id})　${x.action}`));
+  }
+
+  L.push(''); L.push('【明日觀察標的】');
+  if (b.longs.length || b.swings.length) {
+    b.longs.forEach(p => L.push(`🏛 ${p.s.name}(${p.s.id})　進場 ${p.p.lo}~${p.p.hi}｜停損 ${p.p.stop}`));
+    b.swings.forEach(p => L.push(`📈 ${p.s.name}(${p.s.id})　進場 ${p.p.lo}~${p.p.hi}｜停損 ${p.p.stop}`));
+  } else L.push('無符合條件的標的（標準較嚴，寧可空手）');
+  L.push('');
+  L.push('※ 盤後定價交易時段為 14:00–14:30（依收盤價撮合），此報告發布時已結束；');
+  L.push('　以上為明日盤前的準備依據。');
+  L.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(L.join('\n'));
 }
 
