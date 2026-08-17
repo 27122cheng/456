@@ -3521,6 +3521,77 @@ function manualRefresh() {
   if (!scanning) startScan();
 }
 
+// ── 盤中即時報價：每 15 秒批次更新價格 ─────────────────────────────────────
+// 完整掃描（含技術分析）成本高、間隔數分鐘；但價格本身只要更新數字即可。
+// 這裡以 MIS 批次報價每 15 秒刷新價格與成交量，技術指標仍隨掃描更新。
+let liveTimer = null;
+let _liveBusy = false;
+
+async function refreshLivePrices() {
+  if (_liveBusy || scanning) return 0;
+  if (!isMarketOpenTW()) return 0;
+  const ids = allStocks.filter(s => s.analysis).map(s => s.id);
+  if (!ids.length) return 0;
+  _liveBusy = true;
+  try {
+    const map = await fetchRealtimeBatch(ids);
+    const today = twClock().date;
+    let n = 0, latest = '';
+    for (const s of allStocks) {
+      const q = map[s.id];
+      if (!q?.price || !s.analysis) continue;
+      // 只接受今日報價，避免收盤後或休市日把舊值當即時
+      if (q.date && `${q.date.slice(0,4)}-${q.date.slice(4,6)}-${q.date.slice(6,8)}` !== today) continue;
+      s.analysis.price = q.price;
+      if (q.prevClose) s.analysis.prevClose = q.prevClose;
+      if (q.cumVol) s.analysis.lastVol = q.cumVol * 1000;      // 張 → 股
+      // 同步最後一根日 K，讓圖表與後續計算看到的是同一個價格
+      const bars = s.ohlcv;
+      if (bars?.length) {
+        const last = bars[bars.length - 1];
+        const bar = { open: q.open ?? q.price, high: Math.max(q.high ?? q.price, q.price),
+                      low: Math.min(q.low ?? q.price, q.price), close: q.price,
+                      volume: q.cumVol ? q.cumVol * 1000 : last.volume };
+        if (last.time === today) Object.assign(last, bar);
+        else bars.push({ time: today, ...bar });
+      }
+      s._quoteTime = q.time;
+      if (q.time > latest) latest = q.time;
+      n++;
+    }
+    if (n) { _lastQuoteTime = latest; renderLiveTick(); }
+    return n;
+  } catch (e) { console.warn('即時報價更新失敗:', e); return 0; }
+  finally { _liveBusy = false; }
+}
+
+let _lastQuoteTime = '';
+
+// 只重繪價格相關區塊（不重跑技術分析，故成本低）
+function renderLiveTick() {
+  try {
+    const el = document.getElementById('quote-time');
+    if (el) el.textContent = _lastQuoteTime ? `報價 ${_lastQuoteTime}` : '';
+    if (currentPage === 'ranking') renderRanking();
+    else if (currentPage === 'dashboard') renderDashboard();
+    else if (currentPage === 'stock' && currentStockId) {
+      const s = allStocks.find(x => x.id === currentStockId);
+      const pe = document.getElementById('stock-price');
+      if (s?.analysis && pe) pe.textContent = s.analysis.price.toFixed(2);
+    }
+    if (currentPage === 'holdings') renderHoldings();
+  } catch (e) { console.warn('即時重繪失敗:', e); }
+}
+
+function startLiveQuotes() {
+  clearInterval(liveTimer);
+  liveTimer = setInterval(() => {
+    if (document.hidden) return;              // 背景分頁不打 API
+    refreshLivePrices();
+  }, 15000);
+  refreshLivePrices();
+}
+
 function startRefreshCycle() {
   const sec = parseInt(localStorage.getItem('refresh-interval') || '300');
   if (sec === 0) return;
@@ -3620,6 +3691,7 @@ function saveAllSettings() {
 
   showToast('設定已儲存', 'success');
   startRefreshCycle();
+  startLiveQuotes();   // 盤中每 15 秒批次更新即時報價
 }
 
 function resetAllSettings() {
@@ -4356,7 +4428,7 @@ function renderBacktest() {
 // 事件與數據、持倉怎麼佈局、有哪些交易機會 —— 並推送 Telegram。
 // 全部取自系統既有資料，不新增外部相依；沒有的資料就誠實標明「無」。
 
-function twNow() {
+function twClock() {
   // 取台北時區的年/月/日/時/分/星期
   const p = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei', hour12: false,
     year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', weekday: 'short' })
@@ -4367,7 +4439,7 @@ function twNow() {
 
 // 以「本週一的日期」當識別，確保同一週只推一次
 function weekKey() {
-  const t = twNow();
+  const t = twClock();
   const d = new Date(`${t.date}T00:00:00Z`);
   const dow = d.getUTCDay();                        // 0=Sun
   const back = dow === 0 ? 6 : dow - 1;
@@ -4382,7 +4454,7 @@ function weekEvents() {
   const end = new Date(now.getTime() + 7 * 86400000);
   for (const e of getCapitalFlowEvents()) if (e.date >= new Date(now.getTime() - 86400000) && e.date <= end) out.push(e);
   // 每月 10 日前為上市櫃月營收公布期
-  const t = twNow();
+  const t = twClock();
   const dom = +t.date.slice(8, 10);
   if (dom <= 10) out.push({ name: '月營收公布期', desc: '上市櫃公司需於每月 10 日前公布上月營收，個股易因營收數字跳動', dir: 'mix', date: now });
   return out;
@@ -4391,13 +4463,13 @@ function weekEvents() {
 // 交易日判定：週六日一律不推播。國定假日盤前無法從資料判定，
 // 但 09:00 之後可用「今日是否有即時成交」偵測（見 marketTradedToday）。
 function isTradingDayTW() {
-  const wd = twNow().wd;
+  const wd = twClock().wd;
   return wd !== 'Sat' && wd !== 'Sun';
 }
 
 // 今天市場是否真的有開（僅盤中之後可判定）：任一檔有今日的即時分鐘資料即為有開盤
 function marketTradedToday() {
-  const today = twNow().date;
+  const today = twClock().date;
   for (const s of allStocks.slice(0, 12)) {
     const bars = getIntradayBars(s.id, 5);
     if (bars.length && String(bars[bars.length - 1].time).slice(0, 10) === today) return true;
@@ -4463,7 +4535,7 @@ function checkAiSignalExits() {
 function buildWeeklyBrief() {
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length < 5) return null;
-  const t = twNow();
+  const t = twClock();
 
   // ① 大盤與國際情勢
   const norm = Math.round(outlookData.norm ?? 0);
@@ -4622,7 +4694,7 @@ function renderWeeklyBrief() {
 
 // 週一 09:30 起自動推送（同一週只推一次；錯過時間仍會在下次掃描補推）
 function notifyWeeklyBrief() {
-  const t = twNow();
+  const t = twClock();
   if (!isTradingDayTW()) return;                   // 假日不推
   if (t.wd !== 'Mon') return;
   // 09:30 才推：五檔掛單是盤中資料，盤前拿不到 —— 等開盤半小時後
@@ -4692,12 +4764,12 @@ function buildDailyBrief() {
     norm, regime, us, vix: fac('^VIX'), ov: outlookData.overnight,
     instVol: instAndVolumeSummary(), focus, holdings, exits, watches,
     picks: computeEntrySignals().slice(0, 4),
-    date: twNow().date,
+    date: twClock().date,
   };
 }
 
 function notifyDailyBrief() {
-  const t = twNow();
+  const t = twClock();
   if (!isTradingDayTW()) return;
   if (t.hour * 60 + t.minute < 9 * 60) return;             // 09:00 起
   if (localStorage.getItem('tg-daily-brief') === t.date) return;
@@ -4759,12 +4831,12 @@ function buildPostOpen() {
     focus: [...ready].sort((a, b) => verdictScore(b) - verdictScore(a)).slice(0, 5).map(s => ({ s, v: getVerdict(s) })),
     newsSec: _newsSignals ? Object.entries(_newsSignals.sectors)
       .filter(([, v]) => Math.abs(v.score) >= 2).sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 3) : [],
-    date: twNow().date, hasIntraday: movers.length > 0,
+    date: twClock().date, hasIntraday: movers.length > 0,
   };
 }
 
 function notifyPostOpen() {
-  const t = twNow();
+  const t = twClock();
   if (!isTradingDayTW()) return;
   if (t.hour * 60 + t.minute < 9 * 60 + 30) return;        // 09:30 起
   if (localStorage.getItem('tg-postopen') === t.date) return;

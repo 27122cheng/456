@@ -330,7 +330,10 @@ function mergeOfficialBar(ohlcv, q) {
   if (!q?.close || !ohlcv?.length) return ohlcv;
   const tw = twNow();
   const dow = tw.getDay();
-  if (dow === 0 || dow === 6 || tw.getHours() < 9) return ohlcv; // 週末/開盤前不合併
+  // STOCK_DAY_ALL 是「盤後收盤行情」，盤中取得的其實是前一交易日資料 ——
+  // 14:00 前合併等於把昨日收盤當成今日價格（即時性失真的主因）。
+  // 盤中價格改由 MIS 批次即時報價提供（見 fetchRealtimeBatch）。
+  if (dow === 0 || dow === 6 || tw.getHours() < 14) return ohlcv;
   const todayStr = `${tw.getFullYear()}-${String(tw.getMonth()+1).padStart(2,'0')}-${String(tw.getDate()).padStart(2,'0')}`;
   const last = ohlcv[ohlcv.length - 1];
   if (last.time === todayStr) {
@@ -1235,6 +1238,44 @@ async function fetchRealtimeQuote(stockId) {
     // 五檔掛單（張）— 供大戶掛單偵測；收盤後 MIS 可能回空
     bidP: nums(m.b), bidV: nums(m.g), askP: nums(m.a), askV: nums(m.f),
   };
+}
+
+// ── 批次即時報價（盤中價格的唯一即時來源）─────────────────────────────────
+// 為什麼需要：STOCK_DAY_ALL 是「盤後收盤行情」，盤中取得的是昨日收盤；
+// Yahoo 日線快取 10 分鐘且對雲端 IP 常限流 —— 兩者都無法即時。
+// MIS 支援一次查多檔（ex_ch 以 | 分隔），因此 100 檔只需 3 個請求。
+async function fetchRealtimeBatch(ids) {
+  const list = [...new Set(ids)].filter(id => /^\d{4,6}[A-Z]?$/.test(id));
+  if (!list.length) return {};
+  const chunks = [];
+  for (let i = 0; i < list.length; i += 40) chunks.push(list.slice(i, i + 40));
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const nums = v => String(v || '').split('_').map(num).filter(x => x != null);
+  const out = {};
+
+  await Promise.all(chunks.map(async chunk => {
+    const ch = chunk.map(id => {
+      const otc = localStorage.getItem(`sym-suffix:${id}`) === 'TWO' || localStorage.getItem(`mkt:${id}`) === 'tpex';
+      return `${otc ? 'otc' : 'tse'}_${id}.tw`;
+    }).join('|');
+    const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(ch)}&json=1&delay=0&_=${Date.now()}`;
+    const j = await proxyFetch(url, 8000).catch(() => null);
+    for (const m of j?.msgArray || []) {
+      const id = String(m.c || '').trim();
+      if (!id) continue;
+      // z 為成交價；尚未成交時退用最佳買/賣價（開盤前試撮階段常見）
+      const price = num(m.z) ?? num(String(m.b || '').split('_')[0]) ?? num(String(m.a || '').split('_')[0]);
+      if (price == null) continue;
+      out[id] = {
+        price, open: num(m.o), high: num(m.h), low: num(m.l),
+        prevClose: num(m.y),
+        cumVol: num(m.v) ?? 0,        // 當日累積成交量（張）
+        time: String(m.t || ''), date: String(m.d || ''), name: m.n,
+        bidP: nums(m.b), bidV: nums(m.g), askP: nums(m.a), askV: nums(m.f),
+      };
+    }
+  }));
+  return out;
 }
 
 function intradayKey(stockId, mins) { return `intra:${stockId}:${mins}`; }
