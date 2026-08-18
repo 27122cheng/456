@@ -3880,7 +3880,14 @@ async function refreshLivePrices() {
   _liveBusy = true;
   try {
     let map = await fetchRealtimeBatch(ids);
-    let src = 'MIS';
+    let src = localStorage.getItem('mis-direct') === 'yes' ? 'MIS 直連' : 'MIS';
+    // FinMind（使用者自己的免費 token）：額度不與他人共用，優先於 Yahoo 備援
+    if (!Object.keys(map).length && finmindToken()) {
+      const prio = [currentStockId, ...getHoldings().map(h => h.id),
+        ...[...allStocks].filter(x => x.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(x => x.id)];
+      map = await fetchFinMindQuotes([...new Set(prio.filter(Boolean))], 12);
+      src = 'FinMind';
+    }
     if (!Object.keys(map).length) {
       // MIS 取不到 → 改用 Yahoo 分鐘線備援（每檔一請求，故只取重點標的：
       // 正在檢視的個股、持倉、評分前段），至少讓最在意的價格是即時的
@@ -3891,7 +3898,9 @@ async function refreshLivePrices() {
       src = 'Yahoo 備援';
     }
     if (!Object.keys(map).length) {               // 靜默失敗是先前查不出問題的原因，改為明示
-      _liveFail = `${lastQuoteFail || 'MIS 無回應'}；Yahoo 分鐘線亦無資料${srcDead('yahoo') ? '（Yahoo 限流中）' : ''}`;
+      _liveFail = `${lastQuoteFail || 'MIS 無回應'}`
+        + `${finmindToken() ? '；FinMind 亦無資料' : '；未設定 FinMind token'}`
+        + `；Yahoo 分鐘線亦無資料${srcDead('yahoo') ? '（Yahoo 限流中）' : ''}`;
       _liveStatus = '即時報價無回應';
       // 自動恢復：連續失敗到一定次數就自行清熔斷器重試一次，
       // 不必等使用者手動按「重試」（先前必須手動介入才會恢復）
@@ -4038,6 +4047,15 @@ function startRefreshCycle() {
 // ── Settings ────────────────────────────────────────────────────────────────
 
 function loadSettings() {
+  const fm = document.getElementById('s-finmind');
+  if (fm) {
+    fm.value = localStorage.getItem('finmind-token') || '';
+    fm.addEventListener('change', () => {
+      const v = fm.value.trim();
+      if (v) { localStorage.setItem('finmind-token', v); showToast('已儲存 FinMind token — 下次即時報價會優先使用', 'success'); }
+      else { localStorage.removeItem('finmind-token'); showToast('已清除 FinMind token', 'info'); }
+    });
+  }
   const tf = localStorage.getItem('timeframe') || '1d';
   currentTF = tf;
   // 一次性遷移：舊版預設 60 秒全池重掃對免費資料源太頻繁（觸發限流 → 大量檢測失敗），下限改 5 分鐘
@@ -4308,6 +4326,20 @@ async function runDiagnostics() {
         if (!r?.length) return { ok: false, msg: '無回應（rwd 版失效時將無法人資料）' };
         const t = r.find(x => x.id === '2330') || r[0];
         return { ok: true, msg: `${r.length} 檔｜${t.name || t.id} 外資 ${t.foreign.toLocaleString()} 張` };
+      } },
+    { name: '即時報價來源總覽', run: async () => {
+        const direct = localStorage.getItem('mis-direct');
+        const parts = [`MIS 直連：${direct === 'yes' ? '可用（用你自己的 IP，不受共用限流）' : direct === 'no' ? '不支援（改走共用代理）' : '尚未偵測'}`];
+        parts.push(`FinMind token：${finmindToken() ? '已設定' : '未設定'}`);
+        parts.push(`Yahoo：${srcDead('yahoo') ? '限流中' : '可用'}`);
+        return { ok: true, msg: parts.join('｜') };
+      } },
+    { name: 'FinMind 即時報價（需 token）', run: async () => {
+        if (!finmindToken()) return { ok: false, msg: '未設定 token —— 這是唯一額度不與他人共用的來源，建議設定' };
+        const m = await fetchFinMindQuotes(['2330'], 1);
+        const q = m['2330'];
+        return q ? { ok: true, msg: `台積電 ${q.price}｜${q.time || '--'}｜量 ${q.cumVol}` }
+                 : { ok: false, msg: 'token 無效、額度用盡或今日尚無成交' };
       } },
     { name: '即時報價 (MIS 批次)', run: async () => {
         const ids = allStocks.slice(0, 5).map(s => s.id);
