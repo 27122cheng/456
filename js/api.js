@@ -688,6 +688,123 @@ async function fetchTWIIQuoteOfficial() {
 }
 
 // Fetch a single index quote: 官方(僅台股) → Yahoo → Stooq 三層備援
+// ── 證交所 OpenAPI 補強 ────────────────────────────────────────────────────
+// 說明：OpenAPI 全為「盤後開放資料」，沒有即時報價與五檔掛單（那只有 MIS 有）。
+// 但以下三項是系統既有的真實缺口，OpenAPI 可以補上。
+// 一律採防禦式解析：欄位名模糊比對、取不到就誠實回 null，不猜。
+
+// 上市公司產業別代碼（官方分類）。未知代碼保留原值，不亂猜。
+const TWSE_INDUSTRY = {
+  '01': '水泥工業', '02': '食品工業', '03': '塑膠工業', '04': '紡織纖維', '05': '電機機械',
+  '06': '電器電纜', '08': '玻璃陶瓷', '09': '造紙工業', '10': '鋼鐵工業', '11': '橡膠工業',
+  '12': '汽車工業', '14': '建材營造', '15': '航運業', '16': '觀光餐旅', '17': '金融保險',
+  '18': '貿易百貨', '19': '綜合', '20': '其他', '21': '化學工業', '22': '生技醫療',
+  '23': '油電燃氣', '24': '半導體', '25': '電腦及週邊設備', '26': '光電', '27': '通信網路',
+  '28': '電子零組件', '29': '電子通路', '30': '資訊服務', '31': '其他電子', '32': '文化創意',
+  '33': '農業科技', '34': '電子商務', '35': '綠能環保', '36': '數位雲端', '37': '運動休閒',
+  '38': '居家生活',
+};
+
+// ① 上市公司基本資料 → 全市場產業別
+// 補的缺口：目前只有硬編碼 100 檔有 sector，自動加入或自選的股票只能標「自訂」，
+// 族群排名也因此無法涵蓋清單外標的。
+let _companyPromise = null;
+async function fetchCompanyInfo() {
+  if (_companyPromise) return _companyPromise;   // 公司基本資料極少變動，session 內沿用
+  _companyPromise = (async () => {
+    const key = 'cache:company';
+    const cached = cacheGet(key, 7 * 24 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/opendata/t187ap03_L', 'twse-company', 12000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    const sample = rows[0];
+    const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+    const kId = findKey(/公司代號|證券代號|Code/i);
+    const kAbbr = findKey(/公司簡稱|證券簡稱|Abbrev/i);
+    const kName = findKey(/公司名稱|Name/i);
+    const kInd = findKey(/產業別|Industry/i);
+    if (!kId) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    const map = {};
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!isRealStockId(id)) continue;
+      const raw = String(r[kInd] ?? '').trim();
+      const sector = /^\d+$/.test(raw) ? (TWSE_INDUSTRY[raw.padStart(2, '0')] || `產業別${raw}`) : (raw || null);
+      map[id] = { name: String(r[kAbbr] ?? r[kName] ?? '').trim() || null, sector };
+    }
+    if (!Object.keys(map).length) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    cacheSet(key, map);
+    return map;
+  })();
+  try { return await _companyPromise; } finally { /* 保留結果供 session 沿用 */ }
+}
+
+// ② 當日沖銷交易標的及成交量值 → 當沖模組的關鍵缺口
+// 補的缺口：目前推薦當沖時完全不知道該股當天是否真的有當沖成交、當沖比重多高。
+// 有當沖成交紀錄 = 該股可現股當沖且有實際參與者；沒有則誠實標示「無當沖成交紀錄」。
+let _dayTradePromise = null;
+async function fetchDayTradeStats() {
+  if (_dayTradePromise) return _dayTradePromise;
+  _dayTradePromise = (async () => {
+    const key = 'cache:daytrade';
+    const cached = cacheGet(key, 6 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/TWTB4U', 'twse-daytrade', 10000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    const sample = rows[0];
+    const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+    const kId = findKey(/證券代號|股票代號|Code/i);
+    const kVol = findKey(/沖銷.*股數|成交股數|Volume/i);
+    const kBuy = findKey(/沖銷.*買.*金額|買進成交金額/i);
+    if (!kId) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const map = {};
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!isRealStockId(id)) continue;
+      map[id] = { vol: num(r[kVol]) ?? 0, buyValue: num(r[kBuy]) ?? null };
+    }
+    if (!Object.keys(map).length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    cacheSet(key, map);
+    return map;
+  })();
+  try { return await _dayTradePromise; } finally { _dayTradePromise = null; }
+}
+
+// ③ 三大法人買賣超（OpenAPI 版）→ 作為 rwd T86 的備援
+// rwd 版需要逐日帶日期參數探測，遇到假日或來源異常時較脆弱；
+// OpenAPI 版固定回最新一交易日、免參數，作為備援可提高籌碼資料的到手率。
+async function fetchT86OpenAPI() {
+  const key = 'cache:t86api';
+  const cached = cacheGet(key, 60 * 60 * 1000);
+  if (cached) return cached;
+  const rows = await officialJSON('https://openapi.twse.com.tw/v1/fund/T86', 'twse-t86api', 10000)
+    .catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+  const sample = rows[0];
+  const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+  const kId = findKey(/證券代號|Code/i);
+  const kName = findKey(/證券名稱|Name/i);
+  const kF = findKey(/外陸資買賣超股數|外資買賣超|Foreign/i);
+  const kI = findKey(/投信買賣超股數|投信買賣超|Investment/i);
+  const kD = findKey(/自營商買賣超股數|自營商買賣超|Dealer/i);
+  const kT = findKey(/三大法人買賣超股數|合計|Total/i);
+  if (!kId || !kF) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+  const out = [];
+  for (const r of rows) {
+    const id = String(r[kId] ?? '').trim();
+    if (!isRealStockId(id)) continue;
+    out.push({ id, name: String(r[kName] ?? '').trim(),
+      foreign: parseK(r[kF]), investment: parseK(r[kI]), dealer: parseK(r[kD]),
+      total: r[kT] != null && r[kT] !== '' ? parseK(r[kT]) : parseK(r[kF]) + parseK(r[kI]) + parseK(r[kD]) });
+  }
+  if (!out.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+  cacheSet(key, out);
+  return out;
+}
+
 // ── TDCC 集保戶股權分散表（每週公布）───────────────────────────────────────
 // 官方每週公布各股「持股分級」的人數與股數占比。千張大戶持股比率的變化，
 // 比單日法人買賣超更穩定的大戶進出證據 —— 且官方一次給完整快照，
@@ -883,9 +1000,13 @@ function isRealStockId(id) {
 
 async function fetchT86Parsed() {
   const rows = await fetchT86All();
-  if (!rows?.length) return null;
-  const idx = t86ColIdx();
-  return rows.map(r => parseT86Row(r, idx)).filter(p => isRealStockId(p.id));
+  if (rows?.length) {
+    const idx = t86ColIdx();
+    const parsed = rows.map(r => parseT86Row(r, idx)).filter(p => isRealStockId(p.id));
+    if (parsed.length) return parsed;
+  }
+  // rwd 版取不到（假日探測失敗、來源異常）→ 改用 OpenAPI 版，欄位已具名不需推欄位
+  return await fetchT86OpenAPI().catch(() => null);
 }
 
 async function fetchT86All() {

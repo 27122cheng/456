@@ -224,6 +224,24 @@ async function runScan() {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
   }).catch(() => {});
+  // 全市場產業別（證交所公司基本資料）：讓清單外／自動加入的股票也有正確族群，
+  // 族群排名因此能涵蓋任何加入的標的，而不是只顯示「自訂」「法人動向」
+  fetchCompanyInfo().then(m => {
+    if (!m) return;
+    let changed = false;
+    allStocks.forEach(s => {
+      const info = m[s.id];
+      if (!info) return;
+      if (info.sector && (!s.sector || ['自訂', '法人動向', '其他'].includes(s.sector))) { s.sector = info.sector; changed = true; }
+      if (info.name && (!s.name || s.name === s.id)) { s.name = info.name; changed = true; }
+    });
+    if (changed) { try { renderRanking(); } catch {} }
+  }).catch(() => {});
+  // 當日沖銷成交量：當沖推薦需要知道該股當天是否真的有當沖成交、比重多高
+  fetchDayTradeStats().then(m => {
+    if (!m) return;
+    allStocks.forEach(s => { s._dayTrade = m[s.id] || null; });
+  }).catch(() => {});
   // 集保股權分散（週更）：千張大戶持股比率 — 比單日法人買賣超更穩定的大戶證據
   fetchTDCCAll(new Set(allStocks.map(s => s.id))).then(m => {
     if (!m) return;
@@ -4031,6 +4049,26 @@ async function runDiagnostics() {
           (t.mid != null ? `、400張以上 ${t.mid}%` : '（級距數非 15，400張級距略過）') +
           `｜級距 ${t.levels} 段` };
       } },
+    { name: '公司基本資料/產業別 (t187ap03_L)', run: async () => {
+        const m = await fetchCompanyInfo();
+        if (!m) return { ok: false, msg: '無回應（清單外標的將無產業別，族群排名僅涵蓋內建清單）' };
+        const n = Object.keys(m).length;
+        const withSec = Object.values(m).filter(x => x.sector).length;
+        const sample = m['2330'] || Object.values(m)[0];
+        return { ok: true, msg: `${n} 家公司｜${withSec} 家有產業別｜範例：${sample?.name || '--'} / ${sample?.sector || '--'}` };
+      } },
+    { name: '當日沖銷成交 (TWTB4U)', run: async () => {
+        const m = await fetchDayTradeStats();
+        if (!m) return { ok: false, msg: '無回應（當沖推薦將無官方成交佐證）' };
+        const n = Object.keys(m).length;
+        return { ok: true, msg: `${n} 檔有當沖成交紀錄${m['2330'] ? `｜台積電當沖 ${Math.round(m['2330'].vol / 1000).toLocaleString()} 張` : ''}` };
+      } },
+    { name: '三大法人備援 (OpenAPI T86)', run: async () => {
+        const r = await fetchT86OpenAPI();
+        if (!r?.length) return { ok: false, msg: '無回應（rwd 版失效時將無法人資料）' };
+        const t = r.find(x => x.id === '2330') || r[0];
+        return { ok: true, msg: `${r.length} 檔｜${t.name || t.id} 外資 ${t.foreign.toLocaleString()} 張` };
+      } },
     { name: '即時報價 (MIS 批次)', run: async () => {
         const ids = allStocks.slice(0, 5).map(s => s.id);
         const m = await fetchRealtimeBatch(ids.length ? ids : ['2330', '2317']);
@@ -5985,16 +6023,26 @@ function computeDayTradePicks() {
     const finWarn = dFin != null && dFin > 0 && volZ > 0 && dFin >= volZ * 0.08
       ? `⚠ 融資大增 ${dFin.toLocaleString()} 張，散戶追價籌碼偏髒` : null;
 
+    // ── 當沖成交實證：官方當日沖銷成交量（沒有紀錄代表當天沒人沖或不可當沖）──
+    const dt = s._dayTrade;
+    const dtRatio = dt?.vol && last.volume > 0 ? dt.vol / last.volume : null;
+
     // ── 隔夜跳空預判：當沖規則是「開高逾 2% 不追」，ADR 大漲時前一晚就能預知 ──
     const gapWarn = overnightGapNote(s);
 
+    const dtNote = dtRatio != null
+      ? `官方當沖成交佔今日量 ${(dtRatio * 100).toFixed(0)}%（可現股當沖、有實際參與者）`
+      : '⚠ 官方當日無此股當沖成交紀錄 — 可能不可現股當沖或無人參與，下單前請先確認';
+
     out.push({ s, m, hasChips: net > 0 ? 1 : 0, why: [
       `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
+      dtNote,
       chips,
       ...(finWarn ? [finWarn] : []),
       ...(gapWarn ? [gapWarn.txt] : []),
       `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
-    ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct + (gapWarn?.pts ?? 0) });
+    ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct + (gapWarn?.pts ?? 0)
+              + (dtRatio != null ? Math.min(dtRatio * 20, 8) : -4) });
   }
   // 有法人籌碼支撐者優先
   out.sort((x, y) => (y.hasChips - x.hasChips) || (y.score - x.score));
