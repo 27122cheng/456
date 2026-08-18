@@ -931,6 +931,57 @@ async function fetchTWSESwagger() {
   try { return await _swaggerPromise; } finally { _swaggerPromise = null; }
 }
 
+// ── 通用 OpenAPI 資料集擷取 ────────────────────────────────────────────────
+// 任何以「公司代號／證券代號」為鍵的端點都能被一致地抓取、索引到個股上。
+// 抓進來的資料一律顯示；但只有意義明確的欄位才會進評分（見 OAPI_SIGNALS），
+// 其餘標為僅供參考 —— 把不理解的數字自動加權，等於製造看似精密的亂猜。
+function oapiTTL(path) {
+  if (/\/fund\//.test(path)) return 60 * 60 * 1000;              // 法人類：每日盤後
+  if (/\/exchangeReport\//.test(path)) return 6 * 60 * 60 * 1000; // 交易報表：日更
+  if (/\/opendata\//.test(path)) return 12 * 60 * 60 * 1000;      // 公開資料：月/季更
+  return 6 * 60 * 60 * 1000;
+}
+
+// 從一列資料中找出個股代號欄位（找不到代表此端點非個股層級，例如大盤統計）
+function oapiIdKey(row) {
+  for (const k of Object.keys(row || {})) {
+    if (!/公司代號|證券代號|股票代號|Code$/i.test(k)) continue;
+    const v = String(row[k] ?? '').trim();
+    if (/^\d{4,6}[A-Z]?$/.test(v)) return k;
+  }
+  return null;
+}
+
+async function fetchOpenApiDataset(path) {
+  const key = `cache:oapi:${path}`;
+  const cached = cacheGet(key, oapiTTL(path));
+  if (cached) return cached;
+  const rows = await officialJSON(`https://openapi.twse.com.tw${path}`, `oapi${path}`, 15000).catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 7 * 24 * 60 * 60 * 1000);
+  const idKey = oapiIdKey(rows[0]);
+  if (!idKey) {                                  // 非個股層級 → 標記後仍快取，供目錄顯示
+    const meta = { perStock: false, n: rows.length, sample: rows[0] };
+    cacheSet(key, meta);
+    return meta;
+  }
+  const map = {};
+  for (const r of rows) {
+    const id = String(r[idKey] ?? '').trim();
+    if (isRealStockId(id)) map[id] = r;
+  }
+  const out = { perStock: true, idKey, n: Object.keys(map).length, map };
+  cacheSet(key, out);
+  return out;
+}
+
+// 使用者啟用的額外資料集（預設空；由目錄頁一鍵加入）
+function getEnabledDatasets() {
+  try { return JSON.parse(localStorage.getItem('oapi-enabled') || '[]'); } catch { return []; }
+}
+function setEnabledDatasets(list) {
+  try { localStorage.setItem('oapi-enabled', JSON.stringify(list.slice(0, 12))); } catch {}
+}
+
 // 目前系統實際使用的 OpenAPI 端點（路徑須與 swagger 中一致）
 const USED_OPENAPI = [
   '/v1/exchangeReport/STOCK_DAY_ALL',

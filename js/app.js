@@ -224,6 +224,8 @@ async function runScan() {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
   }).catch(() => {});
+  // 使用者於目錄頁啟用的額外資料集
+  loadEnabledDatasets().catch(() => {});
   // 全市場產業別（證交所公司基本資料）：讓清單外／自動加入的股票也有正確族群，
   // 族群排名因此能涵蓋任何加入的標的，而不是只顯示「自訂」「法人動向」
   fetchCompanyInfo().then(m => {
@@ -1803,6 +1805,17 @@ function buildManagerAnalysis(s) {
     add(0.8, -1, '外資與投信同步賣超（法人一致撤退）', 'chip');
   }
 
+  // 額外官方資料集：只有 OAPI_SIGNALS 明列的欄位才進評分，
+  // 其餘一律只顯示不計分（欄位含義未經驗證，強行加權會產生假精確）
+  if (s._oapi) {
+    for (const [path, row] of Object.entries(s._oapi)) {
+      for (const [k, v] of Object.entries(row)) {
+        const sig = oapiFieldSignal(path, k, v, s);
+        if (sig && sig.w > 0 && sig.dir !== 0) add(sig.w, sig.dir, sig.txt, 'chip');
+      }
+    }
+  }
+
   // 外資持股比率（存量）：水位變化比單日買賣超更能反映外資態度
   const fg = s._fgnTrend;
   if (fg && Math.abs(fg.delta) >= 0.3) {
@@ -2477,6 +2490,7 @@ async function openStock(stockId) {
     if (fin) s._fin = fin;
     renderManagerVerdict(s);
     renderAnalysisPanels(s, s._inst || null);
+    try { renderExtraData(s); } catch {}
   }).catch(() => {});
 }
 
@@ -4350,6 +4364,86 @@ async function runDiagnostics() {
   </div>`;
 }
 
+
+// ── 額外官方資料集：載入、顯示、（有限度地）代入分析 ──────────────────────
+// 設計原則：全部抓進來並顯示，但只有意義明確的欄位進評分。
+// 未列於 OAPI_SIGNALS 的欄位一律標為「僅供參考，未納入評分」——
+// 對不確定含義的數字給權重，只會產生看似精密的錯誤結論。
+const OAPI_SIGNALS = [
+  { path: /TWT93U/, field: /借券賣出.*餘額|融券.*借券/, label: '借券賣出餘額',
+    dir: (v, s) => { const vol = s.analysis?.volMA ? s.analysis.volMA / 1000 : 0;
+      if (!vol) return 0; const r = v / 1000 / vol; return r >= 1 ? -1 : r <= 0.2 ? 0 : 0; },
+    note: v => `借券賣出餘額 ${Math.round(v / 1000).toLocaleString()} 張（空方潛在賣壓）`, w: 0.6 },
+  { path: /t187ap45_L/, field: /現金股利|股利.*合計/, label: '股利分派',
+    dir: () => 0, note: v => `現金股利 ${v} 元（僅供參考，殖利率已由估值資料計入）`, w: 0 },
+];
+
+function oapiFieldSignal(path, key, val, s) {
+  const num = parseFloat(String(val ?? '').replace(/,/g, ''));
+  if (!isFinite(num)) return null;
+  for (const sig of OAPI_SIGNALS) {
+    if (!sig.path.test(path) || !sig.field.test(key)) continue;
+    return { label: sig.label, dir: sig.dir(num, s), w: sig.w, txt: sig.note(num) };
+  }
+  return null;
+}
+
+// 掃描時載入所有已啟用的資料集，索引到個股上
+async function loadEnabledDatasets() {
+  const paths = getEnabledDatasets();
+  if (!paths.length) return;
+  const results = await Promise.all(paths.map(p =>
+    fetchOpenApiDataset(p).then(d => ({ p, d })).catch(() => ({ p, d: null }))));
+  for (const s of allStocks) s._oapi = {};
+  for (const { p, d } of results) {
+    if (!d?.perStock || !d.map) continue;
+    for (const s of allStocks) { const row = d.map[s.id]; if (row) s._oapi[p] = row; }
+  }
+}
+
+// 個股頁：完整呈現所有額外官方資料（每個欄位都列出，不做取捨）
+function renderExtraData(s) {
+  const el = document.getElementById('extra-data-body');
+  if (!el) return;
+  const sets = s?._oapi ? Object.entries(s._oapi) : [];
+  if (!sets.length) {
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">尚未啟用額外資料集。到「設定 → 證交所 OpenAPI 目錄」勾選要納入的端點，下輪掃描即會帶入。</p>';
+    return;
+  }
+  el.innerHTML = sets.map(([path, row]) => {
+    const rows = Object.entries(row)
+      .filter(([k]) => !/公司代號|證券代號|股票代號|Code$/i.test(k))
+      .map(([k, v]) => {
+        const sig = oapiFieldSignal(path, k, v, s);
+        const scored = sig && sig.w > 0 && sig.dir !== 0;
+        return `<div style="display:flex;gap:8px;padding:3px 0;border-bottom:1px solid var(--border);font-size:0.75rem">
+          <span style="color:var(--text3);min-width:44%">${k}</span>
+          <span style="font-family:var(--mono);color:var(--text1)">${v ?? '--'}</span>
+          ${scored ? `<span style="margin-left:auto;font-size:0.64rem;color:${sig.dir > 0 ? 'var(--bull)' : 'var(--bear)'}">已納入評分</span>`
+                   : `<span style="margin-left:auto;font-size:0.64rem;color:var(--text3)">僅供參考</span>`}
+        </div>`;
+      }).join('');
+    return `<div style="margin-bottom:12px">
+      <div style="font-size:0.76rem;font-weight:700;color:var(--text2);margin-bottom:4px">${path}</div>
+      ${rows || '<span style="font-size:0.75rem;color:var(--text3)">此資料集無其他欄位</span>'}
+    </div>`;
+  }).join('') +
+  '<div style="font-size:0.66rem;color:var(--text3);margin-top:6px">標示「僅供參考」者未進評分 —— 欄位含義與合理區間未經驗證，強行加權只會產生看似精密的錯誤結論。</div>';
+}
+
+// 目錄頁的啟用/停用切換
+function toggleDataset(path) {
+  const list = getEnabledDatasets();
+  const i = list.indexOf(path);
+  if (i >= 0) { list.splice(i, 1); showToast(`已移除 ${path}`, 'info'); }
+  else {
+    if (list.length >= 12) { showToast('最多同時啟用 12 個資料集（避免請求量與儲存空間爆量）', 'error'); return; }
+    list.push(path); showToast(`已加入 ${path} — 下輪掃描開始帶入`, 'success');
+  }
+  setEnabledDatasets(list);
+  renderApiCatalog();
+}
+
 // ── 證交所 OpenAPI 目錄 ─────────────────────────────────────────────────────
 // 讀官方 swagger.json：驗證我們用的端點是否還在（官方改版會靜默失效），
 // 並列出所有可用但尚未接的資料，讓「還能拿什麼」變成可自助查詢，而非我猜。
@@ -4364,6 +4458,7 @@ async function renderApiCatalog() {
     return;
   }
   const used = new Set(USED_OPENAPI);
+  const enabled = new Set(getEnabledDatasets());
   const inSpec = new Set(list.map(x => x.path));
   const missing = USED_OPENAPI.filter(p => !inSpec.has(p));
   const unused = list.filter(x => !used.has(x.path));
@@ -4378,7 +4473,8 @@ async function renderApiCatalog() {
 
   el.innerHTML = `
     <div style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.03);margin-bottom:10px;font-size:0.82rem">
-      官方目錄共 <b>${list.length}</b> 個端點｜本系統已使用 <b>${USED_OPENAPI.length}</b> 個｜尚未使用 <b>${unused.length}</b> 個
+      官方目錄共 <b>${list.length}</b> 個端點｜內建已使用 <b>${USED_OPENAPI.length}</b> 個｜額外啟用 <b>${enabled.size}</b> 個｜尚未使用 <b>${unused.length}</b> 個
+      <br><span style="font-size:0.72rem;color:var(--text3)">按「＋ 納入」即會在下輪掃描抓取並顯示於個股頁；意義明確的欄位會進評分，其餘標為僅供參考</span>
     </div>
     ${missing.length
       ? `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.08);border-left:3px solid var(--bear);margin-bottom:10px;font-size:0.8rem">
@@ -4396,9 +4492,13 @@ async function renderApiCatalog() {
           <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:4px">${g}（${items.length}）</div>
           ${items.map(x => `
             <div class="api-item" data-k="${(x.path + ' ' + (x.summary || '')).toLowerCase()}"
-                 style="padding:5px 10px;border-bottom:1px solid var(--border);font-size:0.76rem">
-              <span style="font-family:var(--mono);color:var(--blue)">${x.path}</span>
-              ${x.summary ? `<br><span style="color:var(--text3)">${x.summary}</span>` : ''}
+                 style="padding:5px 10px;border-bottom:1px solid var(--border);font-size:0.76rem;display:flex;gap:8px;align-items:flex-start">
+              <div style="flex:1;min-width:0">
+                <span style="font-family:var(--mono);color:var(--blue)">${x.path}</span>
+                ${x.summary ? `<br><span style="color:var(--text3)">${x.summary}</span>` : ''}
+              </div>
+              <button class="btn-ghost" style="padding:2px 10px;font-size:0.66rem;white-space:nowrap;${enabled.has(x.path) ? 'color:var(--bull);border-color:var(--bull)' : ''}"
+                onclick="toggleDataset('${x.path}')">${enabled.has(x.path) ? '✓ 已納入' : '＋ 納入'}</button>
             </div>`).join('')}
         </div>`).join('')}
     </div>
