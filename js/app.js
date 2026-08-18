@@ -242,6 +242,27 @@ async function runScan() {
     if (!m) return;
     allStocks.forEach(s => { s._dayTrade = m[s.id] || null; });
   }).catch(() => {});
+  // 官方除權息表：以精確的權值息值標記 K 棒，取代用缺口反推
+  fetchExDividend().then(list => {
+    if (!list?.length) return;
+    const byId = {};
+    for (const e of list) (byId[e.id] = byId[e.id] || []).push(e);
+    allStocks.forEach(s => {
+      const evs = byId[s.id];
+      if (!evs || !s.ohlcv?.length) return;
+      for (const e of evs) {
+        const bar = s.ohlcv.find(b => b.time === e.date);
+        if (bar) { bar.exDiv = true; bar.divAmt = e.amt; }   // 官方金額優先於缺口推算
+      }
+    });
+  }).catch(() => {});
+  // 外資持股比率（存量）：單日買賣超只看得到流量，看不到水位
+  fetchForeignHolding().then(m => {
+    if (!m) return;
+    allStocks.forEach(s => { if (m[s.id]) s._fgn = m[s.id]; });
+    accumulateForeignHist(m);
+    allStocks.forEach(s => { if (m[s.id]) s._fgnTrend = foreignTrend(s.id); });
+  }).catch(() => {});
   // 集保股權分散（週更）：千張大戶持股比率 — 比單日法人買賣超更穩定的大戶證據
   fetchTDCCAll(new Set(allStocks.map(s => s.id))).then(m => {
     if (!m) return;
@@ -338,7 +359,7 @@ async function runScan() {
   after('結算預測', resolvePredictions);
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
-  after('即時報價復原', reapplyLiveQuotes);   // 必須在其他渲染之前，讓各面板看到最新價
+  after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
@@ -1419,6 +1440,36 @@ function tdccTrend(stockId) {
            weeks: arr.length, dHolders, date: last.d };
 }
 
+// ── 外資持股比率：逐日累積與趨勢 ────────────────────────────────────────────
+// 官方只給當日快照，故逐日累積本機歷史（保留 20 筆），才能看出「水位變化」。
+function accumulateForeignHist(map) {
+  try {
+    const hist = JSON.parse(localStorage.getItem('fgn-hist') || '{}');
+    const d = localStorage.getItem('t86-last-date') || twClock().date;
+    let changed = false;
+    for (const [id, v] of Object.entries(map)) {
+      if (v?.pct == null) continue;
+      const arr = hist[id] = hist[id] || [];
+      if (arr.some(r => r.d === d)) continue;
+      arr.push({ d, p: v.pct });
+      hist[id] = arr.slice(-20);
+      changed = true;
+    }
+    if (changed) localStorage.setItem('fgn-hist', JSON.stringify(hist));
+  } catch {}
+}
+
+// 外資持股比率的變化（需 ≥2 筆才有結論；樣本不足誠實回 null）
+function foreignTrend(stockId) {
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem('fgn-hist') || '{}')[stockId] || []; } catch {}
+  if (arr.length < 2) return null;
+  const last = arr[arr.length - 1];
+  const base = arr[Math.max(0, arr.length - 6)];        // 約一週前
+  const d = +(last.p - base.p).toFixed(2);
+  return { pct: last.p, delta: d, days: arr.length - 1 - Math.max(0, arr.length - 6), n: arr.length };
+}
+
 // 法人連續買/賣超天數（依 inst-hist 逐日累積的真實資料）
 function instStreak(stockId) {
   let hist = [];
@@ -1656,6 +1707,16 @@ function buildManagerAnalysis(s) {
     add(0.8, 1, '外資與投信同步買超（雙引擎籌碼）', 'chip');
   } else if (foreign != null && inv != null && foreign < -500 && inv < -300) {
     add(0.8, -1, '外資與投信同步賣超（法人一致撤退）', 'chip');
+  }
+
+  // 外資持股比率（存量）：水位變化比單日買賣超更能反映外資態度
+  const fg = s._fgnTrend;
+  if (fg && Math.abs(fg.delta) >= 0.3) {
+    add(Math.abs(fg.delta) >= 1 ? 1.2 : 0.7, fg.delta > 0 ? 1 : -1,
+      `外資持股比率${fg.delta > 0 ? '上升' : '下降'} ${Math.abs(fg.delta)} 個百分點`
+      + `（現 ${fg.pct}%、近 ${fg.days} 個交易日）`, 'chip');
+  } else if (s._fgn && !fg) {
+    notes.push(`外資持股比率 ${s._fgn.pct}% — 尚未累積前期資料，無法比較增減`);
   }
 
   // 集保千張大戶持股變化（週更、官方完整快照 — 比單日法人買賣超穩定）
@@ -3694,7 +3755,10 @@ function reapplyLiveQuotes() {
 }
 
 async function refreshLivePrices() {
-  if (_liveBusy || scanning) return 0;
+  // 過去掃描期間完全封鎖即時報價 —— 100 檔掃描可耗時 1 分鐘以上，
+  // 開站後要等第一輪掃描結束才會有即時價（使用者感受到的「很久才連上」）。
+  // 改為只擋自身重入：已完成分析的股票即可即時更新，掃描結束再統一復原一次。
+  if (_liveBusy) return 0;
   if (!isMarketOpenTW()) { _liveStatus = ''; return 0; }
   const ids = allStocks.filter(s => s.analysis).map(s => s.id);
   if (!ids.length) return 0;
@@ -4048,6 +4112,19 @@ async function runDiagnostics() {
         return { ok: true, msg: `${Object.keys(m).length} 檔｜資料日 ${t.d}｜千張大戶 ${t.big}%` +
           (t.mid != null ? `、400張以上 ${t.mid}%` : '（級距數非 15，400張級距略過）') +
           `｜級距 ${t.levels} 段` };
+      } },
+    { name: '除權除息計算結果 (TWT49U)', run: async () => {
+        const list = await fetchExDividend();
+        if (!list?.length) return { ok: false, msg: '無回應（除息還原將沿用缺口推算，仍可運作但精度較低）' };
+        const last = list[list.length - 1];
+        return { ok: true, msg: `累積 ${list.length} 筆除權息事件｜最近 ${last.date} ${last.id} 權息值 ${last.amt}` };
+      } },
+    { name: '外資持股比率 (MI_QFIIS)', run: async () => {
+        const m = await fetchForeignHolding();
+        if (!m) return { ok: false, msg: '無回應（籌碼分析將只有單日買賣超，無持股水位）' };
+        const n = Object.keys(m).length;
+        const t = m['2330'] || Object.values(m)[0];
+        return { ok: true, msg: `${n} 檔｜範例持股比率 ${t.pct}%` };
       } },
     { name: '公司基本資料/產業別 (t187ap03_L)', run: async () => {
         const m = await fetchCompanyInfo();
