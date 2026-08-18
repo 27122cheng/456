@@ -805,6 +805,88 @@ async function fetchT86OpenAPI() {
   return out;
 }
 
+// ④ 除權除息計算結果表 → 精確的除權息日與權值息值
+// 補的缺口：目前靠 Yahoo 事件與證交所 X 記號推算，缺一段就得用缺口反推。
+// 官方表直接給「權值+息值」，還原停損與報酬時更準確。
+// 官方僅提供近期資料，故逐次累積本機歷史（保留 180 天）。
+let _exDivPromise = null;
+async function fetchExDividend() {
+  if (_exDivPromise) return _exDivPromise;
+  _exDivPromise = (async () => {
+    const key = 'cache:exdiv';
+    const cached = cacheGet(key, 12 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/TWT49U', 'twse-exdiv', 10000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    const sample = rows[0];
+    const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+    const kDate = findKey(/資料日期|除權息日期|Date/i);
+    const kId = findKey(/股票代號|證券代號|Code/i);
+    const kAmt = findKey(/權值.*息值|權值|息值|Value/i);
+    const kType = findKey(/權.*息|類別|Type/i);
+    if (!kId || !kDate) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const fresh = [];
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!isRealStockId(id)) continue;
+      const iso = rocToISO(String(r[kDate] ?? '')) || (/^\d{8}$/.test(String(r[kDate]))
+        ? `${String(r[kDate]).slice(0,4)}-${String(r[kDate]).slice(4,6)}-${String(r[kDate]).slice(6,8)}` : null);
+      const amt = num(r[kAmt]);
+      if (!iso || amt == null) continue;
+      fresh.push({ id, date: iso, amt, type: String(r[kType] ?? '').trim() || null });
+    }
+    // 併入本機歷史（官方只回近期，過去的事件要自己留著）
+    let hist = [];
+    try { hist = JSON.parse(localStorage.getItem('exdiv-hist') || '[]'); } catch {}
+    const seen = new Set(hist.map(x => `${x.id}:${x.date}`));
+    for (const f of fresh) if (!seen.has(`${f.id}:${f.date}`)) { hist.push(f); seen.add(`${f.id}:${f.date}`); }
+    const cutoff = new Date(Date.now() - 180 * 86400000).toISOString().slice(0, 10);
+    hist = hist.filter(x => x.date >= cutoff).sort((a, b) => a.date.localeCompare(b.date));
+    try { localStorage.setItem('exdiv-hist', JSON.stringify(hist)); } catch {}
+    if (!hist.length) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    cacheSet(key, hist);
+    return hist;
+  })();
+  try { return await _exDivPromise; } finally { _exDivPromise = null; }
+}
+
+// ⑤ 外資及陸資持股統計 → 外資持股「存量」
+// 補的缺口：目前只有單日買賣超（流量），看不出外資的長期部位水位。
+// 持股比率的變化比單日進出更能反映外資態度，且逐日累積後可算趨勢。
+let _fgnPromise = null;
+async function fetchForeignHolding() {
+  if (_fgnPromise) return _fgnPromise;
+  _fgnPromise = (async () => {
+    const key = 'cache:fgnhold';
+    const cached = cacheGet(key, 6 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/fund/MI_QFIIS', 'twse-fgn', 12000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    const sample = rows[0];
+    const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+    const kId = findKey(/證券代號|股票代號|Code/i);
+    const kPct = findKey(/持股比率|持有比率|Ratio|Percent/i);
+    const kHold = findKey(/持有股數|Shares/i);
+    if (!kId || !kPct) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/[,%]/g, '')); return isFinite(f) ? f : null; };
+    const map = {};
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!isRealStockId(id)) continue;
+      const pct = num(r[kPct]);
+      if (pct == null) continue;
+      map[id] = { pct: +pct.toFixed(2), shares: num(r[kHold]) };
+    }
+    if (!Object.keys(map).length) return cacheGetStale(key, 72 * 60 * 60 * 1000);
+    cacheSet(key, map);
+    return map;
+  })();
+  try { return await _fgnPromise; } finally { _fgnPromise = null; }
+}
+
 // ── TDCC 集保戶股權分散表（每週公布）───────────────────────────────────────
 // 官方每週公布各股「持股分級」的人數與股數占比。千張大戶持股比率的變化，
 // 比單日法人買賣超更穩定的大戶進出證據 —— 且官方一次給完整快照，
