@@ -1660,6 +1660,10 @@ async function fetchRealtimeBatch(ids) {
         price, open: num(m.o), high: num(m.h), low: num(m.l),
         prevClose: num(m.y),
         cumVol: num(m.v) ?? 0,        // 當日累積成交量（張）
+        tickVol: num(m.tv),           // 當盤成交量（可看單筆大單）
+        limitUp: num(m.u), limitDown: num(m.w),   // 漲停價／跌停價
+        ex: String(m.ex || '').toLowerCase() || null,  // tse=上市 otc=上櫃（可據此校正市場別）
+        fullName: m.nf || null,
         time: String(m.t || ''), date: String(m.d || ''), name: m.n,
         bidP: nums(m.b), bidV: nums(m.g), askP: nums(m.a), askV: nums(m.f),
       };
@@ -1694,6 +1698,27 @@ async function fetchYahooQuotes(ids, limit = 15) {
       src: 'yahoo',
     };
   }));
+  return out;
+}
+
+// 即時大盤／櫃買指數：MIS 同一支端點，代號 tse_t00.tw（加權）與 otc_o00.tw（櫃買）
+async function fetchRealtimeIndex() {
+  const url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
+    + `?ex_ch=${encodeURIComponent('tse_t00.tw|otc_o00.tw')}&json=1&delay=0&_=${Date.now()}`;
+  let j = await misDirectFetch(url, 6000).catch(() => null);
+  if (!j) j = await proxyFetch(url, 8000).catch(() => null);
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const out = {};
+  for (const m of j?.msgArray || []) {
+    const px = num(m.z) ?? num(m.o);
+    if (px == null) continue;
+    const y = num(m.y);
+    out[String(m.c || '').trim()] = {
+      price: px, prevClose: y, open: num(m.o), high: num(m.h), low: num(m.l),
+      chgPct: y ? +((px - y) / y * 100).toFixed(2) : null,
+      time: String(m.t || ''), date: String(m.d || ''),
+    };
+  }
   return out;
 }
 

@@ -1805,6 +1805,11 @@ function buildManagerAnalysis(s) {
     add(0.8, -1, '外資與投信同步賣超（法人一致撤退）', 'chip');
   }
 
+  // 漲跌停距離（MIS 即時欄位）：貼近漲停代表追價空間已極小，貼近跌停則有停損風險
+  const ld0 = limitDistance(s);
+  if (ld0?.toUp != null && ld0.toUp <= 1) notes.push(`已逼近漲停（距 ${ld0.toUp}%，漲停價 ${ld0.up}）— 追價幾無空間，且隔日開高走低風險高`);
+  else if (ld0?.toDown != null && ld0.toDown <= 1) notes.push(`已逼近跌停（距 ${ld0.toDown}%，跌停價 ${ld0.down}）— 流動性可能瞬間消失`);
+
   // 額外官方資料集：只有 OAPI_SIGNALS 明列的欄位才進評分，
   // 其餘一律只顯示不計分（欄位含義未經驗證，強行加權會產生假精確）
   if (s._oapi) {
@@ -3858,7 +3863,27 @@ function applyLiveQuote(s, q, today) {
     else bars.push({ time: today, ...bar });
   }
   s._quoteTime = q.time;
+  // MIS 額外欄位：漲跌停價、當盤量、市場別、全名 —— 一併留下供分析與顯示使用
+  if (q.limitUp != null || q.limitDown != null) s._limit = { up: q.limitUp, down: q.limitDown };
+  if (q.tickVol != null) s._tickVol = q.tickVol;
+  if (q.fullName && !s.fullName) s.fullName = q.fullName;
+  if (q.ex === 'tse' || q.ex === 'otc') {
+    // 官方回報的市場別最準，用來校正先前靠試探記住的判斷
+    const mkt = q.ex === 'otc' ? 'tpex' : 'twse';
+    if (s.mkt !== mkt) { s.mkt = mkt; try { localStorage.setItem(`mkt:${s.id}`, mkt); } catch {} }
+  }
   return true;
+}
+
+// 距離漲停／跌停的百分比 —— 追價與當沖風險的關鍵，先前完全沒用到
+function limitDistance(s) {
+  const px = s?.analysis?.price, lim = s?._limit;
+  if (!px || !lim) return null;
+  return {
+    toUp: lim.up ? +((lim.up - px) / px * 100).toFixed(2) : null,
+    toDown: lim.down ? +((px - lim.down) / px * 100).toFixed(2) : null,
+    up: lim.up, down: lim.down,
+  };
 }
 
 // 掃描完成後復原即時價 —— runScan 會重建 allStocks，
@@ -3924,6 +3949,17 @@ async function refreshLivePrices() {
         n++;
       }
     }
+    // 即時大盤指數（MIS 同一支端點）—— 盤中大盤原本只有日線收盤值
+    try {
+      const idx = await fetchRealtimeIndex();
+      const t00 = idx?.t00;
+      if (t00?.price) {
+        const f = outlookData.factors?.find(x => x.sym === '^TWII');
+        if (f) { f.price = t00.price; f.chg1 = t00.chgPct ?? f.chg1; }
+        outlookData.twiiLive = t00;
+      }
+    } catch {}
+
     if (n) {
       _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0;
       _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
@@ -4340,6 +4376,26 @@ async function runDiagnostics() {
         const q = m['2330'];
         return q ? { ok: true, msg: `台積電 ${q.price}｜${q.time || '--'}｜量 ${q.cumVol}` }
                  : { ok: false, msg: 'token 無效、額度用盡或今日尚無成交' };
+      } },
+    { name: 'MIS 原始回應（除錯用）', run: async () => {
+        const url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
+          + `?ex_ch=${encodeURIComponent('tse_2330.tw')}&json=1&delay=0&_=${Date.now()}`;
+        let via = '直連';
+        let j = await misDirectFetch(url, 6000).catch(() => null);
+        if (!j) { via = '代理'; j = await proxyFetch(url, 8000).catch(() => null); }
+        if (!j) return { ok: false, msg: '直連與代理皆無回應 —— 代理本身或 MIS 端點不可達' };
+        const n = j.msgArray?.length ?? 0;
+        const m = j.msgArray?.[0];
+        return { ok: n > 0, msg: `經${via}｜rtcode=${j.rtcode ?? '--'}｜rtmessage=${j.rtmessage ?? '--'}｜筆數 ${n}`
+          + (m ? `｜成交 ${m.z ?? '-'} 開 ${m.o ?? '-'} 昨收 ${m.y ?? '-'} 漲停 ${m.u ?? '-'} 時間 ${m.t ?? '-'} 日期 ${m.d ?? '-'}`
+               : '｜msgArray 為空（多半是 session 或來源限制）') };
+      } },
+    { name: '即時大盤指數 (MIS t00)', run: async () => {
+        const idx = await fetchRealtimeIndex();
+        const t = idx?.t00;
+        return t?.price ? { ok: true, msg: `加權 ${t.price.toLocaleString()}（${t.chgPct >= 0 ? '+' : ''}${t.chgPct}%）｜${t.time || '--'}`
+          + (idx.o00 ? `｜櫃買 ${idx.o00.price}` : '') }
+          : { ok: false, msg: '無回應（大盤將沿用日線收盤值）' };
       } },
     { name: '即時報價 (MIS 批次)', run: async () => {
         const ids = allStocks.slice(0, 5).map(s => s.id);
@@ -6459,6 +6515,13 @@ function computeDayTradePicks() {
     // ── 隔夜跳空預判：當沖規則是「開高逾 2% 不追」，ADR 大漲時前一晚就能預知 ──
     const gapWarn = overnightGapNote(s);
 
+    // 漲跌停距離：貼近漲停時追價風險極高（買不到、或買在最高點）
+    const ld = limitDistance(s);
+    if (ld?.toUp != null && ld.toUp <= 1.5) continue;      // 距漲停 <1.5% 不推當沖
+    const limNote = ld?.toUp != null
+      ? `距漲停 ${ld.toUp}%（漲停 ${ld.up}）／距跌停 ${ld.toDown}%`
+      : null;
+
     const dtNote = dtRatio != null
       ? `官方當沖成交佔今日量 ${(dtRatio * 100).toFixed(0)}%（可現股當沖、有實際參與者）`
       : '⚠ 官方當日無此股當沖成交紀錄 — 可能不可現股當沖或無人參與，下單前請先確認';
@@ -6466,6 +6529,7 @@ function computeDayTradePicks() {
     out.push({ s, m, hasChips: net > 0 ? 1 : 0, why: [
       `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
       dtNote,
+      ...(limNote ? [limNote] : []),
       chips,
       ...(finWarn ? [finWarn] : []),
       ...(gapWarn ? [gapWarn.txt] : []),
