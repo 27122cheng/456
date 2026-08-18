@@ -1296,6 +1296,30 @@ async function fetchRealtimeBatch(ids) {
   return out;
 }
 
+// MIS 全掛時的備援：Yahoo 分鐘線（每檔一個請求，故僅用於重點標的）
+// 回傳格式與 fetchRealtimeBatch 一致，呼叫端不必分辨來源。
+async function fetchYahooQuotes(ids, limit = 15) {
+  const out = {};
+  await Promise.all(ids.slice(0, limit).map(async id => {
+    const bars = await fetchStockOHLCV(id, '1m', '1d').catch(() => []);
+    if (!bars?.length) return;
+    const last = bars[bars.length - 1];
+    const t = String(last.time || '');
+    out[id] = {
+      price: last.close,
+      open: bars[0].open,
+      high: Math.max(...bars.map(b => b.high)),
+      low: Math.min(...bars.map(b => b.low)),
+      prevClose: null,
+      cumVol: Math.round(bars.reduce((a, b) => a + (b.volume || 0), 0) / 1000),
+      time: t.length >= 16 ? t.slice(11, 16) : '',
+      date: t.slice(0, 10).replace(/-/g, ''),
+      src: 'yahoo',
+    };
+  }));
+  return out;
+}
+
 function intradayKey(stockId, mins) { return `intra:${stockId}:${mins}`; }
 
 function getIntradayBars(stockId, mins) {
