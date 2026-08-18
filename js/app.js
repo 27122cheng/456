@@ -4297,6 +4297,75 @@ async function runDiagnostics() {
   </div>`;
 }
 
+// ── 證交所 OpenAPI 目錄 ─────────────────────────────────────────────────────
+// 讀官方 swagger.json：驗證我們用的端點是否還在（官方改版會靜默失效），
+// 並列出所有可用但尚未接的資料，讓「還能拿什麼」變成可自助查詢，而非我猜。
+async function renderApiCatalog() {
+  const el = document.getElementById('api-catalog-body');
+  if (!el) return;
+  el.innerHTML = '<div class="adv-loading">讀取 openapi.twse.com.tw/v1/swagger.json ...</div>';
+  const list = await fetchTWSESwagger().catch(() => null);
+  if (!list?.length) {
+    el.innerHTML = '<div style="padding:10px 12px;font-size:0.8rem;color:var(--bear)">無法讀取 swagger.json — '
+      + '可能是代理無回應或官方端點異動。目前使用中的端點仍會照常運作（各自有備援與舊資料保護）。</div>';
+    return;
+  }
+  const used = new Set(USED_OPENAPI);
+  const inSpec = new Set(list.map(x => x.path));
+  const missing = USED_OPENAPI.filter(p => !inSpec.has(p));
+  const unused = list.filter(x => !used.has(x.path));
+
+  // 依 tag 分組（沒有 tag 就用路徑第二段）
+  const groups = {};
+  for (const x of unused) {
+    const g = x.tags?.[0] || x.path.split('/')[2] || '其他';
+    (groups[g] = groups[g] || []).push(x);
+  }
+  const order = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+
+  el.innerHTML = `
+    <div style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.03);margin-bottom:10px;font-size:0.82rem">
+      官方目錄共 <b>${list.length}</b> 個端點｜本系統已使用 <b>${USED_OPENAPI.length}</b> 個｜尚未使用 <b>${unused.length}</b> 個
+    </div>
+    ${missing.length
+      ? `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.08);border-left:3px solid var(--bear);margin-bottom:10px;font-size:0.8rem">
+          ⚠ 使用中但目錄查無的端點（官方可能已改版，這些資料會靜默失效）：<br>
+          <span style="font-family:var(--mono);font-size:0.74rem">${missing.join('<br>')}</span>
+        </div>`
+      : `<div style="padding:8px 12px;border-radius:8px;background:rgba(34,197,94,0.08);border-left:3px solid var(--bull);margin-bottom:10px;font-size:0.8rem">
+          ✅ 使用中的 ${USED_OPENAPI.length} 個端點皆存在於官方目錄</div>`}
+    <input type="text" id="api-catalog-filter" placeholder="篩選端點或說明關鍵字…"
+      style="width:100%;padding:8px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.82rem;margin-bottom:10px"
+      oninput="filterApiCatalog(this.value)" />
+    <div id="api-catalog-list">
+      ${order.map(([g, items]) => `
+        <div class="api-group" style="margin-bottom:10px">
+          <div style="font-size:0.78rem;font-weight:700;color:var(--text2);margin-bottom:4px">${g}（${items.length}）</div>
+          ${items.map(x => `
+            <div class="api-item" data-k="${(x.path + ' ' + (x.summary || '')).toLowerCase()}"
+                 style="padding:5px 10px;border-bottom:1px solid var(--border);font-size:0.76rem">
+              <span style="font-family:var(--mono);color:var(--blue)">${x.path}</span>
+              ${x.summary ? `<br><span style="color:var(--text3)">${x.summary}</span>` : ''}
+            </div>`).join('')}
+        </div>`).join('')}
+    </div>
+    <div style="font-size:0.7rem;color:var(--text3);margin-top:8px">
+      這份目錄全為盤後開放資料 —— 沒有即時報價與五檔掛單（那只有 MIS 有）。
+      看到想接的資料，把端點路徑給我即可。
+    </div>`;
+}
+
+function filterApiCatalog(q) {
+  const k = String(q || '').trim().toLowerCase();
+  document.querySelectorAll('#api-catalog-list .api-item').forEach(el => {
+    el.style.display = !k || el.dataset.k.includes(k) ? '' : 'none';
+  });
+  document.querySelectorAll('#api-catalog-list .api-group').forEach(g => {
+    const any = [...g.querySelectorAll('.api-item')].some(i => i.style.display !== 'none');
+    g.style.display = any ? '' : 'none';
+  });
+}
+
 // ── Custom Stock List ──────────────────────────────────────────────────────
 
 function getStockList() {

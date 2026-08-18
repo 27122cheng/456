@@ -839,6 +839,14 @@
           <div id="diag-body"></div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-name">證交所 OpenAPI 目錄</div>
+              <div class="setting-desc">讀取官方 swagger.json，檢查目前使用的端點是否仍存在，並列出所有可用但尚未使用的資料</div>
+            </div>
+            <button class="btn-primary" style="padding:8px 18px" onclick="renderApiCatalog()">📚 載入目錄</button>
+          </div>
+          <div id="api-catalog-body"></div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-name">自動刷新間隔</div>
               <div class="setting-desc">自動重掃全部股票的頻率（免費資料源有流量限制，過於頻繁會觸發限流導致大量檢測失敗；日線資料盤中僅最後一根 K 棒變動，5 分鐘已足夠）</div>
             </div>
