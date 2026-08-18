@@ -2557,6 +2557,20 @@ function renderOI(s, oi) {
     </div>`;
 }
 
+
+// 價格時間戳：即時報價 / 當日收盤 / 前一交易日收盤，一律標明，避免舊價被當現價
+function quoteStampHTML(s) {
+  const today = twClock().date;
+  const barDate = s?.ohlcv?.length ? String(s.ohlcv[s.ohlcv.length - 1].time).slice(0, 10) : null;
+  if (s?._quoteTime) return `<span style="color:var(--bull)">● 即時 ${s._quoteTime}</span>`;
+  if (barDate === today) return `● 今日 ${isMarketOpenTW() ? '盤中' : '收盤'}價`;
+  if (barDate) {
+    const md = barDate.slice(5).replace('-', '/');
+    return `<span style="color:var(--yellow)">⚠ ${md} 收盤價（未取得今日報價）</span>`;
+  }
+  return '';
+}
+
 function renderStockDetail(s) {
   const a = s.analysis;
   const price = a.price?.toFixed(2) ?? '--';
@@ -2570,6 +2584,10 @@ function renderStockDetail(s) {
   document.getElementById('stock-change').textContent = chgPct !== null
     ? `${isUp ? '+' : ''}${chg.toFixed(2)} (${chgPct.toFixed(2)}%)`
     : 'TWD';
+  // 價格必須標明是「什麼時候的價格」—— 取不到即時報價時會顯示前一日收盤，
+  // 沒有標示就會被誤認成現價（實際發生過：顯示昨收 50.00，當下實際 49.00）
+  const qEl = document.getElementById('stock-quote-src');
+  if (qEl) qEl.innerHTML = quoteStampHTML(s);
 
   // Trend chip
   const chip = document.getElementById('stock-trend-chip');
@@ -3660,9 +3678,18 @@ async function refreshLivePrices() {
   if (!ids.length) return 0;
   _liveBusy = true;
   try {
-    const map = await fetchRealtimeBatch(ids);
-    const got = Object.keys(map).length;
-    if (!got) {                                  // 靜默失敗是先前查不出問題的原因，改為明示
+    let map = await fetchRealtimeBatch(ids);
+    let src = 'MIS';
+    if (!Object.keys(map).length) {
+      // MIS 取不到 → 改用 Yahoo 分鐘線備援（每檔一請求，故只取重點標的：
+      // 正在檢視的個股、持倉、評分前段），至少讓最在意的價格是即時的
+      const prio = [currentStockId, ...getHoldings().map(h => h.id),
+        ...[...allStocks].filter(s2 => s2.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(s2 => s2.id)];
+      const uniq = [...new Set(prio.filter(Boolean))];
+      map = await fetchYahooQuotes(uniq, 15);
+      src = 'Yahoo 備援';
+    }
+    if (!Object.keys(map).length) {               // 靜默失敗是先前查不出問題的原因，改為明示
       _liveStatus = '即時報價無回應';
       renderLiveTick();
       return 0;
@@ -3678,7 +3705,7 @@ async function refreshLivePrices() {
         n++;
       }
     }
-    if (n) { _lastQuoteTime = latest; _liveStatus = `報價 ${latest}`; }
+    if (n) { _lastQuoteTime = latest; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
     else _liveStatus = '報價非今日（休市或收盤）';
     renderLiveTick();
     return n;
@@ -3704,7 +3731,17 @@ function renderLiveTick() {
     else if (currentPage === 'stock' && currentStockId) {
       const s = allStocks.find(x => x.id === currentStockId);
       const pe = document.getElementById('stock-price');
-      if (s?.analysis && pe) pe.textContent = s.analysis.price.toFixed(2);
+      if (s?.analysis && pe) {
+        pe.textContent = s.analysis.price.toFixed(2);
+        const ce = document.getElementById('stock-change');
+        if (ce && s.analysis.prevClose) {
+          const d = s.analysis.price - s.analysis.prevClose;
+          ce.style.color = d >= 0 ? 'var(--bull)' : 'var(--bear)';
+          ce.textContent = `${d >= 0 ? '+' : ''}${d.toFixed(2)} (${(d / s.analysis.prevClose * 100).toFixed(2)}%)`;
+        }
+        const qe = document.getElementById('stock-quote-src');
+        if (qe) qe.innerHTML = quoteStampHTML(s);
+      }
     }
     if (currentPage === 'holdings') renderHoldings();
   } catch (e) { console.warn('即時重繪失敗:', e); }
