@@ -899,6 +899,54 @@ async function fetchForeignHolding() {
   try { return await _fgnPromise; } finally { _fgnPromise = null; }
 }
 
+// ── 證交所 OpenAPI 目錄（swagger.json）──────────────────────────────────────
+// 用途有二：① 驗證我們正在用的端點是否仍存在（官方改版時能第一時間發現）
+//          ② 列出所有可用但尚未使用的資料，供評估要不要接
+// 沙盒環境無法連外驗證，故把探索能力做進 App，由使用者端實際讀取。
+let _swaggerPromise = null;
+async function fetchTWSESwagger() {
+  if (_swaggerPromise) return _swaggerPromise;
+  _swaggerPromise = (async () => {
+    const key = 'cache:swagger';
+    const cached = cacheGet(key, 24 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const doc = await officialJSON('https://openapi.twse.com.tw/v1/swagger.json', 'twse-swagger', 15000)
+      .catch(() => null);
+    const paths = doc?.paths;
+    if (!paths || typeof paths !== 'object') return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    const out = [];
+    for (const [p, ops] of Object.entries(paths)) {
+      const get = ops?.get || ops?.GET || Object.values(ops || {})[0];
+      out.push({
+        path: p,
+        summary: String(get?.summary || get?.description || '').trim() || null,
+        tags: Array.isArray(get?.tags) ? get.tags : [],
+      });
+    }
+    if (!out.length) return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    out.sort((a, b) => a.path.localeCompare(b.path));
+    cacheSet(key, out);
+    return out;
+  })();
+  try { return await _swaggerPromise; } finally { _swaggerPromise = null; }
+}
+
+// 目前系統實際使用的 OpenAPI 端點（路徑須與 swagger 中一致）
+const USED_OPENAPI = [
+  '/v1/exchangeReport/STOCK_DAY_ALL',
+  '/v1/exchangeReport/BWIBBU_ALL',
+  '/v1/exchangeReport/TWTB4U',
+  '/v1/exchangeReport/TWT49U',
+  '/v1/opendata/t187ap03_L',
+  '/v1/opendata/t187ap05_L',
+  '/v1/opendata/t187ap06_L_ci',
+  '/v1/opendata/t187ap07_L',
+  '/v1/fund/T86',
+  '/v1/fund/MI_QFIIS',
+  '/v1/announcement/punish',
+  '/v1/announcement/notice',
+];
+
 // ── TDCC 集保戶股權分散表（每週公布）───────────────────────────────────────
 // 官方每週公布各股「持股分級」的人數與股數占比。千張大戶持股比率的變化，
 // 比單日法人買賣超更穩定的大戶進出證據 —— 且官方一次給完整快照，
