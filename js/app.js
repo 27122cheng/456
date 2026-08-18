@@ -320,6 +320,7 @@ async function runScan() {
   after('結算預測', resolvePredictions);
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
+  after('即時報價復原', reapplyLiveQuotes);   // 必須在其他渲染之前，讓各面板看到最新價
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
@@ -3620,52 +3621,84 @@ function manualRefresh() {
 // 這裡以 MIS 批次報價每 15 秒刷新價格與成交量，技術指標仍隨掃描更新。
 let liveTimer = null;
 let _liveBusy = false;
+let _lastQuoteTime = '';
+let _liveStatus = '';          // 供導覽列顯示：報價時間或失敗原因
+const _liveQuotes = {};        // 最近一次成功的即時報價（掃描重建 allStocks 後用來復原）
+
+// 把即時報價套進一檔股票（掃描重建物件後也會呼叫，避免價格倒退回快取值）
+function applyLiveQuote(s, q, today) {
+  if (!q?.price || !s?.analysis) return false;
+  if (q.date && `${q.date.slice(0,4)}-${q.date.slice(4,6)}-${q.date.slice(6,8)}` !== today) return false;
+  s.analysis.price = q.price;
+  if (q.prevClose) s.analysis.prevClose = q.prevClose;
+  if (q.cumVol) s.analysis.lastVol = q.cumVol * 1000;      // 張 → 股
+  const bars = s.ohlcv;
+  if (bars?.length) {
+    const last = bars[bars.length - 1];
+    const bar = { open: q.open ?? q.price, high: Math.max(q.high ?? q.price, q.price),
+                  low: Math.min(q.low ?? q.price, q.price), close: q.price,
+                  volume: q.cumVol ? q.cumVol * 1000 : last.volume };
+    if (last.time === today) Object.assign(last, bar);
+    else bars.push({ time: today, ...bar });
+  }
+  s._quoteTime = q.time;
+  return true;
+}
+
+// 掃描完成後復原即時價 —— runScan 會重建 allStocks，
+// 若不復原，價格會倒退回日 K 快取（最舊可達 10 分鐘前）直到下一次 tick
+function reapplyLiveQuotes() {
+  if (!isMarketOpenTW()) return;
+  const today = twClock().date;
+  for (const s of allStocks) applyLiveQuote(s, _liveQuotes[s.id], today);
+}
 
 async function refreshLivePrices() {
   if (_liveBusy || scanning) return 0;
-  if (!isMarketOpenTW()) return 0;
+  if (!isMarketOpenTW()) { _liveStatus = ''; return 0; }
   const ids = allStocks.filter(s => s.analysis).map(s => s.id);
   if (!ids.length) return 0;
   _liveBusy = true;
   try {
     const map = await fetchRealtimeBatch(ids);
+    const got = Object.keys(map).length;
+    if (!got) {                                  // 靜默失敗是先前查不出問題的原因，改為明示
+      _liveStatus = '即時報價無回應';
+      renderLiveTick();
+      return 0;
+    }
     const today = twClock().date;
     let n = 0, latest = '';
     for (const s of allStocks) {
       const q = map[s.id];
-      if (!q?.price || !s.analysis) continue;
-      // 只接受今日報價，避免收盤後或休市日把舊值當即時
-      if (q.date && `${q.date.slice(0,4)}-${q.date.slice(4,6)}-${q.date.slice(6,8)}` !== today) continue;
-      s.analysis.price = q.price;
-      if (q.prevClose) s.analysis.prevClose = q.prevClose;
-      if (q.cumVol) s.analysis.lastVol = q.cumVol * 1000;      // 張 → 股
-      // 同步最後一根日 K，讓圖表與後續計算看到的是同一個價格
-      const bars = s.ohlcv;
-      if (bars?.length) {
-        const last = bars[bars.length - 1];
-        const bar = { open: q.open ?? q.price, high: Math.max(q.high ?? q.price, q.price),
-                      low: Math.min(q.low ?? q.price, q.price), close: q.price,
-                      volume: q.cumVol ? q.cumVol * 1000 : last.volume };
-        if (last.time === today) Object.assign(last, bar);
-        else bars.push({ time: today, ...bar });
+      if (!q) continue;
+      if (applyLiveQuote(s, q, today)) {
+        _liveQuotes[s.id] = q;
+        if (q.time > latest) latest = q.time;
+        n++;
       }
-      s._quoteTime = q.time;
-      if (q.time > latest) latest = q.time;
-      n++;
     }
-    if (n) { _lastQuoteTime = latest; renderLiveTick(); }
+    if (n) { _lastQuoteTime = latest; _liveStatus = `報價 ${latest}`; }
+    else _liveStatus = '報價非今日（休市或收盤）';
+    renderLiveTick();
     return n;
-  } catch (e) { console.warn('即時報價更新失敗:', e); return 0; }
-  finally { _liveBusy = false; }
+  } catch (e) {
+    console.warn('即時報價更新失敗:', e);
+    _liveStatus = '即時報價連線失敗';
+    renderLiveTick();
+    return 0;
+  } finally { _liveBusy = false; }
 }
-
-let _lastQuoteTime = '';
 
 // 只重繪價格相關區塊（不重跑技術分析，故成本低）
 function renderLiveTick() {
   try {
     const el = document.getElementById('quote-time');
-    if (el) el.textContent = _lastQuoteTime ? `報價 ${_lastQuoteTime}` : '';
+    if (el) {
+      el.textContent = _liveStatus;
+      el.style.color = _liveStatus.includes('無回應') || _liveStatus.includes('失敗')
+        ? 'var(--bear)' : 'var(--text3)';
+    }
     if (currentPage === 'ranking') renderRanking();
     else if (currentPage === 'dashboard') renderDashboard();
     else if (currentPage === 'stock' && currentStockId) {
@@ -3943,6 +3976,17 @@ async function runDiagnostics() {
         return { ok: true, msg: `${Object.keys(m).length} 檔｜資料日 ${t.d}｜千張大戶 ${t.big}%` +
           (t.mid != null ? `、400張以上 ${t.mid}%` : '（級距數非 15，400張級距略過）') +
           `｜級距 ${t.levels} 段` };
+      } },
+    { name: '即時報價 (MIS 批次)', run: async () => {
+        const ids = allStocks.slice(0, 5).map(s => s.id);
+        const m = await fetchRealtimeBatch(ids.length ? ids : ['2330', '2317']);
+        const n = Object.keys(m).length;
+        if (!n) return { ok: false, msg: '無回應 —— 盤中價格將退回日 K 快取（最舊可達 10 分鐘前）' };
+        const one = Object.values(m)[0];
+        const today = twClock().date;
+        const qd = one.date ? `${one.date.slice(0,4)}-${one.date.slice(4,6)}-${one.date.slice(6,8)}` : '--';
+        return { ok: true, msg: `${n} 檔｜${one.name || ''} ${one.price}｜報價時間 ${one.time || '--'}｜資料日 ${qd}` +
+          (qd !== today ? '（非今日，休市或尚未開盤）' : '') };
       } },
     { name: '隔夜訊號 (台積電ADR/EWT)', run: async () => {
         const day = await fetchTWDayAll().catch(() => null);
