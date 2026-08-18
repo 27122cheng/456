@@ -850,6 +850,13 @@
           <div id="diag-body"></div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-name">FinMind API Token（選填）</div>
+              <div class="setting-desc">即時報價的第三來源。額度綁在你自己的 token 上，不與其他使用者共用 IP 額度 —— 這是最能避開限流的做法。至 finmindtrade.com 免費註冊後貼上</div>
+            </div>
+            <input type="text" id="s-finmind" placeholder="貼上 token" style="min-width:180px;padding:8px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.82rem" />
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-name">證交所 OpenAPI 目錄</div>
               <div class="setting-desc">讀取官方 swagger.json，檢查目前使用的端點是否仍存在，並列出所有可用但尚未使用的資料</div>
             </div>

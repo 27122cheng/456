@@ -1579,6 +1579,57 @@ async function fetchRealtimeQuote(stockId) {
 // Yahoo 日線快取 10 分鐘且對雲端 IP 常限流 —— 兩者都無法即時。
 // MIS 支援一次查多檔（ex_ch 以 | 分隔），因此 100 檔只需 3 個請求。
 let lastQuoteFail = '';       // 供 UI 說明「為什麼沒有即時價」
+// MIS 直連能力偵測：所有請求都經由同一個 Vercel IP 出去，是限流的根本原因。
+// 若瀏覽器能直連（對方允許 CORS），每位使用者用自己的 IP，限流問題自然消失。
+// 只試一次並記住結果，避免每 15 秒浪費一個必失敗的請求。
+async function misDirectFetch(url, timeout = 6000) {
+  const flag = localStorage.getItem('mis-direct');
+  if (flag === 'no') return null;
+  const res = await fetchWithTimeout(url, timeout);
+  if (!res) { if (flag !== 'yes') localStorage.setItem('mis-direct', 'no'); return null; }
+  try {
+    const j = await res.json();
+    if (j?.msgArray) { localStorage.setItem('mis-direct', 'yes'); return j; }
+  } catch {}
+  if (flag !== 'yes') localStorage.setItem('mis-direct', 'no');
+  return null;
+}
+
+// FinMind：台灣本土開放資料 API，註冊即可取得免費 token。
+// 關鍵優勢：額度綁在使用者自己的 token 上，不與其他人共用 IP 額度。
+// 未設定 token 時完全不啟用（不猜、不偷跑）。
+function finmindToken() { return (localStorage.getItem('finmind-token') || '').trim(); }
+
+async function fetchFinMindQuotes(ids, limit = 12) {
+  const token = finmindToken();
+  if (!token || !ids?.length) return {};
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' }); // YYYY-MM-DD
+  const out = {};
+  await Promise.all(ids.slice(0, limit).map(async id => {
+    const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPriceTick`
+      + `&data_id=${encodeURIComponent(id)}&start_date=${today}&token=${encodeURIComponent(token)}`;
+    let j = null;
+    try {
+      const res = await fetchWithTimeout(url, 8000);   // FinMind 支援 CORS → 由使用者瀏覽器直連
+      if (res) j = await res.json();
+    } catch {}
+    const rows = Array.isArray(j?.data) ? j.data : null;
+    if (!rows?.length) return;
+    const last = rows[rows.length - 1];
+    const px = Number(last.deal_price ?? last.close ?? last.price);
+    if (!isFinite(px) || px <= 0) return;
+    const prices = rows.map(r => Number(r.deal_price ?? r.close ?? r.price)).filter(v => isFinite(v) && v > 0);
+    const vol = rows.reduce((a, r) => a + (Number(r.volume) || 0), 0);
+    out[id] = {
+      price: px, open: prices[0], high: Math.max(...prices), low: Math.min(...prices),
+      prevClose: null, cumVol: Math.round(vol),
+      time: String(last.Time || last.time || '').slice(0, 8),
+      date: today.replace(/-/g, ''), src: 'finmind',
+    };
+  }));
+  return out;
+}
+
 async function fetchRealtimeBatch(ids) {
   const list = [...new Set(ids)].filter(id => /^\d{4,6}[A-Z]?$/.test(id));
   if (!list.length) return {};
@@ -1595,7 +1646,8 @@ async function fetchRealtimeBatch(ids) {
       return `${otc ? 'otc' : 'tse'}_${id}.tw`;
     }).join('|');
     const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(ch)}&json=1&delay=0&_=${Date.now()}`;
-    const j = await proxyFetch(url, 8000).catch(() => null);
+    let j = await misDirectFetch(url, 6000).catch(() => null);   // 先用使用者自己的 IP 直連
+    if (!j) j = await proxyFetch(url, 8000).catch(() => null);    // 不支援 CORS 才走共用代理
     if (j) anyResponse = true;
     if (j?.msgArray?.length) anyRows = true;
     for (const m of j?.msgArray || []) {
