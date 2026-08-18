@@ -334,6 +334,31 @@ async function runScan() {
     }
   }
 
+  // 資料過期重抓：有資料但停在數個交易日前者，清當月快取後強制重抓
+  const stale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
+  if (stale.length) {
+    setScanProgress(99, `重抓 ${stale.length} 檔過期資料...`);
+    for (const s of stale.slice(0, 30)) {
+      try {
+        clearCurrentMonthCache(s.id);
+        const ohlcv = await fetchStockOHLCV(s.id, currentTF, currentTF === '1d' ? '6mo' : '2y');
+        if (ohlcv.length >= 20) {
+          s.ohlcv = ohlcv;
+          s.analysis = calculateScore(ohlcv);
+          s.reversal = detectReversal(ohlcv, s.analysis);
+          delete s._verdict;
+        }
+      } catch {}
+    }
+    const stillStale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
+    stillStale.forEach(s => { s._staleDays = dataAgeDays(s); });
+    allStocks.filter(s => !isStaleData(s)).forEach(s => { delete s._staleDays; });
+    if (stillStale.length) {
+      showToast(`⚠ ${stillStale.length} 檔資料仍停留在 ${String(stillStale[0].ohlcv[stillStale[0].ohlcv.length-1].time).slice(5)} 前後`
+        + `（${stillStale.slice(0, 4).map(x => x.name).join('、')}${stillStale.length > 4 ? '…' : ''}）—— 這些股票已停止提供評分與建議`, 'error');
+    }
+  }
+
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
   const lu = document.getElementById('last-updated');
@@ -1124,6 +1149,32 @@ function renderMarketIndex(data) {
     </div>`;
 }
 
+
+// ── 資料新鮮度：日 K 落後幾個交易日 ────────────────────────────────────────
+// 為什麼需要：當月 STOCK_DAY 請求失敗時，過去月份仍有 7 天快取，
+// 於是資料停在上個月底卻「有資料」，既不會被重試、也照樣拿去算分數與給建議。
+function tradingDaysBetween(fromISO, toISO) {
+  if (!fromISO || !toISO || fromISO >= toISO) return 0;
+  let n = 0;
+  const d = new Date(`${fromISO}T00:00:00Z`), end = new Date(`${toISO}T00:00:00Z`);
+  while (d < end) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const w = d.getUTCDay();
+    if (w !== 0 && w !== 6) n++;
+  }
+  return n;
+}
+
+function dataAgeDays(s) {
+  if (!s?.ohlcv?.length) return null;
+  const last = String(s.ohlcv[s.ohlcv.length - 1].time).slice(0, 10);
+  return tradingDaysBetween(last, twClock().date);
+}
+
+// 資料落後 3 個交易日以上即視為過期：分數與建議都不該再採信
+const STALE_LIMIT = 3;
+function isStaleData(s) { const n = dataAgeDays(s); return n != null && n >= STALE_LIMIT; }
+
 // ── 權威研判：全站唯一結論來源 ─────────────────────────────────────────────
 // 過去有三套獨立評分並存 —— 排名頁用 calculateScore（純技術）、交易員視角與
 // AI 研判用 buildManagerAnalysis（證據加權，含籌碼／基本面／趨勢引擎／新聞）、
@@ -1132,6 +1183,10 @@ function renderMarketIndex(data) {
 // 五維度僅用於「推薦與否」的額外門檻，不再影響方向判定。
 function getVerdict(s) {
   if (!s?.analysis) return null;
+  // 資料過期就不該再給方向與分數 —— 用三週前的 K 線算出「強勢多頭」會誤導決策
+  if (s._staleDays >= STALE_LIMIT)
+    return { score: 50, signal: '資料過期', dir: 0, stance: '資料過期',
+             stanceColor: 'var(--yellow)', agr: 0, conf: 0, m: null, stale: s._staleDays };
   if (s._verdict && s._verdictOf === s.analysis) return s._verdict;
   // 再入防護：研判的任何輸入若不慎回頭呼叫本函式，退回技術分而非無限遞迴
   if (s._verdictBusy) return { score: s.analysis.score, signal: s.analysis.signal, dir: 0,
@@ -2645,6 +2700,12 @@ function quoteStampHTML(s) {
   if (barDate === today) return `● 今日 ${isMarketOpenTW() ? '盤中' : '收盤'}價`;
   if (barDate) {
     const md = barDate.slice(5).replace('-', '/');
+    const age = dataAgeDays(s);
+    if (age >= STALE_LIMIT) {
+      return `<span style="color:var(--bear);font-weight:700">⚠ 資料停留在 ${md}（落後 ${age} 個交易日）— 已停止提供評分與建議</span>`
+        + ` <button class="btn-ghost" style="padding:0 6px;font-size:0.6rem" onclick="retryStock('${s.id}')">重抓</button>`
+        + (_liveFail ? `<br><span style="color:var(--text3);font-size:0.62rem">${_liveFail}</span>` : '');
+    }
     const why = _liveFail ? `<br><span style="color:var(--text3);font-size:0.62rem">${_liveFail}</span>` : '';
     const btn = isMarketOpenTW()
       ? ` <button class="btn-ghost" style="padding:0 6px;font-size:0.6rem" onclick="retryLiveQuotes()">重試</button>` : '';
@@ -3724,6 +3785,7 @@ let _liveBusy = false;
 let _lastQuoteTime = '';
 let _liveStatus = '';          // 供導覽列顯示：報價時間或失敗原因
 let _liveFail = '';            // 失敗的具體原因（顯示在價格旁，手機也看得到）
+let _liveFailStreak = 0;       // 連續失敗次數，用於自動清熔斷器重連
 const _liveQuotes = {};        // 最近一次成功的即時報價（掃描重建 allStocks 後用來復原）
 
 // 把即時報價套進一檔股票（掃描重建物件後也會呼叫，避免價格倒退回快取值）
@@ -3778,6 +3840,12 @@ async function refreshLivePrices() {
     if (!Object.keys(map).length) {               // 靜默失敗是先前查不出問題的原因，改為明示
       _liveFail = `${lastQuoteFail || 'MIS 無回應'}；Yahoo 分鐘線亦無資料${srcDead('yahoo') ? '（Yahoo 限流中）' : ''}`;
       _liveStatus = '即時報價無回應';
+      // 自動恢復：連續失敗到一定次數就自行清熔斷器重試一次，
+      // 不必等使用者手動按「重試」（先前必須手動介入才會恢復）
+      if (++_liveFailStreak % 4 === 0) {
+        try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
+        _liveStatus = '即時報價重連中...';
+      }
       renderLiveTick();
       return 0;
     }
@@ -3792,7 +3860,7 @@ async function refreshLivePrices() {
         n++;
       }
     }
-    if (n) { _lastQuoteTime = latest; _liveFail = ''; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
+    if (n) { _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
     else _liveStatus = '報價非今日（休市或收盤）';
     renderLiveTick();
     return n;
@@ -3835,8 +3903,36 @@ function renderLiveTick() {
   } catch (e) { console.warn('即時重繪失敗:', e); }
 }
 
+// 單檔重抓歷史資料（資料過期時使用）
+async function retryStock(id) {
+  const s = allStocks.find(x => x.id === id);
+  if (!s) return;
+  showToast(`重新抓取 ${s.name} 的歷史資料...`, 'info');
+  try {
+    clearCurrentMonthCache(id);
+    try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
+    const ohlcv = await fetchStockOHLCV(id, currentTF, currentTF === '1d' ? '6mo' : '2y');
+    if (ohlcv.length >= 20) {
+      s.ohlcv = ohlcv;
+      s.analysis = calculateScore(ohlcv);
+      s.reversal = detectReversal(ohlcv, s.analysis);
+      delete s._verdict;
+      const age = dataAgeDays(s);
+      if (age >= STALE_LIMIT) { s._staleDays = age; showToast(`仍只取得到 ${String(ohlcv[ohlcv.length-1].time).slice(5)} 的資料（落後 ${age} 個交易日）`, 'error'); }
+      else { delete s._staleDays; showToast(`已更新至 ${String(ohlcv[ohlcv.length-1].time).slice(5)}`, 'success'); }
+      renderStockDetail(s);
+    } else showToast('仍無法取得歷史資料，稍後自動重試', 'error');
+  } catch (e) { showToast(`重抓失敗：${e?.message || e}`, 'error'); }
+}
+
 // 手動重試即時報價：清掉熔斷器與報價快取後強制重抓，並把結果直接顯示出來
+let _retryBusy = false;
 async function retryLiveQuotes() {
+  if (_retryBusy) return;                       // 連按不重複觸發（原本會疊出一整排提示）
+  _retryBusy = true;
+  try { await _retryLiveQuotesInner(); } finally { _retryBusy = false; }
+}
+async function _retryLiveQuotesInner() {
   try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
   Object.keys(localStorage).filter(k => k.startsWith('cache:ohlcv:')).forEach(k => localStorage.removeItem(k));
   showToast('重新取得即時報價中...', 'info');
@@ -5314,6 +5410,7 @@ async function detectWhales() {
   let bookProbes = 0;
 
   for (const s of ready) {
+    if (s._staleDays >= STALE_LIMIT) continue;   // 資料過期不列大戶訊號
     const a = s.analysis;
     const bars = s.ohlcv;
     const last = bars[bars.length - 1];
@@ -6068,6 +6165,7 @@ function computeDayTradePicks() {
   const out = [];
   for (const s of ready) {
     if (s._alert) continue;                      // 注意/處置股不當沖
+    if (s._staleDays >= STALE_LIMIT) continue;   // 資料過期不當沖
     const a = s.analysis;
     const bars = s.ohlcv;
     const last = bars[bars.length - 1];
@@ -6257,6 +6355,7 @@ function computeEntrySignals() {
   const mktNow = Math.round(outlookData.norm ?? 0);
   const picks = [];
   for (const s of ready) {
+    if (s._staleDays >= STALE_LIMIT) continue;       // 資料過期不推薦
     const m = buildManagerAnalysis(s);
     if (!m || m.dir < 3) continue;                   // 只推研判強度足夠者
     const p = buildEntryPlan(s, m);

@@ -397,6 +397,18 @@ async function fetchTWSEMonth(stockId, year, month) {
   return bars;
 }
 
+// 清掉當月日線快取，強制重抓 —— 當月資料失敗時，過去月份仍有 7 天快取，
+// 會造成「資料停在上個月底」卻不會被重試（實際發生過：停在 07/31）
+function clearCurrentMonthCache(stockId) {
+  const now = new Date();
+  const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+  try {
+    localStorage.removeItem(`cache:sd:${stockId}:${ym}`);
+    localStorage.removeItem(`cache:td:${stockId}:${ym}`);
+    Object.keys(localStorage).filter(k => k.startsWith(`cache:ohlcv:${stockId}`)).forEach(k => localStorage.removeItem(k));
+  } catch {}
+}
+
 // 抓最近 N 個月併成連續日線（預設 7 個月 ≈ 140 根，足夠 EMA50/RSI/MACD/ADX）
 async function fetchTWSEHistory(stockId, months = 14) {
   const now = new Date();
