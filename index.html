@@ -214,6 +214,16 @@
         <div id="weekly-brief-body" style="margin-top:10px"><div class="adv-loading">掃描完成後生成本週佈局...</div></div>
       </div>
 
+      <!-- 當日訊號流水帳 -->
+      <div class="market-outlook-card">
+        <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+          <h3 style="font-size:0.88rem;font-weight:600;color:var(--text2);margin:0">🧾 當日訊號流水帳</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">系統今天實際發出的每一則訊號，依時間排序</span>
+          <button class="btn-ghost" style="margin-left:auto;padding:3px 12px;font-size:0.7rem" onclick="clearSignalLog()">清空今日</button>
+        </div>
+        <div id="signal-log-body" style="margin-top:10px"><div class="adv-loading">今日尚無訊號紀錄</div></div>
+      </div>
+
       <!-- 市場多空總覽 -->
       <div class="market-outlook-card">
         <div id="market-outlook-body"><div class="adv-loading">載入市場多空分析...</div></div>

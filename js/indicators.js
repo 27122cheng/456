@@ -292,6 +292,124 @@ function detectBreakout(bars) {
   return null;
 }
 
+// ── Order Block（訂單塊）──────────────────────────────────────────────────
+// 定義：造成結構突破的那段急拉／急殺之前，最後一根「反向」K 棒。
+// 意義：那根 K 是大單建倉的痕跡 —— 價格回測該區間時常有反應，
+// 比均線這類平滑值更貼近「哪個價位真的有掛單」。
+// 未被回補（unmitigated）的 OB 才有效，被吃掉過就失去意義。
+function detectOrderBlocks(ohlcv, opts = {}) {
+  const empty = { list: [], support: null, resist: null, fresh: null };
+  if (!ohlcv || ohlcv.length < 40) return empty;
+  const n = ohlcv.length;
+  const look = Math.min(opts.lookback ?? 120, n - 5);
+  const start = n - look;
+  const highs = ohlcv.map(b => b.high), lows = ohlcv.map(b => b.low), closes = ohlcv.map(b => b.close);
+
+  // 衝量門檻用 ATR，讓不同價位的商品有一致標準
+  let atr = 0, cnt = 0;
+  for (let i = Math.max(1, n - 14); i < n; i++) {
+    atr += Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i-1]), Math.abs(lows[i] - closes[i-1]));
+    cnt++;
+  }
+  atr = cnt ? atr / cnt : 0;
+  if (!(atr > 0)) return empty;
+
+  const vols = ohlcv.map(b => b.volume || 0);
+  const avgVol = vols.slice(-60).reduce((a, c) => a + c, 0) / Math.min(60, n) || 0;
+  const impulse = (opts.impulseATR ?? 1.5) * atr;
+  const out = [];
+
+  for (let i = start + 10; i < n - 3; i++) {
+    const fwdHi = Math.max(highs[i+1], highs[i+2], highs[i+3]);
+    const fwdLo = Math.min(lows[i+1], lows[i+2], lows[i+3]);
+    const priorHi = Math.max(...highs.slice(i - 10, i + 1));
+    const priorLo = Math.min(...lows.slice(i - 10, i + 1));
+
+    // 向上衝量且突破前高 → 找這波之前最後一根陰線＝多方 OB
+    if (fwdHi - closes[i] >= impulse && fwdHi > priorHi) {
+      for (let j = i; j >= Math.max(start, i - 3); j--) {
+        if (ohlcv[j].close < ohlcv[j].open) {
+          out.push({ type: 'bull', i: j, time: ohlcv[j].time,
+            bottom: +lows[j].toFixed(4), top: +highs[j].toFixed(4),
+            volRatio: avgVol ? +(vols[j] / avgVol).toFixed(2) : null });
+          break;
+        }
+      }
+    }
+    // 向下衝量且跌破前低 → 找這波之前最後一根陽線＝空方 OB
+    if (closes[i] - fwdLo >= impulse && fwdLo < priorLo) {
+      for (let j = i; j >= Math.max(start, i - 3); j--) {
+        if (ohlcv[j].close > ohlcv[j].open) {
+          out.push({ type: 'bear', i: j, time: ohlcv[j].time,
+            bottom: +lows[j].toFixed(4), top: +highs[j].toFixed(4),
+            volRatio: avgVol ? +(vols[j] / avgVol).toFixed(2) : null });
+          break;
+        }
+      }
+    }
+  }
+
+  // 去重（同一根 K 可能被多次判定）
+  const seen = new Set();
+  const uniq = out.filter(o => { const k = `${o.type}:${o.i}`; if (seen.has(k)) return false; seen.add(k); return true; });
+
+  // 回補判定：之後任一根 K 觸及區間即視為已被吃掉
+  const live = uniq.filter(o => {
+    for (let k = o.i + 4; k < n; k++) {
+      if (lows[k] <= o.top && highs[k] >= o.bottom) return false;
+    }
+    return true;
+  });
+
+  const price = closes[n-1];
+  const support = live.filter(o => o.type === 'bull' && o.top <= price)
+    .sort((a, b) => b.top - a.top)[0] || null;
+  const resist = live.filter(o => o.type === 'bear' && o.bottom >= price)
+    .sort((a, b) => a.bottom - b.bottom)[0] || null;
+  const fresh = live.filter(o => o.i >= n - 10).sort((a, b) => b.i - a.i)[0] || null;
+  return { list: live.slice(-6), support, resist, fresh };
+}
+
+// ── 成交量分佈（Volume Profile）────────────────────────────────────────────
+// 一般成交量圖是「按時間」，這裡是「按價格」：哪個價位真正換手最多。
+// POC（最大量價位）具磁吸效果；價值區（70% 成交量）之上／之下是常見的偏多／偏空判準。
+function volumeProfile(ohlcv, lookback = 60, bins = 24) {
+  if (!ohlcv || ohlcv.length < 20) return null;
+  const win = ohlcv.slice(-lookback);
+  const hi = Math.max(...win.map(b => b.high));
+  const lo = Math.min(...win.map(b => b.low));
+  if (!(hi > lo)) return null;
+  const step = (hi - lo) / bins;
+  const vol = new Array(bins).fill(0);
+  for (const b of win) {
+    const a = Math.max(0, Math.min(bins - 1, Math.floor((b.low - lo) / step)));
+    const z = Math.max(0, Math.min(bins - 1, Math.floor((b.high - lo) / step)));
+    const share = (b.volume || 0) / (z - a + 1);
+    for (let k = a; k <= z; k++) vol[k] += share;
+  }
+  const total = vol.reduce((a, c) => a + c, 0);
+  if (!(total > 0)) return null;
+
+  let poc = 0;
+  for (let k = 1; k < bins; k++) if (vol[k] > vol[poc]) poc = k;
+  let a = poc, z = poc, acc = vol[poc];
+  while (acc < total * 0.7 && (a > 0 || z < bins - 1)) {
+    const nz = z < bins - 1 ? vol[z + 1] : -1;
+    const na = a > 0 ? vol[a - 1] : -1;
+    if (nz >= na) { z++; acc += vol[z]; } else { a--; acc += vol[a]; }
+  }
+  const price = win[win.length - 1].close;
+  const val = +(lo + step * a).toFixed(4);
+  const vah = +(lo + step * (z + 1)).toFixed(4);
+  const pocPrice = +(lo + step * (poc + 0.5)).toFixed(4);
+  return {
+    poc: pocPrice, vah, val,
+    position: price > vah ? 'above' : price < val ? 'below' : 'inside',
+    pocDist: +((price - pocPrice) / price * 100).toFixed(2),
+    coverage: +(acc / total * 100).toFixed(0),
+  };
+}
+
 // ── ZigZag 擺動點（ATR 自適應門檻）────────────────────────────────────────
 // 固定視窗的分形擺動會把雜訊小波動當轉折 → HH/HL 判定被污染。
 // 改用「反轉幅度須超過 max(2×ATR, 3%)」的 ZigZag：只留真正的波段轉折。
@@ -868,6 +986,8 @@ function calculateScore(ohlcv) {
   const gaps = detectGaps(ohlcv);
   const falseBreak = detectFalseBreak(ohlcv);
   const trend = classifyTrend(ohlcv);
+  const ob = detectOrderBlocks(ohlcv);
+  const vp = volumeProfile(ohlcv);
   const maStruct = maStructure(closes[closes.length - 1], ema20, ema50, ema200, ema20arr);
   const brk = detectBreakout(ohlcv);
 
@@ -988,7 +1108,7 @@ function calculateScore(ohlcv) {
 
   return { score, signal, reasons, ema20, ema50, ema200, rsi, macd, adx, volMA, boll, stoch,
            diverg, squeeze, structure, candles, rsiDiv, pattern, fib, risk, vpRegime,
-           vForce, pctile, paCtx, gaps, falseBreak, trend, maStruct, brk, price, prevClose, lastVol };
+           vForce, pctile, paCtx, gaps, falseBreak, trend, maStruct, brk, ob, vp, price, prevClose, lastVol };
 }
 
 // ── Trading Setup ─────────────────────────────────────────────────────────

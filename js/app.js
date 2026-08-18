@@ -406,6 +406,7 @@ async function runScan() {
   after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
   after('價格警報', checkAlerts);
   after('本週開盤佈局', () => { renderWeeklyBrief(); });
+  after('訊號流水帳', () => { renderSignalLog(); });
   after('Telegram 推送', () => {
     // 盤後總結（約 16:30 法人資料出爐後，一天一則）
     notifyAfterClose();
@@ -1181,7 +1182,15 @@ function recomputeAnalysis(s) {
     s.reversal = detectReversal(s.ohlcv, next);
     if (!next.prevClose && prev?.prevClose) next.prevClose = prev.prevClose;
     s._anaPrice = next.price;                   // 記錄重算當下的價格，供漲跌幅門檻判斷
+    const prevStance = s._verdict?.stance, prevDir = s._verdict?.dir;
     delete s._verdict;                          // 研判必須跟著重算
+    // 即時價帶動研判翻轉（多↔空）時記一筆流水帳 —— 盤中最需要被看見的變化
+    if (prevStance) {
+      const v = getVerdict(s);
+      if (v && v.stance !== prevStance && Math.sign(v.dir) !== Math.sign(prevDir) && Math.sign(v.dir) !== 0)
+        logSignal('flip', `${s.name}（${s.id}）研判由「${prevStance}」轉為「${v.stance}」`,
+          `現價 ${next.price}｜綜合 ${v.score}`, { id: s.id, dir: Math.sign(v.dir), dedupKey: `${s.id}|${v.stance}` });
+    }
     return true;
   } catch (e) { console.warn(`重算分析失敗 ${s.id}:`, e); return false; }
 }
@@ -1932,6 +1941,40 @@ function buildManagerAnalysis(s) {
     if (a.gaps.recent.type === 'up' && volR >= 1.5) add(0.8, 1, `帶量向上跳空缺口（${a.gaps.recent.bottom}~${a.gaps.recent.top}）未回補 — 突破缺口特徵`);
     else if (a.gaps.recent.type === 'down' && volR >= 1.5) add(0.8, -1, `帶量向下跳空缺口未回補 — 逃逸缺口特徵，趨勢轉弱`);
   }
+  // Order Block：未被回補的大單建倉痕跡，比均線更貼近「哪個價位真的有掛單」
+  // 只有貼近現價（5% 內）才計權重 — 太遠的 OB 這筆交易碰不到
+  if (a.ob) {
+    const obS = a.ob.support, obR = a.ob.resist;
+    if (obS && price > 0) {
+      const d = (price - obS.top) / price * 100;
+      if (d <= 5) add(d <= 2 ? 1.2 : 0.7, 1,
+        `下方 ${obS.bottom}~${obS.top} 為未回補多方訂單塊（距現價 ${d.toFixed(1)}%${obS.volRatio >= 1.5 ? `，成交量 ${obS.volRatio} 倍` : ''}）`);
+      else notes.push(`多方訂單塊在 ${obS.bottom}~${obS.top}（距現價 ${d.toFixed(1)}%，暫時無關）`);
+    }
+    if (obR && price > 0) {
+      const d = (obR.bottom - price) / price * 100;
+      if (d <= 5) add(d <= 2 ? 1.2 : 0.7, -1,
+        `上方 ${obR.bottom}~${obR.top} 為未回補空方訂單塊（距現價 ${d.toFixed(1)}%，反壓區）`);
+      else notes.push(`空方訂單塊在 ${obR.bottom}~${obR.top}（距現價 ${d.toFixed(1)}%，暫時無關）`);
+    }
+    if (a.ob.fresh)
+      notes.push(`近 10 日新生成${a.ob.fresh.type === 'bull' ? '多' : '空'}方訂單塊 ${a.ob.fresh.bottom}~${a.ob.fresh.top} — 尚未測試`);
+  }
+
+  // 成交量分佈：價值區之上／之下是換手結構的多空分界，POC 具磁吸效果
+  if (a.vp) {
+    if (a.vp.position === 'above')
+      add(0.9, 1, `價格站上 60 日價值區上緣 ${a.vp.vah}（換手結構偏多，VAL ${a.vp.val}）`);
+    else if (a.vp.position === 'below')
+      add(0.9, -1, `價格跌破 60 日價值區下緣 ${a.vp.val}（換手結構偏空，VAH ${a.vp.vah}）`);
+    else
+      notes.push(`價格位於價值區 ${a.vp.val}~${a.vp.vah} 內（區間震盪，等突破再表態）`);
+    if (Math.abs(a.vp.pocDist) <= 1.5)
+      notes.push(`貼近最大量價位 POC ${a.vp.poc} — 多空成本密集區，易來回洗盤`);
+    else
+      notes.push(`最大量價位 POC ${a.vp.poc}（現價${a.vp.pocDist > 0 ? '高於' : '低於'} ${Math.abs(a.vp.pocDist)}%），回測時具磁吸力`);
+  }
+
   if (a.vpRegime) {
     if (a.vpRegime.dir === 1) add(0.5, 1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
     else if (a.vpRegime.dir === -1) add(0.5, -1, `${a.vpRegime.k}：${a.vpRegime.txt}`);
@@ -2214,6 +2257,10 @@ function buildEntryPlan(s, m) {
     stopBasis.push(`保留 ${((lo - stop) / atr).toFixed(1)}×ATR 緩衝，避免日常波動誤觸`);
   }
   if (a.ema50 && stop < a.ema50) stopBasis.push('位於季線之下，跌破即中期轉弱');
+  // 訂單塊支撐：停損若已在多方 OB 之下，代表「大單建倉區被吃掉」才認賠，邏輯更乾淨
+  if (a.ob?.support) stopBasis.push(stop < a.ob.support.bottom
+    ? `低於多方訂單塊 ${a.ob.support.bottom}~${a.ob.support.top}（該區大單被吃光才停損）`
+    : `⚠ 停損落在多方訂單塊 ${a.ob.support.bottom}~${a.ob.support.top} 之內，易被該區震盪掃出`);
 
   // ── 止盈：先找上方是否存在真實壓力，沒有就續抱 ──
   const r = lo - stop;
@@ -2231,6 +2278,10 @@ function buildEntryPlan(s, m) {
   if (priorHi20 > price * 1.015) resList.push({ v: +priorHi20.toFixed(2), why: '前 20 日高點' });
   if (priorHi60 > price * 1.015) resList.push({ v: +priorHi60.toFixed(2), why: '前 3 個月高點' });
   if (a.boll?.upper > price * 1.015) resList.push({ v: +a.boll.upper.toFixed(2), why: '布林上軌' });
+  // 訂單塊與成交量分佈：真實有掛單／有換手的價位，比純圖形壓力更貼近實際賣壓
+  if (a.ob?.resist && a.ob.resist.bottom > price * 1.015) resList.push({ v: +a.ob.resist.bottom.toFixed(2), why: '空方訂單塊下緣' });
+  if (a.vp?.vah > price * 1.015) resList.push({ v: +a.vp.vah.toFixed(2), why: '價值區上緣 VAH' });
+  if (a.vp?.poc > price * 1.015) resList.push({ v: +a.vp.poc.toFixed(2), why: '最大量價位 POC' });
   resList.sort((x, y) => x.v - y.v);
   // 合併過近的壓力（相差 <1% 視為同一區，避免目標一與目標二顯示同價位）
   const merged = [];
@@ -2656,6 +2707,27 @@ function renderPatterns(s) {
   if (a.gaps?.list?.length) parts.push(card('🕳 未回補跳空缺口',
     a.gaps.list.slice(-3).map(g => `${g.type === 'up' ? '⬆ 上跳' : '⬇ 下跳'} ${g.bottom} ~ ${g.top}<span style="font-size:0.72rem;color:var(--text3)">（${g.time}${g.type === 'up' ? '，回測此區有支撐' : '，反彈至此區有壓力'}）</span>`).join('<br>'),
     'var(--blue)'));
+  if (a.ob?.list?.length) {
+    const pr = a.price;
+    const row = o => {
+      const d = pr > 0 ? (o.type === 'bull' ? (pr - o.top) / pr * 100 : (o.bottom - pr) / pr * 100) : null;
+      return `<strong style="color:${tone(o.type === 'bull' ? 1 : -1)}">${o.type === 'bull' ? '多方 OB' : '空方 OB'}</strong> ` +
+        `<span style="font-family:var(--mono)">${o.bottom} ~ ${o.top}</span>` +
+        `<span style="font-size:0.72rem;color:var(--text3)">（${o.time}${o.volRatio ? `，量 ${o.volRatio} 倍` : ''}` +
+        `${d != null && d >= 0 ? `，距現價 ${d.toFixed(1)}%` : '，現價已在區內'}）</span>`;
+    };
+    const key = [a.ob.support, a.ob.resist].filter(Boolean);
+    const rest = a.ob.list.filter(o => !key.includes(o)).slice(-3);
+    parts.push(card('🧱 訂單塊（Order Block）',
+      [...key, ...rest].map(row).join('<br>') +
+      '<br><span style="font-size:0.72rem;color:var(--text3)">急拉／急殺前最後一根反向 K，是大單建倉痕跡；僅列出尚未被回補的區間，回測到此常有反應</span>',
+      a.ob.support && !a.ob.resist ? tone(1) : a.ob.resist && !a.ob.support ? tone(-1) : tone(0)));
+  }
+  if (a.vp) parts.push(card('🧮 成交量分佈（Volume Profile）',
+    `<strong>${a.vp.position === 'above' ? '價格在價值區之上（換手結構偏多）' : a.vp.position === 'below' ? '價格在價值區之下（換手結構偏空）' : '價格在價值區內（區間震盪）'}</strong>` +
+    `<br><span style="font-family:var(--mono);font-size:0.78rem">VAH ${a.vp.vah}｜POC ${a.vp.poc}｜VAL ${a.vp.val}</span>` +
+    `<br><span style="font-size:0.72rem;color:var(--text3)">近 60 日按「價格」而非「時間」統計成交量：POC 為換手最多的價位，具磁吸效果（現價${a.vp.pocDist > 0 ? '高於' : '低於'} ${Math.abs(a.vp.pocDist)}%）；價值區涵蓋 ${a.vp.coverage}% 成交量</span>`,
+    tone(a.vp.position === 'above' ? 1 : a.vp.position === 'below' ? -1 : 0)));
   if (a.vpRegime) parts.push(card('📶 量價關係', `<strong>${a.vpRegime.k}</strong> — ${a.vpRegime.txt}`, tone(a.vpRegime.dir)));
   if (a.vForce) parts.push(card('⚔️ 多空力道', a.vForce.txt +
     `<br><span style="font-size:0.75rem;color:var(--text3)">上漲 ${a.vForce.upDays} 日 / 下跌 ${a.vForce.dnDays} 日${a.vForce.ratio ? `｜漲日均量為跌日的 ${a.vForce.ratio} 倍` : ''}</span>`,
@@ -4740,6 +4812,87 @@ function renderCustomStocksList() {
 // ── AI 訊號自動紙上追蹤 ─────────────────────────────────────────────────────
 // 每個推薦交易自動建檔追蹤到停損/停利，不用手動操作 —
 // 讓系統累積「自己的訊號實際表現」與止損原因，回饋教訓學習。
+// ── 當日訊號流水帳 ─────────────────────────────────────────────────────────
+// 目的：系統每天到底叫了什麼、幾點叫的，事後要能一條一條對。
+// 沒有這份紀錄，訊號散在 Telegram、推薦頁、大戶偵測各處，回頭檢討時無從還原。
+const SIGLOG_KINDS = {
+  entry:    { icon: '🎯', label: '進場訊號', color: 'var(--bull)' },
+  exit:     { icon: '🚪', label: '出場訊號', color: 'var(--bear)' },
+  whale:    { icon: '🐋', label: '大戶動向', color: 'var(--blue)' },
+  flip:     { icon: '🔄', label: '研判翻轉', color: 'var(--yellow)' },
+  brief:    { icon: '📰', label: '定時簡報', color: 'var(--text2)' },
+  alert:    { icon: '⚠️', label: '風險警示', color: 'var(--bear)' },
+  telegram: { icon: '✉️', label: 'Telegram', color: 'var(--text2)' },
+};
+
+function getSignalLog() {
+  try { return JSON.parse(localStorage.getItem('signal-log') || '[]'); } catch { return []; }
+}
+function saveSignalLog(list) {
+  try { localStorage.setItem('signal-log', JSON.stringify(list.slice(-400))); } catch {}
+}
+
+// dedupKey 相同者當天只記一次（避免每 15 秒即時刷新重覆寫入同一則訊號）
+function logSignal(kind, title, detail = '', opts = {}) {
+  const t = twClock();
+  const time = `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+  const key = opts.dedupKey ? `${t.date}|${kind}|${opts.dedupKey}` : null;
+  const list = getSignalLog();
+  if (key && list.some(x => x.key === key)) return false;
+  list.push({ date: t.date, time, kind, title, detail, key,
+              id: opts.id || null, dir: opts.dir ?? 0 });
+  saveSignalLog(list);
+  if (document.getElementById('signal-log-body')) renderSignalLog();
+  return true;
+}
+
+function todaySignalLog() {
+  const d = twClock().date;
+  return getSignalLog().filter(x => x.date === d);
+}
+
+function clearSignalLog() {
+  const d = twClock().date;
+  saveSignalLog(getSignalLog().filter(x => x.date !== d));
+  renderSignalLog();
+  showToast('已清空今日訊號流水帳', 'success');
+}
+
+function renderSignalLog() {
+  const el = document.getElementById('signal-log-body');
+  if (!el) return;
+  const rows = todaySignalLog();
+  if (!rows.length) {
+    // 沒有紀錄要說清楚是「今天還沒發訊號」，不是「功能壞了」
+    el.innerHTML = '<div style="font-size:0.78rem;color:var(--text3)">今日尚無訊號紀錄 — 系統只在偵測到符合條件的事件時才寫入，空白代表今天還沒有訊號。</div>';
+    return;
+  }
+  const cnt = {};
+  for (const r of rows) cnt[r.kind] = (cnt[r.kind] || 0) + 1;
+  const chips = Object.entries(cnt).map(([k, n]) => {
+    const m = SIGLOG_KINDS[k] || { icon: '•', label: k, color: 'var(--text2)' };
+    return `<span style="display:inline-block;margin:0 6px 4px 0;padding:2px 9px;border-radius:9px;font-size:0.7rem;background:${m.color}1a;color:${m.color}">${m.icon} ${m.label} ${n}</span>`;
+  }).join('');
+
+  el.innerHTML = `
+    <div style="margin-bottom:8px">${chips}</div>
+    <div style="max-height:320px;overflow-y:auto">
+      ${rows.slice().reverse().map(r => {
+        const m = SIGLOG_KINDS[r.kind] || { icon: '•', color: 'var(--text2)' };
+        const c = r.dir > 0 ? 'var(--bull)' : r.dir < 0 ? 'var(--bear)' : m.color;
+        return `<div style="display:flex;gap:9px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+          <span style="font-family:var(--mono);font-size:0.72rem;color:var(--text3);flex:0 0 38px">${r.time}</span>
+          <span style="flex:0 0 18px">${m.icon}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:0.79rem;color:${c};font-weight:600">${r.title}</div>
+            ${r.detail ? `<div style="font-size:0.72rem;color:var(--text3);line-height:1.55">${r.detail}</div>` : ''}
+          </div>
+          ${r.id ? `<button class="btn-ghost" style="padding:1px 8px;font-size:0.68rem;align-self:center" onclick="openStock('${r.id}')">查看</button>` : ''}
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
 function getAiSignals() {
   try { return JSON.parse(localStorage.getItem('ai-signals') || '[]'); } catch { return []; }
 }
@@ -4771,6 +4924,9 @@ function recordAiSignals() {
       },
     });
     added++;
+    logSignal('entry', `${s.name}（${s.id}）符合進場條件`,
+      `建議區 ${p.lo}~${p.hi}｜停損 ${p.stop}｜${p.t1 ? `目標 ${p.t1}` : '無壓力續抱'}｜研判 ${m.stance}`,
+      { id: s.id, dir: 1, dedupKey: s.id });
   }
   if (added) saveAiSignals(list);
 }
@@ -5516,6 +5672,7 @@ function notifyWeeklyBrief() {
   if (localStorage.getItem('tg-weekly') === wk) return;
   const b = buildWeeklyBrief();
   if (!b) return;                                  // 資料未就緒，下輪再試
+  logSignal('brief', '本週開盤佈局已推送', '週一盤前：假日新聞/數據＋美股夜盤＋籌碼綜合佈局建議', { dedupKey: 'weekly' });
   localStorage.setItem('tg-weekly', wk);
   if (!tgWants('sig')) return;
 
@@ -5587,6 +5744,7 @@ function notifyDailyBrief() {
   if (localStorage.getItem('tg-daily-brief') === t.date) return;
   const b = buildDailyBrief();
   if (!b) return;
+  logSignal('brief', '每日市場簡報已推送', '09:00 盤前：大盤研判、多空家數、重點事件', { dedupKey: 'daily' });
   localStorage.setItem('tg-daily-brief', t.date);
   if (!tgWants('sig')) return;
 
@@ -5655,6 +5813,7 @@ function notifyPostOpen() {
   if (marketTradedToday() === false) return;               // 國定假日（無任何盤中成交）
   const b = buildPostOpen();
   if (!b) return;
+  logSignal('brief', '開盤後走勢分析已推送', '09:30：開盤走勢＋新聞數據＋持倉平倉檢查＋今日重點關注', { dedupKey: 'postopen' });
   localStorage.setItem('tg-postopen', t.date);
   if (!tgWants('sig')) return;
 
@@ -5732,6 +5891,7 @@ function notifyAfterClose() {
   if (localStorage.getItem('tg-afterclose') === dataDate) return;
   const b = buildAfterClose();
   if (!b) return;
+  logSignal('brief', '盤後總結已推送', '16:30：收盤結果、法人買賣超、明日觀察重點', { dedupKey: 'afterclose' });
   localStorage.setItem('tg-afterclose', dataDate);
   if (!tgWants('sig')) return;
 
@@ -6011,6 +6171,8 @@ function notifyWhales() {
       r.mktBad ? '⚠ 大盤目前偏空，部位宜保守' : '',
     ].filter(Boolean).join('\n');
     tgPush(`🐋 大戶動向：${r.s.name}(${r.s.id})\n\n${r.sig.map(t => '・' + t).join('\n')}\n\n陷阱檢查：未發現誘多/出貨跡象 ✅\n\n📋 交易分析\n${anal}\n\n⚠ 僅供參考，非投資建議`);
+    logSignal('whale', `${r.s.name}（${r.s.id}）大戶動向（已過陷阱檢查）`,
+      r.sig.join('；'), { id: r.s.id, dir: 1, dedupKey: r.s.id });
     sent.ids.push(r.s.id);
   }
   localStorage.setItem('whale-tg', JSON.stringify(sent));
@@ -6327,6 +6489,9 @@ function showHoldingView(stockId) {
   if (pHi20 > price * 1.01) resSet.push({ v: +pHi20.toFixed(2), why: '前 20 日高點' });
   if (pHi60 > price * 1.01) resSet.push({ v: +pHi60.toFixed(2), why: '前 3 個月高點' });
   if (a.boll?.upper > price * 1.01) resSet.push({ v: +a.boll.upper.toFixed(2), why: '布林上軌' });
+  if (a.ob?.resist && a.ob.resist.bottom > price * 1.01) resSet.push({ v: +a.ob.resist.bottom.toFixed(2), why: '空方訂單塊下緣' });
+  if (a.vp?.vah > price * 1.01) resSet.push({ v: +a.vp.vah.toFixed(2), why: '價值區上緣 VAH' });
+  if (a.vp?.poc > price * 1.01) resSet.push({ v: +a.vp.poc.toFixed(2), why: '最大量價位 POC' });
   resSet.sort((x, y) => x.v - y.v);
   const resMerged = [];
   for (const r0 of resSet) {
@@ -6706,6 +6871,13 @@ function notifyHoldingExits() {
   tgPush(`📋 台股雷達 每日持倉檢查\n${today}\n\n` +
     (exits ? `⚠ 有 ${exits} 檔出現出場訊號\n` : watches ? `留意 ${watches} 檔\n` : '全部續抱，無出場訊號\n') +
     `\n${lines}\n\n⚠ 僅供參考，非投資建議`);
+  for (const r of rows) {
+    if (r.level === 'hold') continue;
+    logSignal(r.level === 'exit' ? 'exit' : 'alert',
+      `${r.h.name}（${r.h.id}）${r.level === 'exit' ? '出現出場訊號' : '需留意'}`,
+      `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%｜${r.reasons.join('；')}`,
+      { id: r.h.id, dir: -1, dedupKey: r.h.id });
+  }
   localStorage.setItem('tg-holdings-date', dataDate);
 }
 
@@ -8101,5 +8273,6 @@ function rsiClass(rsi) {
 
 document.addEventListener('DOMContentLoaded', () => {
   animateBar();
+  renderSignalLog();   // 流水帳存在 localStorage，掃描完成前就能看到今天已發過的訊號
   setTimeout(initApp, 600);
 });
