@@ -384,6 +384,7 @@ async function runScan() {
   after('結算預測', resolvePredictions);
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
+  after('分析基準價', () => { allStocks.forEach(s => { if (s.analysis) s._anaPrice = s.analysis.price; }); });
   after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); });
@@ -1149,6 +1150,44 @@ function renderMarketIndex(data) {
     </div>`;
 }
 
+
+
+// ── 即時價流入完整分析 ─────────────────────────────────────────────────────
+// 先前只更新 analysis.price，指標（RSI/MACD/EMA/ADX/趨勢/型態）與研判評分
+// 仍停在掃描當下 —— 價格是即時的，結論卻是舊的。
+// 這裡以更新後的 K 棒重算整份分析，研判快取因物件更換而自動失效。
+function recomputeAnalysis(s) {
+  if (!s?.ohlcv || s.ohlcv.length < 20) return false;
+  try {
+    const prev = s.analysis;
+    const next = calculateScore(s.ohlcv);
+    // 重算結果不完整就保留原分析 —— 寧可指標稍舊，也不能讓整份分析消失
+    if (!next || next.price == null) return false;
+    s.analysis = next;
+    s.reversal = detectReversal(s.ohlcv, next);
+    if (!next.prevClose && prev?.prevClose) next.prevClose = prev.prevClose;
+    s._anaPrice = next.price;                   // 記錄重算當下的價格，供漲跌幅門檻判斷
+    delete s._verdict;                          // 研判必須跟著重算
+    return true;
+  } catch (e) { console.warn(`重算分析失敗 ${s.id}:`, e); return false; }
+}
+
+// 決定哪些股票需要重算：正在檢視的、持倉、追蹤中的訊號一定重算；
+// 其餘只在價格較上次重算變動 >=0.2% 時才重算（避免每 15 秒空轉 100 檔）
+function pickRecomputeTargets(updated, cap = 40) {
+  const must = new Set([currentStockId,
+    ...getHoldings().map(h => h.id),
+    ...getAiSignals().filter(t => t.status === 'open').map(t => t.id)].filter(Boolean));
+  const moved = [];
+  for (const s of updated) {
+    if (must.has(s.id)) continue;
+    const base = s._anaPrice;
+    const d = base > 0 ? Math.abs(s.analysis.price - base) / base : 1;
+    if (d >= 0.002) moved.push({ s, d });
+  }
+  moved.sort((a, b) => b.d - a.d);
+  return [...updated.filter(s => must.has(s.id)), ...moved.slice(0, Math.max(0, cap - must.size)).map(x => x.s)];
+}
 
 // ── 資料新鮮度：日 K 落後幾個交易日 ────────────────────────────────────────
 // 為什麼需要：當月 STOCK_DAY 請求失敗時，過去月份仍有 7 天快取，
@@ -3851,16 +3890,23 @@ async function refreshLivePrices() {
     }
     const today = twClock().date;
     let n = 0, latest = '';
+    const touched = [];
     for (const s of allStocks) {
       const q = map[s.id];
       if (!q) continue;
       if (applyLiveQuote(s, q, today)) {
         _liveQuotes[s.id] = q;
         if (q.time > latest) latest = q.time;
+        touched.push(s);
         n++;
       }
     }
-    if (n) { _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
+    if (n) {
+      _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0;
+      _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
+      // 關鍵：讓即時價真正進入指標與研判，而不只是換掉畫面上的數字
+      for (const s of pickRecomputeTargets(touched)) recomputeAnalysis(s);
+    }
     else _liveStatus = '報價非今日（休市或收盤）';
     renderLiveTick();
     return n;
@@ -3886,6 +3932,13 @@ function renderLiveTick() {
     else if (currentPage === 'dashboard') renderDashboard();
     else if (currentPage === 'stock' && currentStockId) {
       const s = allStocks.find(x => x.id === currentStockId);
+      // 決策相關面板（交易員視角、AI 研判與進場計畫、型態）也要跟著即時價更新，
+      // 否則價格跳動但「該怎麼做」還停在掃描當下。圖表不重繪以免打斷檢視。
+      if (s?.analysis) {
+        try { renderTraderView(s); } catch {}
+        try { renderPatterns(s); } catch {}
+        try { renderAnalysisPanels(s, s._inst || null); } catch {}
+      }
       const pe = document.getElementById('stock-price');
       if (s?.analysis && pe) {
         pe.textContent = s.analysis.price.toFixed(2);
