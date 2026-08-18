@@ -219,10 +219,12 @@ function tsToLabel(ts, interval) {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 }
 
-async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo') {
+async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo', opts = {}) {
   const key = `cache:ohlcv:${symbol}:${interval}:${range}`;
-  // Yahoo 整體被限流時直接跳過，不必每檔股票都重試（省下大量等待）
-  if (srcDead('yahoo')) return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
+  // Yahoo 整體被限流時直接跳過，不必每檔股票都重試（省下大量等待）。
+  // opts.force：即時報價備援用 —— 只針對少數重點標的，值得繞過熔斷器再試一次，
+  // 否則「Yahoo 掛掉時的備援」在 Yahoo 被標記掛掉時永遠不會執行（先前的實際缺陷）。
+  if (srcDead('yahoo') && !opts.force) return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
   // 日線盤中只有最後一根 K 會變 → 10 分鐘快取；分鐘級變動快 → 2 分鐘
   const ttl = isIntradayTF(interval) ? 2 * 60 * 1000
             : (interval === '1d' || interval === '1wk') ? 10 * 60 * 1000 : CACHE_TTL;
@@ -578,8 +580,8 @@ let _dayAllResolved = null;
 const _ohlcvInflight = new Map(); // 同一檔同時被多處請求時只發一次
 const ohlcvFailReason = {};       // 掃描失敗原因（stockId → 說明文字），供 UI 呈現
 
-async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
-  const ikey = `${stockId}:${interval}:${range}`;
+async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {}) {
+  const ikey = `${stockId}:${interval}:${range}${opts.force ? ':f' : ''}`;
   if (_ohlcvInflight.has(ikey)) return _ohlcvInflight.get(ikey);
   const task = (async () => {
     // 記住哪些股票是上櫃（.TWO），下次直接抓對的，不用先等 .TW 失敗
@@ -587,12 +589,12 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo') {
     const knownSuffix = localStorage.getItem(suffixKey);
     let ohlcv = [];
     if (knownSuffix === 'TWO') {
-      ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
+      ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
     }
     if (!ohlcv.length) {
-      ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range);
+      ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range, opts);
       if (!ohlcv.length) {
-        const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range);
+        const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
         if (two.length) localStorage.setItem(suffixKey, 'TWO');
         ohlcv = two;
       }
@@ -1262,9 +1264,11 @@ async function fetchRealtimeQuote(stockId) {
 // 為什麼需要：STOCK_DAY_ALL 是「盤後收盤行情」，盤中取得的是昨日收盤；
 // Yahoo 日線快取 10 分鐘且對雲端 IP 常限流 —— 兩者都無法即時。
 // MIS 支援一次查多檔（ex_ch 以 | 分隔），因此 100 檔只需 3 個請求。
+let lastQuoteFail = '';       // 供 UI 說明「為什麼沒有即時價」
 async function fetchRealtimeBatch(ids) {
   const list = [...new Set(ids)].filter(id => /^\d{4,6}[A-Z]?$/.test(id));
   if (!list.length) return {};
+  let anyResponse = false, anyRows = false;
   const chunks = [];
   for (let i = 0; i < list.length; i += 40) chunks.push(list.slice(i, i + 40));
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
@@ -1278,6 +1282,8 @@ async function fetchRealtimeBatch(ids) {
     }).join('|');
     const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(ch)}&json=1&delay=0&_=${Date.now()}`;
     const j = await proxyFetch(url, 8000).catch(() => null);
+    if (j) anyResponse = true;
+    if (j?.msgArray?.length) anyRows = true;
     for (const m of j?.msgArray || []) {
       const id = String(m.c || '').trim();
       if (!id) continue;
@@ -1293,6 +1299,10 @@ async function fetchRealtimeBatch(ids) {
       };
     }
   }));
+  lastQuoteFail = Object.keys(out).length ? ''
+    : !anyResponse ? 'MIS 代理無回應'
+    : !anyRows ? 'MIS 回應但無報價資料（可能為未開盤或來源限制）'
+    : 'MIS 回應格式無法解析';
   return out;
 }
 
@@ -1301,7 +1311,8 @@ async function fetchRealtimeBatch(ids) {
 async function fetchYahooQuotes(ids, limit = 15) {
   const out = {};
   await Promise.all(ids.slice(0, limit).map(async id => {
-    const bars = await fetchStockOHLCV(id, '1m', '1d').catch(() => []);
+    // force：繞過 Yahoo 熔斷器 —— 這裡只有少數重點標的，且正是 Yahoo 掛掉時才會走到
+    const bars = await fetchStockOHLCV(id, '1m', '1d', { force: true }).catch(() => []);
     if (!bars?.length) return;
     const last = bars[bars.length - 1];
     const t = String(last.time || '');

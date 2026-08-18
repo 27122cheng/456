@@ -2566,7 +2566,10 @@ function quoteStampHTML(s) {
   if (barDate === today) return `● 今日 ${isMarketOpenTW() ? '盤中' : '收盤'}價`;
   if (barDate) {
     const md = barDate.slice(5).replace('-', '/');
-    return `<span style="color:var(--yellow)">⚠ ${md} 收盤價（未取得今日報價）</span>`;
+    const why = _liveFail ? `<br><span style="color:var(--text3);font-size:0.62rem">${_liveFail}</span>` : '';
+    const btn = isMarketOpenTW()
+      ? ` <button class="btn-ghost" style="padding:0 6px;font-size:0.6rem" onclick="retryLiveQuotes()">重試</button>` : '';
+    return `<span style="color:var(--yellow)">⚠ ${md} 收盤價（未取得今日報價）</span>${btn}${why}`;
   }
   return '';
 }
@@ -3641,6 +3644,7 @@ let liveTimer = null;
 let _liveBusy = false;
 let _lastQuoteTime = '';
 let _liveStatus = '';          // 供導覽列顯示：報價時間或失敗原因
+let _liveFail = '';            // 失敗的具體原因（顯示在價格旁，手機也看得到）
 const _liveQuotes = {};        // 最近一次成功的即時報價（掃描重建 allStocks 後用來復原）
 
 // 把即時報價套進一檔股票（掃描重建物件後也會呼叫，避免價格倒退回快取值）
@@ -3690,6 +3694,7 @@ async function refreshLivePrices() {
       src = 'Yahoo 備援';
     }
     if (!Object.keys(map).length) {               // 靜默失敗是先前查不出問題的原因，改為明示
+      _liveFail = `${lastQuoteFail || 'MIS 無回應'}；Yahoo 分鐘線亦無資料${srcDead('yahoo') ? '（Yahoo 限流中）' : ''}`;
       _liveStatus = '即時報價無回應';
       renderLiveTick();
       return 0;
@@ -3705,12 +3710,13 @@ async function refreshLivePrices() {
         n++;
       }
     }
-    if (n) { _lastQuoteTime = latest; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
+    if (n) { _lastQuoteTime = latest; _liveFail = ''; _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`; }
     else _liveStatus = '報價非今日（休市或收盤）';
     renderLiveTick();
     return n;
   } catch (e) {
     console.warn('即時報價更新失敗:', e);
+    _liveFail = `更新過程發生錯誤：${e?.message || e}`;   // 例外訊息也要留下，否則又是一次靜默失敗
     _liveStatus = '即時報價連線失敗';
     renderLiveTick();
     return 0;
@@ -3745,6 +3751,17 @@ function renderLiveTick() {
     }
     if (currentPage === 'holdings') renderHoldings();
   } catch (e) { console.warn('即時重繪失敗:', e); }
+}
+
+// 手動重試即時報價：清掉熔斷器與報價快取後強制重抓，並把結果直接顯示出來
+async function retryLiveQuotes() {
+  try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
+  Object.keys(localStorage).filter(k => k.startsWith('cache:ohlcv:')).forEach(k => localStorage.removeItem(k));
+  showToast('重新取得即時報價中...', 'info');
+  const n = await refreshLivePrices();
+  showToast(n ? `已更新 ${n} 檔即時報價（${_liveStatus}）` : `仍無法取得：${_liveFail || '未知原因'}`, n ? 'success' : 'error');
+  const s2 = allStocks.find(x => x.id === currentStockId);
+  if (s2) renderStockDetail(s2);
 }
 
 function startLiveQuotes() {
