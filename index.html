@@ -865,6 +865,14 @@
           <div id="api-catalog-body"></div>
           <div class="setting-row">
             <div class="setting-info">
+              <div class="setting-name">FinMind 資料目錄</div>
+              <div class="setting-desc">檢查 token 是否有效與額度剩餘，並逐一探測各資料集實際能否取得。可勾選要納入個股分析的資料集</div>
+            </div>
+            <button class="btn-primary" style="padding:8px 18px" onclick="renderFinmindCatalog()">🔍 檢查並探測</button>
+          </div>
+          <div id="finmind-catalog-body"></div>
+          <div class="setting-row">
+            <div class="setting-info">
               <div class="setting-name">自動刷新間隔</div>
               <div class="setting-desc">自動重掃全部股票的頻率（免費資料源有流量限制，過於頻繁會觸發限流導致大量檢測失敗；日線資料盤中僅最後一根 K 棒變動，5 分鐘已足夠）</div>
             </div>

@@ -914,11 +914,22 @@ async function fetchTWSESwagger() {
       .catch(() => null);
     const paths = doc?.paths;
     if (!paths || typeof paths !== 'object') return cacheGetStale(key, 30 * 24 * 60 * 60 * 1000);
+    // 官方 swagger 的 paths 不含 /v1 前綴（基底寫在 servers/basePath）。
+    // 未還原前綴會導致：① 使用中的端點全被誤判為「目錄查無」
+    //                  ② 依目錄啟用的資料集組出缺少 /v1 的網址而 404
+    let base = '';
+    try {
+      const srv = doc.servers?.[0]?.url || doc.basePath || '';
+      base = String(srv).replace(/^https?:\/\/[^/]+/, '').replace(/\/$/, '');
+    } catch {}
+    if (!base) base = '/v1';                      // 官方實際基底；取不到時採用已知值
+    const withBase = p => (p.startsWith(base + '/') ? p : base + (p.startsWith('/') ? p : '/' + p));
     const out = [];
     for (const [p, ops] of Object.entries(paths)) {
       const get = ops?.get || ops?.GET || Object.values(ops || {})[0];
       out.push({
-        path: p,
+        path: withBase(p),
+        rawPath: p,
         summary: String(get?.summary || get?.description || '').trim() || null,
         tags: Array.isArray(get?.tags) ? get.tags : [],
       });
@@ -952,7 +963,9 @@ function oapiIdKey(row) {
   return null;
 }
 
-async function fetchOpenApiDataset(path) {
+async function fetchOpenApiDataset(rawPath) {
+  // 舊版可能存入缺少 /v1 的路徑，這裡統一補正，避免 404
+  const path = rawPath.startsWith('/v1/') ? rawPath : `/v1${rawPath.startsWith('/') ? '' : '/'}${rawPath}`;
   const key = `cache:oapi:${path}`;
   const cached = cacheGet(key, oapiTTL(path));
   if (cached) return cached;
@@ -1627,6 +1640,99 @@ async function fetchFinMindQuotes(ids, limit = 12) {
       date: today.replace(/-/g, ''), src: 'finmind',
     };
   }));
+  return out;
+}
+
+// ── FinMind 資料目錄與 token 檢查 ──────────────────────────────────────────
+// 使用者回報「連不上／無資料」。先確認 token 是否有效與額度是否還有，
+// 再逐一探測各資料集實際能不能取得 —— 用證據取代猜測。
+async function finmindUserInfo() {
+  const token = finmindToken();
+  if (!token) return { ok: false, reason: '未設定 token' };
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.finmindtrade.com/api/v4/user_info?token=${encodeURIComponent(token)}`, 8000);
+    if (!res) return { ok: false, reason: '無法連線（網路或 CORS 受阻）' };
+    const j = await res.json();
+    if (j?.msg && /token/i.test(String(j.msg)) && j.status !== 200)
+      return { ok: false, reason: `token 遭拒：${j.msg}` };
+    return {
+      ok: true, level: j?.level ?? j?.user_level ?? null,
+      used: j?.user_count ?? j?.api_request_count ?? null,
+      limit: j?.api_request_limit ?? null,
+      raw: j,
+    };
+  } catch (e) { return { ok: false, reason: `連線錯誤：${e?.message || e}` }; }
+}
+
+// FinMind 常見資料集（逐一探測實際可用性，不預設哪些一定能用）
+const FINMIND_DATASETS = [
+  { id: 'TaiwanStockInfo', label: '上市櫃基本資料', perStock: false },
+  { id: 'TaiwanStockPrice', label: '日線價格', perStock: true },
+  { id: 'TaiwanStockPriceTick', label: '逐筆成交（即時）', perStock: true },
+  { id: 'TaiwanStockPriceMinute', label: '分鐘線', perStock: true },
+  { id: 'TaiwanStockInstitutionalInvestorsBuySell', label: '三大法人買賣超', perStock: true },
+  { id: 'TaiwanStockMarginPurchaseShortSale', label: '融資融券', perStock: true },
+  { id: 'TaiwanStockShareholding', label: '外資持股', perStock: true },
+  { id: 'TaiwanStockHoldingSharesPer', label: '股權分散', perStock: true },
+  { id: 'TaiwanStockMonthRevenue', label: '月營收', perStock: true },
+  { id: 'TaiwanStockFinancialStatements', label: '綜合損益表', perStock: true },
+  { id: 'TaiwanStockBalanceSheet', label: '資產負債表', perStock: true },
+  { id: 'TaiwanStockDividend', label: '股利政策', perStock: true },
+  { id: 'TaiwanStockDayTrading', label: '當沖', perStock: true },
+  { id: 'TaiwanStockPER', label: '本益比/殖利率', perStock: true },
+  { id: 'TaiwanStockNews', label: '新聞', perStock: true },
+  { id: 'TaiwanStockTotalReturnIndex', label: '報酬指數', perStock: false },
+];
+
+// 探測單一資料集：回傳筆數與訊息，供目錄顯示
+async function finmindProbe(dataset, dataId = '2330', backDays = 10) {
+  const token = finmindToken();
+  if (!token) return { ok: false, msg: '未設定 token' };
+  const start = new Date(Date.now() - backDays * 86400000).toISOString().slice(0, 10);
+  const url = `https://api.finmindtrade.com/api/v4/data?dataset=${encodeURIComponent(dataset)}`
+    + (dataId ? `&data_id=${encodeURIComponent(dataId)}` : '')
+    + `&start_date=${start}&token=${encodeURIComponent(token)}`;
+  try {
+    const res = await fetchWithTimeout(url, 10000);
+    if (!res) return { ok: false, msg: '無法連線（網路或 CORS 受阻）' };
+    const j = await res.json();
+    const rows = Array.isArray(j?.data) ? j.data : null;
+    if (!rows) return { ok: false, msg: String(j?.msg || j?.detail || '無 data 欄位') };
+    if (!rows.length) return { ok: false, msg: `回應正常但 0 筆（${j?.msg || '此期間無資料或方案不含此資料集'}）` };
+    return { ok: true, msg: `${rows.length} 筆｜最新 ${rows[rows.length - 1].date || '--'}`, rows, fields: Object.keys(rows[0]) };
+  } catch (e) { return { ok: false, msg: `錯誤：${e?.message || e}` }; }
+}
+
+// 已啟用的 FinMind 資料集（與 OpenAPI 分開管理）
+function getFinmindEnabled() {
+  try { return JSON.parse(localStorage.getItem('finmind-enabled') || '[]'); } catch { return []; }
+}
+function setFinmindEnabled(list) {
+  try { localStorage.setItem('finmind-enabled', JSON.stringify(list.slice(0, 8))); } catch {}
+}
+
+// 依啟用清單抓取，索引到個股（每檔一請求，故限制標的數）
+async function fetchFinmindDatasets(ids, limit = 10) {
+  const sets = getFinmindEnabled();
+  const token = finmindToken();
+  if (!sets.length || !token || !ids?.length) return {};
+  const start = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const out = {};
+  for (const ds of sets) {
+    await Promise.all(ids.slice(0, limit).map(async id => {
+      const url = `https://api.finmindtrade.com/api/v4/data?dataset=${encodeURIComponent(ds)}`
+        + `&data_id=${encodeURIComponent(id)}&start_date=${start}&token=${encodeURIComponent(token)}`;
+      try {
+        const res = await fetchWithTimeout(url, 10000);
+        if (!res) return;
+        const j = await res.json();
+        const rows = Array.isArray(j?.data) ? j.data : null;
+        if (!rows?.length) return;
+        (out[id] = out[id] || {})[ds] = rows[rows.length - 1];   // 取最新一筆
+      } catch {}
+    }));
+  }
   return out;
 }
 

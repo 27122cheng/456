@@ -226,6 +226,18 @@ async function runScan() {
   }).catch(() => {});
   // 使用者於目錄頁啟用的額外資料集
   loadEnabledDatasets().catch(() => {});
+  // FinMind 啟用的資料集（每檔一請求，故只取重點標的）
+  (async () => {
+    const prio = [currentStockId, ...getHoldings().map(h => h.id),
+      ...allStocks.map(x => x.id)].filter(Boolean);
+    const m = await fetchFinmindDatasets([...new Set(prio)], 10).catch(() => ({}));
+    for (const [id, sets] of Object.entries(m)) {
+      const s2 = allStocks.find(x => x.id === id);
+      if (!s2) continue;
+      s2._oapi = s2._oapi || {};
+      for (const [ds, row] of Object.entries(sets)) s2._oapi[`FinMind:${ds}`] = row;
+    }
+  })().catch(() => {});
   // 全市場產業別（證交所公司基本資料）：讓清單外／自動加入的股票也有正確族群，
   // 族群排名因此能涵蓋任何加入的標的，而不是只顯示「自訂」「法人動向」
   fetchCompanyInfo().then(m => {
@@ -4530,6 +4542,71 @@ function toggleDataset(path) {
   }
   setEnabledDatasets(list);
   renderApiCatalog();
+}
+
+// ── FinMind 資料目錄：驗證 token、探測每個資料集、選擇納入 ──────────────────
+async function renderFinmindCatalog() {
+  const el = document.getElementById('finmind-catalog-body');
+  if (!el) return;
+  if (!finmindToken()) {
+    el.innerHTML = '<div style="padding:10px 12px;font-size:0.8rem;color:var(--yellow)">尚未設定 token —— 請先在上方欄位貼上，再按此按鈕。</div>';
+    return;
+  }
+  el.innerHTML = '<div class="adv-loading">檢查 token 與額度中...</div>';
+  const info = await finmindUserInfo();
+  if (!info.ok) {
+    el.innerHTML = `<div style="padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.08);border-left:3px solid var(--bear);font-size:0.8rem">
+      <b>token 檢查未通過：${info.reason}</b><br>
+      <span style="color:var(--text3);font-size:0.74rem">常見原因：token 貼錯或含空白、尚未至 finmindtrade.com 完成註冊、或該網域被你的網路環境阻擋。</span></div>`;
+    return;
+  }
+
+  el.innerHTML = `<div style="padding:10px 12px;border-radius:8px;background:rgba(34,197,94,0.08);border-left:3px solid var(--bull);font-size:0.8rem;margin-bottom:10px">
+      ✅ token 有效${info.level != null ? `｜方案 ${info.level}` : ''}${info.limit != null ? `｜額度 ${info.used ?? '?'} / ${info.limit}` : ''}
+    </div><div class="adv-loading">逐一探測資料集（共 ${FINMIND_DATASETS.length} 項）...</div>`;
+
+  const enabled = new Set(getFinmindEnabled());
+  const results = [];
+  for (const d of FINMIND_DATASETS) {
+    const r = await finmindProbe(d.id, d.perStock ? '2330' : '');
+    results.push({ ...d, ...r });
+    const prog = el.querySelector?.('.adv-loading');   // 使用者切換頁面時元素可能已不存在
+    if (prog) prog.textContent = `逐一探測資料集... ${results.length}/${FINMIND_DATASETS.length}`;
+  }
+  const okN = results.filter(r => r.ok).length;
+
+  el.innerHTML = `<div style="padding:10px 12px;border-radius:8px;background:rgba(34,197,94,0.08);border-left:3px solid var(--bull);font-size:0.8rem;margin-bottom:10px">
+      ✅ token 有效${info.level != null ? `｜方案 ${info.level}` : ''}${info.limit != null ? `｜額度 ${info.used ?? '?'} / ${info.limit}` : ''}
+      ｜可用資料集 <b>${okN}/${results.length}</b>
+    </div>
+    ${results.map(r => `
+      <div style="padding:7px 10px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:flex-start;font-size:0.76rem">
+        <span>${r.ok ? '✅' : '❌'}</span>
+        <div style="flex:1;min-width:0">
+          <span style="font-weight:600">${r.label}</span>
+          <span style="font-family:var(--mono);color:var(--text3);font-size:0.7rem"> ${r.id}</span>
+          <br><span style="color:${r.ok ? 'var(--text3)' : 'var(--bear)'};font-size:0.72rem">${r.msg}</span>
+          ${r.ok && r.fields ? `<br><span style="color:var(--text3);font-size:0.66rem">欄位：${r.fields.slice(0, 8).join('、')}${r.fields.length > 8 ? '…' : ''}</span>` : ''}
+        </div>
+        ${r.ok && r.perStock ? `<button class="btn-ghost" style="padding:2px 10px;font-size:0.66rem;white-space:nowrap;${enabled.has(r.id) ? 'color:var(--bull);border-color:var(--bull)' : ''}"
+          onclick="toggleFinmindDataset('${r.id}')">${enabled.has(r.id) ? '✓ 已納入' : '＋ 納入'}</button>` : ''}
+      </div>`).join('')}
+    <div style="font-size:0.68rem;color:var(--text3);margin-top:8px">
+      納入的資料集會在下輪掃描為重點標的抓取並顯示於個股頁「額外官方資料」。
+      每個資料集每檔各一個請求，故最多同時啟用 8 個、每輪取前 10 檔。
+    </div>`;
+}
+
+function toggleFinmindDataset(id) {
+  const list = getFinmindEnabled();
+  const i = list.indexOf(id);
+  if (i >= 0) { list.splice(i, 1); showToast(`已移除 ${id}`, 'info'); }
+  else {
+    if (list.length >= 8) { showToast('最多同時啟用 8 個 FinMind 資料集（每檔各一請求，避免額度用盡）', 'error'); return; }
+    list.push(id); showToast(`已加入 ${id} — 下輪掃描開始帶入`, 'success');
+  }
+  setFinmindEnabled(list);
+  renderFinmindCatalog();
 }
 
 // ── 證交所 OpenAPI 目錄 ─────────────────────────────────────────────────────
