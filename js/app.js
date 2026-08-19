@@ -1875,8 +1875,32 @@ function buildManagerAnalysis(s) {
 
   if (oi) {
     if (oi.dFin > 0 && flowPct != null && flowPct < -3) add(0.5, -1, '散戶融資加碼但外資站賣方（籌碼對作）', 'chip');
-    if (oi.shortFinRatio >= 30) notes.push(`券資比 ${oi.shortFinRatio.toFixed(0)}%，具軋空題材`);
-    if (oi.dShort > 0) notes.push('融券增溫，若持續走強有軋空助攻');
+    // 軋空三條件同時成立才計分：券資比高（空單多）＋融券還在增（空方沒跑）＋
+    // 股價站上 EMA20（多方結構）— 空單被迫回補會變成額外買盤
+    if (oi.shortFinRatio >= 30 && oi.dShort > 0 && a.ema20 && price > a.ema20)
+      add(0.8, 1, `軋空條件成形：券資比 ${oi.shortFinRatio.toFixed(0)}%＋融券增溫＋股價站上 EMA20（空單回補將成追價買盤）`, 'chip');
+    else {
+      if (oi.shortFinRatio >= 30) notes.push(`券資比 ${oi.shortFinRatio.toFixed(0)}%，具軋空題材`);
+      if (oi.dShort > 0) notes.push('融券增溫，若持續走強有軋空助攻');
+    }
+  }
+
+  // 盤中五檔掛單失衡（MIS 即時資料；掛單可撤、可能是假單 → 只給低權重，並限 3 分鐘內的新鮮資料）
+  const bk = s._book;
+  if (bk && Date.now() - bk.at <= 3 * 60 * 1000 && inNotifyWindow() && bk.bid + bk.ask >= 200) {
+    if (bk.ratio >= 2) add(0.5, 1, `盤中五檔委買 ${bk.bid.toLocaleString()} 張為委賣 ${bk.ratio.toFixed(1)} 倍（掛單可撤，低權重參考）`, 'chip');
+    else if (bk.ratio != null && bk.ratio <= 0.5) add(0.5, -1, `盤中五檔委賣 ${bk.ask.toLocaleString()} 張為委買 ${(1 / bk.ratio).toFixed(1)} 倍（上方賣壓掛單沉重）`, 'chip');
+    else notes.push(`盤中五檔 委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張，掛單均衡`);
+  }
+
+  // 相對大盤強弱：波段選股的核心是「贏過大盤」— 資金只會集中在相對強勢股
+  const mret = marketRet20();
+  if (mret != null && closes.length >= 21) {
+    const rsGap = ret20 - mret;
+    if (rsGap >= 8) add(0.7, 1, `20 日跑贏大盤 ${rsGap.toFixed(1)} 個百分點（相對強勢股，資金聚焦）`);
+    else if (rsGap >= 4) add(0.4, 1, `20 日領先大盤 ${rsGap.toFixed(1)} 個百分點`);
+    else if (rsGap <= -8) add(0.7, -1, `20 日落後大盤 ${Math.abs(rsGap).toFixed(1)} 個百分點（相對弱勢，資金迴避）`);
+    else if (rsGap <= -4) add(0.4, -1, `20 日落後大盤 ${Math.abs(rsGap).toFixed(1)} 個百分點`);
   }
 
   // ⑥ 基本面
@@ -3947,6 +3971,13 @@ function applyLiveQuote(s, q, today) {
     else bars.push({ time: today, ...bar });
   }
   s._quoteTime = q.time;
+  // 五檔掛單：先前抓回來就丟掉了 —— 存起來供研判（掛單失衡）與委託簿顯示使用
+  if (q.bidV?.length || q.askV?.length) {
+    const bid = (q.bidV || []).reduce((x, y) => x + (y || 0), 0);
+    const ask = (q.askV || []).reduce((x, y) => x + (y || 0), 0);
+    if (bid || ask) s._book = { bid, ask, ratio: ask > 0 ? bid / ask : null,
+                                bidP: q.bidP, bidV: q.bidV, askP: q.askP, askV: q.askV, at: Date.now() };
+  }
   // MIS 額外欄位：漲跌停價、當盤量、市場別、全名 —— 一併留下供分析與顯示使用
   if (q.limitUp != null || q.limitDown != null) s._limit = { up: q.limitUp, down: q.limitDown };
   if (q.tickVol != null) s._tickVol = q.tickVol;
@@ -4081,6 +4112,7 @@ function renderLiveTick() {
         try { renderTraderView(s); } catch {}
         try { renderPatterns(s); } catch {}
         try { renderAnalysisPanels(s, s._inst || null); } catch {}
+        try { renderOrderFlow(s); } catch {}   // 五檔委託簿隨即時 tick 更新
       }
       const pe = document.getElementById('stock-price');
       if (s?.analysis && pe) {
@@ -5986,7 +6018,13 @@ async function detectWhales() {
 
     // ── 盤中大單掛買（僅開盤時段；MIS 無五檔資料就跳過，偵測不到就算了） ──
     let book = null;
-    if (marketOpen && bookProbes < 12) {
+    // 優先用即時批次報價已存下的五檔（不用另外打 MIS）；沒有才單獨補抓
+    const cached = s._book && Date.now() - s._book.at <= 3 * 60 * 1000 ? s._book : null;
+    if (marketOpen && cached && cached.bid && cached.ask) {
+      book = { bid: cached.bid, ask: cached.ask, ratio: cached.ratio, price: s.analysis?.price, low: null };
+      if (cached.bid >= cached.ask * 2 && cached.bid >= 300)
+        sig.push(`盤中五檔委買 ${cached.bid.toLocaleString()} 張，為委賣的 ${cached.ratio.toFixed(1)} 倍（大單掛買）`);
+    } else if (marketOpen && bookProbes < 12) {
       bookProbes++;
       try {
         const q = await fetchRealtimeQuote(s.id);
@@ -7942,7 +7980,34 @@ function renderOrderFlow(s) {
                 : buyPct <= 42 ? { t: '🔴 賣方明顯主導 — 賣壓沉重，反彈易遭調節，不宜接刀', c: 'var(--bear)' }
                 : { t: '🟡 買賣力道均衡 — 多空拉鋸，跟隨關鍵位操作', c: 'var(--yellow)' };
 
+  // 盤中真實五檔委託簿（MIS）— 有就顯示；掛單可撤，僅供參考不當成交
+  const bk = s._book;
+  const bookFresh = bk && Date.now() - bk.at <= 3 * 60 * 1000;
+  const bookHtml = bookFresh && bk.bidP?.length ? (() => {
+    const maxV = Math.max(...(bk.bidV || [0]), ...(bk.askV || [0]), 1);
+    const row = (p, v, side) => p > 0 ? `
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:0.7rem;font-family:var(--mono);width:52px;color:${side === 'bid' ? 'var(--bull)' : 'var(--bear)'}">${p}</span>
+        <div style="flex:1;height:7px;background:rgba(255,255,255,0.04);border-radius:4px;overflow:hidden">
+          <div style="height:100%;width:${Math.min(100, (v || 0) / maxV * 100)}%;background:${side === 'bid' ? 'var(--bull)' : 'var(--bear)'};opacity:0.7"></div>
+        </div>
+        <span style="font-size:0.68rem;font-family:var(--mono);width:44px;text-align:right;color:var(--text3)">${(v || 0).toLocaleString()}</span>
+      </div>` : '';
+    const asks = (bk.askP || []).map((p, i) => row(p, bk.askV?.[i], 'ask')).reverse().join('');
+    const bids = (bk.bidP || []).map((p, i) => row(p, bk.bidV?.[i], 'bid')).join('');
+    const rc = bk.ratio >= 2 ? 'var(--bull)' : bk.ratio != null && bk.ratio <= 0.5 ? 'var(--bear)' : 'var(--text2)';
+    return `
+    <div style="margin-bottom:12px">
+      <div class="fund-block-ttl">盤中五檔委託簿（MIS 即時）</div>
+      <div style="display:flex;flex-direction:column;gap:3px;margin-top:6px">${asks}
+        <div style="border-top:1px dashed rgba(255,255,255,0.15);margin:2px 0"></div>${bids}</div>
+      <div style="font-size:0.7rem;margin-top:5px;color:${rc}">委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張${bk.ratio != null ? `（買賣比 ${bk.ratio.toFixed(2)}）` : ''}
+        <span style="color:var(--text3)">— 掛單可隨時撤，僅供參考</span></div>
+    </div>`;
+  })() : '';
+
   el.innerHTML = `
+    ${bookHtml}
     <div style="margin-bottom:12px">
       <div style="display:flex;justify-content:space-between;font-size:0.75rem;margin-bottom:5px">
         <span style="color:var(--bull);font-weight:700">買方 ${buyPct}%</span>
