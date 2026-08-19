@@ -864,6 +864,43 @@ async function fetchExDividend() {
   try { return await _exDivPromise; } finally { _exDivPromise = null; }
 }
 
+// 除權除息「預告」表（TWT48U）：未來的除息日 —— 持倉事件風險警示用。
+// TWT49U 是已發生的結果表，只能標歷史 K 棒；提前避開跳空要靠這張預告表。
+let _exCalPromise = null;
+async function fetchExDivCalendar() {
+  if (_exCalPromise) return _exCalPromise;
+  _exCalPromise = (async () => {
+    const key = 'cache:exdiv-cal';
+    const cached = cacheGet(key, 12 * 60 * 60 * 1000);
+    if (cached) return cached;
+    const rows = await officialJSON('https://openapi.twse.com.tw/v1/exchangeReport/TWT48U', 'twse-exdiv-cal', 10000)
+      .catch(() => null);
+    if (!Array.isArray(rows) || !rows.length) return cacheGetStale(key, 7 * 24 * 60 * 60 * 1000) || [];
+    const sample = rows[0];
+    const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+    const kDate = findKey(/除權息日|預告日|資料日期|Date/i);
+    const kId = findKey(/股票代號|證券代號|Code/i);
+    const kAmt = findKey(/權值.*息值|息值|權值|Value/i);
+    const kType = findKey(/權.*息|類別|Type/i);
+    if (!kId || !kDate) return [];
+    const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+    const today = twNow().toISOString().slice(0, 10);
+    const out = [];
+    for (const r of rows) {
+      const id = String(r[kId] ?? '').trim();
+      if (!isRealStockId(id)) continue;
+      const raw = String(r[kDate] ?? '');
+      const iso = rocToISO(raw) || (/^\d{8}$/.test(raw) ? `${raw.slice(0,4)}-${raw.slice(4,6)}-${raw.slice(6,8)}` : null);
+      if (!iso || iso < today) continue;    // 只留今天（含）以後的事件
+      out.push({ id, date: iso, amt: num(r[kAmt]), type: String(r[kType] ?? '').trim() || null });
+    }
+    out.sort((a, b) => a.date.localeCompare(b.date));
+    if (out.length) cacheSet(key, out);
+    return out;
+  })();
+  try { return await _exCalPromise; } finally { _exCalPromise = null; }
+}
+
 // ⑤ 外資及陸資持股統計 → 外資持股「存量」
 // 補的缺口：目前只有單日買賣超（流量），看不出外資的長期部位水位。
 // 持股比率的變化比單日進出更能反映外資態度，且逐日累積後可算趨勢。
