@@ -270,6 +270,8 @@ async function runScan() {
       }
     });
   }).catch(() => {});
+  // 除權息「預告」：持倉遇到即將除息要提前警示（跳空與棄息賣壓風險）
+  fetchExDivCalendar().then(list => { if (list?.length) { _exDivCal = list; renderHoldings(); } }).catch(() => {});
   // 外資持股比率（存量）：單日買賣超只看得到流量，看不到水位
   fetchForeignHolding().then(m => {
     if (!m) return;
@@ -2366,6 +2368,22 @@ function buildEntryPlan(s, m) {
     }
   } catch {}
 
+  // 分批進出場：突破當下半倉、回測不破補半倉；出場 T1 減半（回測驗證的規則）、
+  // T2 清倉、剩餘移動停利。單點進出把「試錯成本」全押在一個價位上，分批把它攤開。
+  const addLv = Math.max(m.sup || 0, a.ob?.support?.top || 0, a.ema20 || 0);
+  const scale = {
+    e1: `於進場區 ${lo}~${hi} 先進半倉（試探部位）`,
+    e2: addLv > 0 && addLv < lo
+      ? `回測 ${+addLv.toFixed(2)}（${addLv === a.ob?.support?.top ? '多方訂單塊上緣' : addLv === m.sup ? '支撐位' : 'EMA20'}）不破、止穩再補半倉`
+      : '突破進場區上緣且量增時補半倉（順勢加碼，不向下攤平）',
+    x1: t1 ? `觸及目標一 ${t1} 先減半（落袋一半，剩餘零成本追趨勢）` : null,
+    x2: t2 ? `觸及目標二 ${t2} 清倉` : (holdOn ? `無壓力區 → 剩餘部位以移動停利 ${trailPre()} 追蹤` : null),
+  };
+  function trailPre() { return +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2); }
+
+  // 交易成本：牌告來回稅費。獲利要先扣掉它，風報比也是
+  const costPct = tradeCostPct('long');
+
   const rrVal = r > 0 && t1 ? (t1 - lo) / r : null;
   // 風報比低於 1.5 的交易長期期望值差，明確標示而非默默給建議
   const rrWarn = (!holdOn && rrVal != null && rrVal < 1.5)
@@ -2374,6 +2392,8 @@ function buildEntryPlan(s, m) {
 
   return {
     ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn, sizing, lessonWarns,
+    scale, costPct,
+    netReward1: t1 ? +((t1 - lo) / lo * 100 - costPct).toFixed(2) : null,
     conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
     rewardPct2: t2 ? (t2 - lo) / lo * 100 : null,
@@ -2435,7 +2455,15 @@ function entryPlanHtml(s, m) {
         ${p.rr ? `<span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr.toFixed(1)}</strong></span>` : ''}
         <span>訊號一致性 <strong style="color:${p.agr >= 0.6 ? 'var(--bull)' : p.agr >= 0.4 ? 'var(--yellow)' : 'var(--bear)'}">${(p.agr * 100).toFixed(0)}%</strong></span>
         <span>參考持有 ${p.horizon}</span>
+        ${p.netReward1 != null ? `<span>目標一稅費後淨利 <strong style="color:${p.netReward1 > 0 ? 'var(--bull)' : 'var(--bear)'}">${p.netReward1 >= 0 ? '+' : ''}${p.netReward1}%</strong> <span style="font-size:0.68rem">（來回成本 ${p.costPct}%）</span></span>` : ''}
       </div>
+      ${p.scale ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.75rem;color:var(--text2);line-height:1.8">
+        🪜 <strong>分批計畫</strong><br>
+        進場：① ${p.scale.e1}<br>　　　② ${p.scale.e2}<br>
+        出場：${[p.scale.x1, p.scale.x2].filter(Boolean).map((x, i) => `${i ? '<br>　　　' : ''}${['①', '②'][i]} ${x}`).join('')}
+        <span style="display:block;margin-top:3px;font-size:0.7rem;color:var(--text3)">單點進出把試錯成本全押一個價位；分批讓假突破只傷半倉、趨勢走出來時又有完整部位</span>
+      </div>` : ''}
+      ${(() => { const hw = heatWarning(); return hw ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">${hw}</div>` : ''; })()}
       ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
       ${(p.lessonWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">🧠 教訓提醒：${w}</div>`).join('')}
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
@@ -6343,6 +6371,80 @@ function journalInsights() {
 // ── 我的持倉：每日檢查出場訊號 ──────────────────────────────────────────────
 // 不做自動撮合，只記錄你實際買進的部位，每輪掃描重新評估是否該離場。
 
+// ── 交易成本（牌告價，未含券商折扣）──────────────────────────────────────
+// 買賣手續費各 0.1425%＋證交稅 0.3%（現股當沖稅減半 0.15%）。
+// 當沖若預期價差吃不下來回成本的 2 倍，這筆單期望值是負的，不該給。
+function tradeCostPct(kind = 'long') {
+  return kind === 'day' ? +(0.1425 * 2 + 0.15).toFixed(3) : +(0.1425 * 2 + 0.3).toFixed(3);
+}
+
+// ── 組合風險總量（Portfolio Heat）───────────────────────────────────────────
+// 單筆 2% 的限制擋不住「五檔各 2% 同時停損 = -10%」，也看不出
+// 三檔同族群其實是同一注押三次。這裡把兩件事都攤開。
+function portfolioHeat() {
+  const holdings = getHoldings();
+  if (!holdings.length) return null;
+  const capital = parseFloat(localStorage.getItem('capital') || '1000000');
+  let riskAmt = 0, knownN = 0, unknownN = 0;
+  const rows = holdings.map(h => {
+    // 停損已上移超過成本（鎖利）→ 該筆風險為 0，不是負數
+    const perShare = Math.max(0, (h.entry ?? 0) - (h.stop ?? 0));
+    const riskPct = h.entry > 0 ? perShare / h.entry * 100 : null;
+    let amt = null;
+    if (h.qty > 0) { amt = perShare * h.qty * 1000; riskAmt += amt; knownN++; }
+    else unknownN++;
+    return { h, riskPct, amt };
+  });
+  const heat = knownN && capital > 0 ? +(riskAmt / capital * 100).toFixed(2) : null;
+  // 族群集中度：同族群 ≥2 檔，同漲同跌，等於同一注加倍押
+  const list = getStockList();
+  const bySec = {};
+  for (const h of holdings) {
+    const sec = list.find(x => x.id === h.id)?.sector
+      || allStocks.find(x => x.id === h.id)?.sector || null;
+    if (sec) (bySec[sec] = bySec[sec] || []).push(h.name);
+  }
+  const conc = Object.entries(bySec).filter(([, v]) => v.length >= 2)
+    .map(([sec, names]) => ({ sec, names }));
+  return { rows, heat, riskAmt: Math.round(riskAmt), capital, knownN, unknownN, conc,
+           over: heat != null && heat >= 6 };
+}
+
+// 組合風險已滿時，新倉推薦要附警告（不藏訊號，但把總量狀態講清楚）
+function heatWarning() {
+  const ph = portfolioHeat();
+  if (!ph) return null;
+  if (ph.over) return `⚠ 組合風險已達 ${ph.heat}%（全部持倉同時停損的總虧損，上限 6%）— 新倉建議暫緩，或先降既有部位`;
+  if (ph.conc.length) return `⚠ 族群集中：${ph.conc.map(c => `${c.sec}（${c.names.join('、')}）`).join('；')} — 同族群同漲同跌，等於同一注加倍押`;
+  return null;
+}
+
+function setHoldingQty(stockId) {
+  const holdings = getHoldings();
+  const h = holdings.find(x => x.id === stockId);
+  if (!h) return;
+  const input = prompt(`「${h.name}」持有幾張？（1 張 = 1000 股，可填小數如 0.5 表示零股 500 股）`, h.qty || '');
+  if (input === null) return;
+  const qty = parseFloat(input);
+  if (!isFinite(qty) || qty <= 0) { showToast('張數格式不正確', 'error'); return; }
+  h.qty = qty;
+  saveHoldings(holdings);
+  renderHoldings();
+  showToast(`已記錄 ${h.name} 持有 ${qty} 張`, 'success');
+}
+
+// ── 持倉事件風險：未來除權息日警示（TWT48U 預告表）────────────────────────
+let _exDivCal = null;   // fetchExDivCalendar 結果，掃描時載入
+function upcomingExDiv(stockId, withinDays = 7) {
+  if (!_exDivCal?.length) return null;
+  const ev = _exDivCal.find(e => e.id === stockId);
+  if (!ev) return null;
+  const today = twClock().date;
+  const days = Math.round((new Date(ev.date + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 86400000);
+  if (days < 0 || days > withinDays) return null;
+  return { ...ev, days };
+}
+
 function getHoldings() {
   try { return JSON.parse(localStorage.getItem('my-holdings') || '[]'); } catch { return []; }
 }
@@ -6361,9 +6463,12 @@ function addHolding(stockId, kind = 'long') {
   if (input === null) return;
   const entry = parseFloat(input);
   if (!isFinite(entry) || entry <= 0) { showToast('進場價格式不正確', 'error'); return; }
+  // 張數（選填）：有張數才能算組合風險總量；跳過也能記錄
+  const qtyIn = prompt('持有幾張？（選填，用於組合風險計算；1 張 = 1000 股，可填 0.5 表示零股）', '');
+  const qty = qtyIn !== null && isFinite(parseFloat(qtyIn)) && parseFloat(qtyIn) > 0 ? parseFloat(qtyIn) : null;
 
   holdings.push({
-    id: stockId, name: s.name, entry: +entry.toFixed(2),
+    id: stockId, name: s.name, entry: +entry.toFixed(2), qty,
     stop: p?.ok ? p.stop : +(entry * 0.93).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
     src: 'ai', kind: kind === 'day' ? 'day' : 'long',
@@ -6425,6 +6530,9 @@ async function addManualHolding() {
   const idEl = document.getElementById('mh-id');
   const priceEl = document.getElementById('mh-price');
   const kindEl = document.getElementById('mh-kind');
+  const qtyEl = document.getElementById('mh-qty');
+  const qtyV = parseFloat(qtyEl?.value || '');
+  const qty = isFinite(qtyV) && qtyV > 0 ? qtyV : null;
   const raw = (idEl?.value || '').trim();
   const entry = parseFloat(priceEl?.value || '');
   const kind = kindEl?.value === 'day' ? 'day' : 'long';
@@ -6451,7 +6559,7 @@ async function addManualHolding() {
   const m = s?.analysis ? buildManagerAnalysis(s) : null;
   const p = m ? buildEntryPlan(s, m) : null;
   holdings.push({
-    id, name: s?.name || resolvedName, entry: +entry.toFixed(2),
+    id, name: s?.name || resolvedName, entry: +entry.toFixed(2), qty,
     // 停損：有進場計畫且其停損低於你的進場價就沿用；否則當沖 -3%、長線 -7%
     stop: (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
@@ -6475,6 +6583,7 @@ async function addManualHolding() {
   saveHoldings(holdings);
   if (idEl) idEl.value = '';
   if (priceEl) priceEl.value = '';
+  if (qtyEl) qtyEl.value = '';
   showToast(`已加入持倉：${s?.name || resolvedName}（${id}・${kind === 'day' ? '當沖單' : '長線單'}）${addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
   renderHoldings();
   if (s?.analysis) showHoldingView(id); // 立即顯示 AI 對此價位的看法
@@ -6663,9 +6772,35 @@ function checkHoldingExit(h) {
     if (level === 'hold') level = 'watch';
     reasons.push(`已達目標價 ${t1Adj}${div > 0 ? '（除息還原後）' : ''}，可考慮減碼鎖利`);
   }
+  // 事件風險：即將除權息 → 跳空與棄息賣壓，事前提醒（不直接改變出場等級）
+  const exEv = upcomingExDiv(h.id, 7);
+  if (exEv) {
+    if (level === 'hold') level = 'watch';
+    reasons.push(`📅 ${exEv.days === 0 ? '今日' : `${exEv.days} 天後（${exEv.date}）`}除權息${exEv.amt ? `（${exEv.type || '息值'} ${exEv.amt} 元）` : ''} — 留意棄息賣壓與跳空，可考慮事件前收緊停損或降部位`);
+  }
   if (!reasons.length) reasons.push(m ? `結構維持「${m.stance}」，續抱` : '結構穩定，續抱');
 
   return { h, s, price, retPct, level, reasons, stance: m?.stance, trail: m ? +Math.max(price - (m.atr || price * 0.02) * 2, a.ema20 || 0).toFixed(2) : null };
+}
+
+// 組合風險總量卡（持倉清單頂部）
+function portfolioHeatHTML() {
+  const ph = portfolioHeat();
+  if (!ph) return '';
+  const heatC = ph.heat == null ? 'var(--text3)' : ph.heat >= 6 ? 'var(--bear)' : ph.heat >= 4 ? 'var(--yellow)' : 'var(--bull)';
+  const heatTxt = ph.heat == null
+    ? `無法計算 — ${ph.unknownN} 檔未填張數`
+    : `${ph.heat}%（約 ${(ph.riskAmt / 10000).toFixed(1)} 萬）${ph.unknownN ? `，另有 ${ph.unknownN} 檔未填張數未計入` : ''}`;
+  return `
+    <div style="padding:11px 13px;border-radius:9px;background:rgba(255,255,255,0.03);border:1px solid var(--border);margin-bottom:10px">
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap">
+        <span style="font-size:0.78rem;font-weight:700;color:var(--text2)">🌡 組合風險總量</span>
+        <span style="font-size:0.82rem;font-weight:800;font-family:var(--mono);color:${heatC}">${heatTxt}</span>
+        <span style="font-size:0.68rem;color:var(--text3)">＝ 全部持倉同時觸發停損的總虧損 ÷ 資金 ${(ph.capital / 10000).toFixed(0)} 萬｜上限 6%</span>
+      </div>
+      ${ph.over ? `<div style="margin-top:6px;padding:6px 10px;background:rgba(239,68,68,0.08);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.74rem;color:var(--bear)">⚠ 總風險超標 — 新倉暫緩；優先把獲利中持倉的停損上移（風險歸零後即可騰出額度）</div>` : ''}
+      ${ph.conc.length ? `<div style="margin-top:6px;font-size:0.73rem;color:var(--yellow)">⚠ 族群集中：${ph.conc.map(c => `${c.sec}（${c.names.join('、')}）`).join('；')} — 同族群同漲同跌，等於同一注加倍押</div>` : ''}
+    </div>`;
 }
 
 function holdingsHTML() {
@@ -6677,7 +6812,7 @@ function holdingsHTML() {
     ({ h, price: null, retPct: null, level: 'hold', reasons: ['尚未取得分析資料，等待下輪掃描'], pending: true }));
 
   const badge = { exit: { t: '🔴 建議出場', c: 'var(--bear)' }, watch: { t: '🟡 留意', c: 'var(--yellow)' }, hold: { t: '🟢 續抱', c: 'var(--bull)' } };
-  return rows.map(r => `
+  return portfolioHeatHTML() + rows.map(r => `
     <div style="padding:10px 12px;border-radius:9px;background:${badge[r.level].c}0d;border-left:3px solid ${badge[r.level].c};margin-bottom:8px;cursor:pointer" onclick="showHoldingView('${r.h.id}')" title="點擊查看 AI 對此持倉的看法">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <strong style="font-size:0.86rem">${r.h.name} <span style="color:var(--text3);font-size:0.74rem">${r.h.id}</span></strong>
@@ -6687,7 +6822,7 @@ function holdingsHTML() {
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</span>
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
-        成本 ${r.h.entry}｜現價 ${r.price != null ? r.price.toFixed(2) : '--'}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}
+        成本 ${r.h.entry}｜現價 ${r.price != null ? r.price.toFixed(2) : '--'}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}${r.h.qty > 0 ? `｜${r.h.qty} 張` : ` <button class="btn-ghost" style="padding:0 7px;font-size:0.64rem" onclick="event.stopPropagation();setHoldingQty('${r.h.id}')">填張數</button>`}
       </div>
       <div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.6">${r.reasons.join('；')}</div>
       <div style="margin-top:7px;display:flex;gap:8px">
@@ -6768,6 +6903,10 @@ function computeDayTradePicks() {
     if (!m || m.dir < 1) continue;               // 至少不偏空
     const atrPct = (m.atr / a.price) * 100;
     if (atrPct < 1.8) continue;                  // 波動要夠，否則沖不出價差
+    // 稅費門檻：當沖來回成本約 0.44%（費 0.285%＋當沖稅 0.15%），
+    // 實際能吃到的價差抓半個 ATR — 吃不到成本 2 倍的單期望值是負的，不推
+    const dayCost = tradeCostPct('day');
+    if (atrPct / 2 < dayCost * 2) continue;
     if (!(avg > 0 && last.volume >= avg * 1.3 && last.close > last.open)) continue; // 今日放量收紅
     const rng0 = last.high - last.low;
     if (rng0 > 0 && (last.close - last.low) / rng0 < 0.7) continue; // 收上影長，隔日跟隨力差（回測驗證）
@@ -6814,6 +6953,7 @@ function computeDayTradePicks() {
       ...(finWarn ? [finWarn] : []),
       ...(gapWarn ? [gapWarn.txt] : []),
       `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
+      `來回稅費 ${dayCost}% — 獲利未達 ${(dayCost * 2).toFixed(2)}% 前都在幫券商打工，出手要挑波段`,
     ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct + (gapWarn?.pts ?? 0)
               + (dtRatio != null ? Math.min(dtRatio * 20, 8) : -4) });
   }
@@ -6883,7 +7023,8 @@ function renderEntrySignals() {
     sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋強收盤動能篩選（處置/注意股已排除）。開盤跳空逾 +2% 不追（開高走低是隔日沖最大虧損源）、開低逾 -0.5% 放棄；收盤前務必出場',
       days.filter(dp => !picks.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
 
-  el.innerHTML = body ||
+  const hw = heatWarning();
+  el.innerHTML = (hw && body ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);font-size:0.76rem;color:var(--bear);margin-bottom:10px">${hw}</div>` : '') + body ||
     '<p style="font-size:0.8rem;color:var(--text3)">今日三類皆無符合條件的推薦 — 標準較嚴（研判偏多 + 綜合 ≥65 + 非追高 + 非處置股），寧可空手也不硬給訊號。</p>';
 }
 
@@ -7027,7 +7168,8 @@ function notifyEntrySignals() {
       days.map(({ s, why }) => `・${s.name}(${s.id})：${why.join('；')}`).join('\n')
     : '';
 
-  tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}\n\n⚠ 僅供參考，非投資建議`);
+  const hw = heatWarning();
+  tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}${hw ? `\n\n${hw}` : ''}\n\n⚠ 僅供參考，非投資建議`);
   localStorage.setItem('tg-entry-date', dataDate);
 }
 

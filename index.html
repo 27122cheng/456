@@ -726,6 +726,7 @@
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
           <input type="text" id="mh-id" placeholder="代號或名稱（如 2330 / 台積電）" style="flex:1;min-width:120px;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.85rem" />
           <input type="number" id="mh-price" placeholder="進場價" step="0.01" style="flex:1;min-width:100px;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.85rem" />
+          <input type="number" id="mh-qty" placeholder="張數（選填）" step="0.1" min="0" style="flex:1;min-width:96px;padding:9px 12px;background:rgba(255,255,255,0.04);border:1px solid var(--border);border-radius:8px;color:var(--text1);font-size:0.85rem" title="用於組合風險計算；1 張 = 1000 股" />
           <select id="mh-kind" class="setting-select" style="min-width:96px">
             <option value="long" selected>長線單</option>
             <option value="day">當沖單</option>
