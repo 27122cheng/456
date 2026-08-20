@@ -418,6 +418,7 @@ async function runScan() {
     notifyEntrySignals();   // 適合進場的訊號
     notifyHoldingExits();   // 持倉出場檢查
     notifyWeeklyBrief();    // 週一 09:30 本週佈局（含盤中掛單判定）
+    notifyPreOpen();        // 每日 08:30 盤前簡報（昨收＋夜盤＋新聞＋開盤研判）
     notifyDailyBrief();     // 每日 09:00 市場簡報
     notifyPostOpen();       // 每日 09:30 開盤後追蹤
   });
@@ -5795,6 +5796,109 @@ function buildDailyBrief() {
     picks: computeEntrySignals().slice(0, 4),
     date: twClock().date,
   };
+}
+
+// ── 每日 08:30 盤前簡報 ─────────────────────────────────────────────────────
+// 開盤前 30 分鐘：昨收＋美股夜盤＋隔夜新聞＋今日數據事件 → 開盤研判與交易重點。
+// 每一節都「有資料才寫」；連基本盤（掃描池／美股）都沒有就整份不發，不硬湊。
+function buildPreOpen() {
+  const ready = allStocks.filter(s => s.analysis);
+  if (ready.length < 5) return null;
+  const fac = sym => outlookData.factors?.find(f => f.sym === sym);
+
+  // ① 昨日收盤與市場寬度
+  const twii = fac('^TWII');
+  const bullN = ready.filter(s => verdictScore(s) >= getThreshold('bull')).length;
+  const bearN = ready.filter(s => verdictScore(s) <= getThreshold('bear')).length;
+  const norm = Math.round(outlookData.norm ?? 0);
+  const regime = norm >= 35 ? '偏多' : norm >= 15 ? '中性偏多' : norm <= -35 ? '偏空' : norm <= -15 ? '中性偏空' : '中性盤整';
+
+  // ② 美股夜盤收盤
+  const us = [];
+  for (const [sym, label] of [['^DJI', '道瓊'], ['^GSPC', 'S&P500'], ['^IXIC', '那斯達克'], ['^SOX', '費半']]) {
+    const f = fac(sym);
+    if (f?.chg1 != null) us.push(`${label} ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(2)}%`);
+  }
+  const vix = fac('^VIX');
+  const ov = outlookData.overnight;
+
+  // ③ 開盤方向研判（ADR/EWT 隱含跳空 — 與當沖紀律同一套邏輯）
+  let openCall = null;
+  if (ov?.adr?.chg1 != null) {
+    const c = ov.adr.chg1;
+    openCall = c > 2.5 ? `台積電 ADR ${c >= 0 ? '+' : ''}${c}% — 預期大幅開高，追價風險極高：開高逾 2% 的標的不追，等回測缺口`
+      : c > 1 ? `台積電 ADR +${c}% — 預期開高，開盤價超過建議區上緣就別追，等拉回`
+      : c < -2 ? `台積電 ADR ${c}% — 預期大幅開低，昨日動能訊號先視為失效，開盤 30 分不接刀`
+      : c < -0.5 ? `台積電 ADR ${c}% — 可能小幅開低，開低逾 0.5% 的當沖標的依紀律放棄`
+      : `台積電 ADR ${c >= 0 ? '+' : ''}${c}% 持平 — 無不利跳空，昨日訊號有效性維持`;
+    if (ov.premium != null) openCall += `（ADR 溢價 ${ov.premium >= 0 ? '+' : ''}${ov.premium}%）`;
+  }
+
+  // ④ 隔夜新聞（昨 16:00 後發布）與新聞面指向
+  const cutoff = Date.now() - 18 * 60 * 60 * 1000;
+  const nightNews = (_newsRaw || []).filter(n => n.ts && n.ts >= cutoff).slice(0, 5);
+  const newsSec = _newsSignals ? Object.entries(_newsSignals.sectors)
+    .filter(([, v]) => Math.abs(v.score) >= 2)
+    .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score)).slice(0, 3) : [];
+
+  // ⑤ 今日數據事件（weekEvents 的 date 為 Date 物件，取台北當日者）
+  const todayIso = twClock().date;
+  const todayEvts = (weekEvents() || []).filter(e => {
+    try {
+      const d = e.date instanceof Date ? e.date : new Date(e.date);
+      return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei' }).format(d) === todayIso;
+    } catch { return false; }
+  });
+
+  // ⑥ 持倉與交易重點（昨收資料的評估 — 開盤後 09:30 另有追蹤版）
+  const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
+  const exits = holdings.filter(r => r.level === 'exit');
+  const watches = holdings.filter(r => r.level === 'watch');
+  const picks = computeEntrySignals().slice(0, 3);
+  const days = computeDayTradePicks().slice(0, 2);
+
+  return { date: twClock().date, twii, bullN, bearN, total: ready.length, norm, regime,
+           us, vix, ov, openCall, nightNews, newsSec, todayEvts,
+           holdings, exits, watches, picks, days };
+}
+
+function notifyPreOpen() {
+  const t = twClock();
+  if (!inNotifyWindow()) return;                                  // 假日與非交易時段不推
+  const mins = t.hour * 60 + t.minute;
+  if (mins < 8 * 60 + 30 || mins >= 9 * 60) return;               // 只在 08:30~08:59
+  if (localStorage.getItem('tg-preopen') === t.date) return;
+  const b = buildPreOpen();
+  if (!b) return;                                                  // 資料不足不發，等下輪掃描再試
+  logSignal('brief', '盤前簡報已推送', '08:30：昨收＋美股夜盤＋隔夜新聞＋今日開盤研判與交易重點', { dedupKey: 'preopen' });
+  localStorage.setItem('tg-preopen', t.date);
+  if (!tgWants('sig')) return;
+
+  const L = [];
+  L.push(`🌅 盤前簡報　${b.date} 08:30`);
+  L.push('');
+  L.push(`【昨日收盤】${b.twii?.price != null ? `加權 ${b.twii.price.toFixed(0)}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1?.toFixed(2) ?? '--'}%）｜` : ''}研判${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total}`);
+  if (b.us.length) L.push(`【美股夜盤】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
+  if (b.openCall) { L.push(''); L.push(`【開盤研判】${b.openCall}`); }
+  if (b.newsSec.length || b.nightNews.length) {
+    L.push(''); L.push('【新聞面】');
+    if (b.newsSec.length) L.push(`指向：${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
+    b.nightNews.slice(0, 3).forEach(n => L.push(`・${n.headline}${n.dir && n.dir !== '中性' ? `（${n.dir}）` : ''}`));
+  }
+  if (b.todayEvts.length) { L.push(''); L.push(`【今日數據】${b.todayEvts.map(e => e.name || e.txt).join('、')}`); }
+  if (b.holdings.length) {
+    L.push(''); L.push('【持倉重點】');
+    if (b.exits.length) L.push(`⚠ ${b.exits.length} 檔昨收已觸出場條件：${b.exits.map(r => `${r.h.name}（${r.reasons[0]}）`).join('；')} — 開盤反彈即處理`);
+    if (b.watches.length) L.push(`留意 ${b.watches.length} 檔：${b.watches.map(r => r.h.name).join('、')}`);
+    if (!b.exits.length && !b.watches.length) L.push(`${b.holdings.length} 檔結構健康，開盤續抱`);
+  }
+  if (b.picks.length) {
+    L.push(''); L.push('【今日交易重點】');
+    b.picks.forEach(({ s, p }) => L.push(`・${s.name}(${s.id})　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}${b.openCall && /開高/.test(b.openCall) ? '（開高逾區間上緣不追）' : ''}`));
+  }
+  if (b.days.length) L.push(`當沖觀察：${b.days.map(d => d.s.name).join('、')}（開盤跳空逾 +2% 不追、開低逾 -0.5% 放棄）`);
+  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議｜09:00 市場簡報、09:30 開盤後追蹤將另行推送');
+  tgPush(L.join('\n'));
 }
 
 function notifyDailyBrief() {
