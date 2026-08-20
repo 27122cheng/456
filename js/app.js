@@ -6051,12 +6051,18 @@ function buildAfterClose() {
 
 function notifyAfterClose() {
   if (!inAfterCloseWindow()) return;
-  const dataDate = notifyDataDate();
-  if (localStorage.getItem('tg-afterclose') === dataDate) return;
+  // 去重鍵必須用「日曆日」而非資料日：16:30~21:00 窗口橫跨法人資料
+  // 從昨天翻到今天的時刻，用資料日當鍵會在翻面時重發（實際發生過發兩次）
+  const today = twClock().date;
+  if (localStorage.getItem('tg-afterclose') === today) return;
+  // 今日收盤資料到位才發 — 否則第一輪會拿昨天的資料做「今日」總結
+  const s0 = allStocks.find(x => x.ohlcv?.length);
+  const lastBar = s0 ? s0.ohlcv[s0.ohlcv.length - 1].time.slice(0, 10) : null;
+  if (lastBar !== today) return;                 // 未到位，等下一輪掃描再試
   const b = buildAfterClose();
   if (!b) return;
   logSignal('brief', '盤後總結已推送', '16:30：收盤結果、法人買賣超、明日觀察重點', { dedupKey: 'afterclose' });
-  localStorage.setItem('tg-afterclose', dataDate);
+  localStorage.setItem('tg-afterclose', today);
   if (!tgWants('sig')) return;
 
   const L = [];
@@ -6326,10 +6332,11 @@ function notifyDataDate() {
 function notifyWhales() {
   if (!tgWants('sig')) return;
   if (!inNotifyWindow()) return;   // 假日與非交易時段不推播
-  const dataDate = notifyDataDate();
+  // 「每檔一天一次」以日曆日界定：資料日翻面時重置清單會把上午發過的重發
+  const calDay = twClock().date;
   let sent;
   try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
-  if (sent.date !== dataDate) sent = { date: dataDate, ids: [] };
+  if (sent.date !== calDay) sent = { date: calDay, ids: [] };
   const clean = _whaleResults.filter(r => !r.trap.length && !sent.ids.includes(r.s.id));
   if (!clean.length) return;
 
@@ -7138,8 +7145,8 @@ function notifyHoldingExits() {
   const holdings = getHoldings();
   if (!holdings.length) return;
   const today = new Date().toISOString().slice(0, 10);
-  const dataDate = notifyDataDate();
-  if (localStorage.getItem('tg-holdings-date') === dataDate) return;
+  // 去重鍵用日曆日：資料日翻面（快取的法人日期更新）會讓資料日鍵重發
+  if (localStorage.getItem('tg-holdings-date') === twClock().date) return;
 
   const rows = holdings.map(checkHoldingExit).filter(Boolean);
   if (rows.length < holdings.length) return; // 資料未齊，等下輪再推
@@ -7161,7 +7168,7 @@ function notifyHoldingExits() {
       `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%｜${r.reasons.join('；')}`,
       { id: r.h.id, dir: -1, dedupKey: r.h.id });
   }
-  localStorage.setItem('tg-holdings-date', dataDate);
+  localStorage.setItem('tg-holdings-date', twClock().date);
 }
 
 // ── 實績回饋權重：用「已結算的真實成績」自動修正評分，讓系統越用越準 ──────
@@ -7248,8 +7255,8 @@ function computeEntrySignals() {
 function notifyEntrySignals() {
   if (!tgWants('sig')) return;
   const today = new Date().toISOString().slice(0, 10);
-  const dataDate = notifyDataDate();
-  if (localStorage.getItem('tg-entry-date') === dataDate) return;
+  // 去重鍵用日曆日，理由同 notifyHoldingExits
+  if (localStorage.getItem('tg-entry-date') === twClock().date) return;
   const picks = computeEntrySignals();
   if (!picks.length) return;
 
@@ -7274,7 +7281,7 @@ function notifyEntrySignals() {
 
   const hw = heatWarning();
   tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}${hw ? `\n\n${hw}` : ''}\n\n⚠ 僅供參考，非投資建議`);
-  localStorage.setItem('tg-entry-date', dataDate);
+  localStorage.setItem('tg-entry-date', twClock().date);
 }
 
 // ── 交易總結頁 ─────────────────────────────────────────────────────────────
