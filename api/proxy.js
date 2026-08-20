@@ -12,6 +12,7 @@ const ALLOW = [
   /^https:\/\/stooq\.com\/q\//,
   /^https:\/\/mis\.twse\.com\.tw\//,
   /^https:\/\/opendata\.tdcc\.com\.tw\//,
+  /^https:\/\/openapi\.taifex\.com\.tw\//,
 ];
 
 // 證交所 MIS 需要有效的 session cookie —— 只帶 Referer 仍常回空的 msgArray。
