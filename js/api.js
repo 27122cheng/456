@@ -864,6 +864,61 @@ async function fetchExDividend() {
   try { return await _exDivPromise; } finally { _exDivPromise = null; }
 }
 
+// ── 期交所 OpenAPI：期貨籌碼（大盤方向的缺口）──────────────────────────────
+// 現貨買賣超只看得到「現股」動作；外資真正的方向部位在台指期。
+// 兩者背離（現貨買、期貨大空）是很強的警訊。抓不到一律回 null，誠實無資料。
+
+// 臺指選擇權 Put/Call 比：>1 偏避險/恐慌、<0.8 偏樂觀（未平倉口數比）
+async function fetchTaifexPCR() {
+  const key = 'cache:taifex-pcr';
+  const cached = cacheGet(key, 60 * 60 * 1000);
+  if (cached) return cached;
+  const rows = await officialJSON('https://openapi.taifex.com.tw/v1/PutCallRatio', 'taifex', 10000).catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const sample = rows[rows.length - 1];
+  const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+  const kDate = findKey(/日期|Date/i);
+  const kOi = findKey(/未平倉.*比|OpenInterest.*Ratio|買賣權未平倉/i) || findKey(/比率|Ratio/i);
+  if (!kOi) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,|%/g, '')); return isFinite(f) ? f : null; };
+  const last = rows[rows.length - 1];
+  let ratio = num(last[kOi]);
+  if (ratio == null) return null;
+  if (ratio > 10) ratio = +(ratio / 100).toFixed(3);   // 有些欄位以百分比表示（如 105.2）
+  const out = { ratio, date: kDate ? String(last[kDate]).replace(/\//g, '-') : null };
+  cacheSet(key, out);
+  return out;
+}
+
+// 三大法人期貨（依日期）：取外資在臺股期貨（TX）的多空未平倉淨額口數
+async function fetchTaifexForeignTX() {
+  const key = 'cache:taifex-ftx';
+  const cached = cacheGet(key, 60 * 60 * 1000);
+  if (cached) return cached;
+  const rows = await officialJSON(
+    'https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate',
+    'taifex', 12000).catch(() => null);
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const sample = rows[0];
+  const findKey = re => Object.keys(sample).find(k => re.test(k)) || null;
+  const kDate = findKey(/日期|Date/i);
+  const kProd = findKey(/商品|契約|Contract|Product/i);
+  const kInv  = findKey(/身份別|身分別|機構|Investor|Trader/i);
+  const kNet  = findKey(/未平倉.*(多空|淨額).*口數|口數.*淨額|OpenInterest.*Net.*(Volume|Lots)|Net.*OpenInterest/i);
+  if (!kProd || !kInv || !kNet) return null;
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const pick = rows.filter(r =>
+    /臺股期貨|台股期貨|^TX$/i.test(String(r[kProd] ?? '').trim()) &&
+    /外資/.test(String(r[kInv] ?? '')));
+  if (!pick.length) return null;
+  const last = pick[pick.length - 1];
+  const net = num(last[kNet]);
+  if (net == null) return null;
+  const out = { net, date: kDate ? String(last[kDate]).replace(/\//g, '-') : null };
+  cacheSet(key, out);
+  return out;
+}
+
 // 除權除息「預告」表（TWT48U）：未來的除息日 —— 持倉事件風險警示用。
 // TWT49U 是已發生的結果表，只能標歷史 K 棒；提前避開跳空要靠這張預告表。
 let _exCalPromise = null;

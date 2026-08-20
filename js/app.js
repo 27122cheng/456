@@ -542,6 +542,47 @@ async function loadMarketOutlook() {
     const t = analyzeTurnover(rows);
     if (t) { outlookData.turnover = t; renderMarketOutlook(); }
   }).catch(() => {});
+  // 期貨籌碼（外資台指期淨部位＋選擇權 PCR）— 現貨看不到的方向部位
+  loadDerivatives();
+}
+
+// ── 期貨籌碼載入與解讀 ─────────────────────────────────────────────────────
+async function loadDerivatives() {
+  try {
+    const [pcr, ftx] = await Promise.all([
+      fetchTaifexPCR().catch(() => null),
+      fetchTaifexForeignTX().catch(() => null),
+    ]);
+    if (!pcr && !ftx) { outlookData.derivs = null; return; }   // 誠實無資料
+    outlookData.derivs = { pcr, ftx };
+    renderMarketOutlook();
+  } catch { outlookData.derivs = null; }
+}
+
+// 期貨籌碼摘要（給儀表板與簡報共用）；無資料回 null
+function derivsSummary() {
+  const d = outlookData.derivs;
+  if (!d) return null;
+  const parts = [];
+  let dir = 0;
+  if (d.ftx?.net != null) {
+    const n = d.ftx.net;
+    const lvl = Math.abs(n) >= 30000 ? '大幅' : Math.abs(n) >= 10000 ? '明顯' : '小幅';
+    parts.push(`外資台指期淨${n >= 0 ? '多' : '空'}單 ${Math.abs(n).toLocaleString()} 口（${lvl}${n >= 0 ? '偏多' : '偏空'}）`);
+    if (Math.abs(n) >= 10000) dir += n > 0 ? 1 : -1;
+    // 期現貨背離：現貨研判偏多但期貨大空（或反向）→ 提醒
+    const norm = outlookData.norm ?? 0;
+    if (n <= -20000 && norm >= 15) parts.push('⚠ 現貨面偏多但外資期貨大幅偏空 — 期現背離，慎防誘多');
+    else if (n >= 20000 && norm <= -15) parts.push('現貨面偏空但外資期貨大幅偏多 — 期現背離，空方追價需謹慎');
+  }
+  if (d.pcr?.ratio != null) {
+    const r = d.pcr.ratio;
+    parts.push(`選擇權 P/C 比 ${r.toFixed(2)}（${r >= 1.2 ? '避險情緒偏高' : r <= 0.8 ? '樂觀偏貪婪' : '中性'}）`);
+    if (r >= 1.3) dir -= 0.5;                 // 極端避險常伴隨壓回
+    else if (r <= 0.7) dir += 0.5;
+  }
+  if (!parts.length) return null;
+  return { parts, dir, date: d.ftx?.date || d.pcr?.date || null };
 }
 
 // 隔夜訊號載入：台積電 ADR 溢價需要 2330 收盤價（掃描或官方行情皆可）
@@ -741,6 +782,16 @@ function renderMarketOutlook() {
         <strong style="color:${c}">${t.verdict}</strong>
       </div>`;
     })() : ''}
+
+    ${(() => {
+      const dv = derivsSummary();
+      if (!dv) return '';
+      const c = dv.dir >= 1 ? 'var(--bull)' : dv.dir <= -1 ? 'var(--bear)' : 'var(--yellow)';
+      return `<div style="margin-top:10px;padding:10px 12px;border-radius:8px;background:${c}0d;border-left:3px solid ${c};font-size:0.8rem">
+        <span style="color:var(--text3);font-size:0.72rem">期貨籌碼（期交所${dv.date ? '・' + dv.date : ''}）</span><br>
+        ${dv.parts.map(p => `<span style="color:${p.startsWith('⚠') ? 'var(--bear)' : 'var(--text1)'}">${p}</span>`).join('<br>')}
+      </div>`;
+    })()}
 
     <div class="outlook-text">${predict}<br>
       <span style="font-size:0.75rem;color:var(--text3)">⚠ 以上為技術面與資金面的規則化分析，僅供參考，非投資建議。</span>
@@ -1299,8 +1350,29 @@ function sectorStats() {
   }
   return Object.values(map)
     .map(g => ({ ...g, avgChg: g.n ? g.chgSum / g.n : 0,
+                 rotation: sectorRotation(g.stocks),
                  score: g.n ? Math.round(g.stocks.reduce((x, s) => x + verdictScore(s), 0) / g.n) : 50 }))
     .sort((a, b) => b.value - a.value);
+}
+
+// 族群資金輪動：近 5 日平均報酬 −（近 20 日平均報酬 ÷ 4）＝短期是否「加速」。
+// 排名快照只看得到「現在誰大」，輪動看的是「資金正往哪裡去」— 波段要買
+// 加速中的族群，不是已經漲完的族群。
+function sectorRotation(stocks) {
+  let r5s = 0, r20s = 0, n = 0;
+  for (const s of stocks) {
+    const c = s.ohlcv?.map(b => b.close);
+    if (!c || c.length < 21) continue;
+    const p = c[c.length - 1];
+    r5s += (p - c[c.length - 6]) / c[c.length - 6] * 100;
+    r20s += (p - c[c.length - 21]) / c[c.length - 21] * 100;
+    n++;
+  }
+  if (n < 2) return null;                              // 樣本太少不判
+  const r5 = r5s / n, r20 = r20s / n;
+  const accel = +(r5 - r20 / 4).toFixed(2);            // 近 5 日跑贏自身月線步調的幅度
+  return { r5: +r5.toFixed(2), r20: +r20.toFixed(2), accel,
+           state: accel >= 1.5 ? 'in' : accel <= -1.5 ? 'out' : 'flat' };
 }
 
 function renderSectorRanking() {
@@ -1313,7 +1385,19 @@ function renderSectorRanking() {
   const maxVal = Math.max(...list.map(g => g.value), 1);
   const fmtVal = v => v >= 1e8 ? `${(v / 1e8).toFixed(1)} 億` : `${Math.round(v / 1e4).toLocaleString()} 萬`;
 
-  el.innerHTML = list.map((g, i) => {
+  // 輪動摘要列：資金正在流入／流出哪些族群（依加速度排序）
+  const withRot = list.filter(g => g.rotation);
+  const inflow = withRot.filter(g => g.rotation.state === 'in').sort((a, b) => b.rotation.accel - a.rotation.accel).slice(0, 3);
+  const outflow = withRot.filter(g => g.rotation.state === 'out').sort((a, b) => a.rotation.accel - b.rotation.accel).slice(0, 3);
+  const rotBar = (inflow.length || outflow.length) ? `
+    <div style="padding:8px 14px;border-bottom:1px solid var(--border);font-size:0.73rem;line-height:1.9">
+      ${inflow.length ? `<span style="color:var(--text3)">🔥 資金流入中：</span>${inflow.map(g => `<span style="color:var(--bull);font-weight:600">${g.sector}（5日+${g.rotation.r5}%）</span>`).join('・')}` : ''}
+      ${inflow.length && outflow.length ? '<br>' : ''}
+      ${outflow.length ? `<span style="color:var(--text3)">🧊 資金流出中：</span>${outflow.map(g => `<span style="color:var(--bear);font-weight:600">${g.sector}（5日${g.rotation.r5}%）</span>`).join('・')}` : ''}
+      <span style="display:block;font-size:0.66rem;color:var(--text3)">輪動＝近 5 日報酬相對自身月線步調的加速度；波段優先選加速中的族群</span>
+    </div>` : '';
+
+  el.innerHTML = rotBar + list.map((g, i) => {
     const pct = g.value / maxVal * 100;
     const c = g.avgChg >= 0 ? 'var(--bull)' : 'var(--bear)';
     return `
@@ -1321,7 +1405,7 @@ function renderSectorRanking() {
          onclick="openSector('${g.sector.replace(/'/g, "\\'")}')">
       <span style="font-family:var(--mono);font-size:0.72rem;color:var(--text3);min-width:22px">${i + 1}</span>
       <div style="min-width:104px">
-        <div style="font-size:0.85rem;font-weight:700">${g.sector}</div>
+        <div style="font-size:0.85rem;font-weight:700">${g.sector}${g.rotation?.state === 'in' ? ' <span style="font-size:0.62rem;color:var(--bull)">🔥流入</span>' : g.rotation?.state === 'out' ? ' <span style="font-size:0.62rem;color:var(--bear)">🧊流出</span>' : ''}</div>
         <div style="font-size:0.68rem;color:var(--text3)">${g.n} 檔・多 ${g.bull} / 空 ${g.bear}</div>
       </div>
       <div style="flex:1;min-width:70px">
@@ -1894,6 +1978,14 @@ function buildManagerAnalysis(s) {
     if (bk.ratio >= 2) add(0.5, 1, `盤中五檔委買 ${bk.bid.toLocaleString()} 張為委賣 ${bk.ratio.toFixed(1)} 倍（掛單可撤，低權重參考）`, 'chip');
     else if (bk.ratio != null && bk.ratio <= 0.5) add(0.5, -1, `盤中五檔委賣 ${bk.ask.toLocaleString()} 張為委買 ${(1 / bk.ratio).toFixed(1)} 倍（上方賣壓掛單沉重）`, 'chip');
     else notes.push(`盤中五檔 委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張，掛單均衡`);
+  }
+
+  // 期貨籌碼（市場環境證據）：外資期貨部位是現貨買賣超看不到的方向表態
+  const dv = derivsSummary();
+  if (dv) {
+    if (dv.dir <= -1) add(0.4, -1, `期貨籌碼偏空：${dv.parts[0]}`, 'chip');
+    else if (dv.dir >= 1) add(0.4, 1, `期貨籌碼偏多：${dv.parts[0]}`, 'chip');
+    else if (dv.parts.length) notes.push(`期貨籌碼：${dv.parts[0]}`);
   }
 
   // 相對大盤強弱：波段選股的核心是「贏過大盤」— 資金只會集中在相對強勢股
@@ -5879,6 +5971,7 @@ function notifyPreOpen() {
   L.push('');
   L.push(`【昨日收盤】${b.twii?.price != null ? `加權 ${b.twii.price.toFixed(0)}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1?.toFixed(2) ?? '--'}%）｜` : ''}研判${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total}`);
   if (b.us.length) L.push(`【美股夜盤】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
+  (() => { const dv = derivsSummary(); if (dv) L.push(`【期貨籌碼】${dv.parts.join('｜')}`); })();
   if (b.openCall) { L.push(''); L.push(`【開盤研判】${b.openCall}`); }
   if (b.newsSec.length || b.nightNews.length) {
     L.push(''); L.push('【新聞面】');
@@ -6009,6 +6102,12 @@ function notifyPostOpen() {
 
   L.push(''); L.push('【今日重點關注】');
   b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
+  // 當沖觀察股的開盤區間（ORB）：09:30 正好是開盤區間定型的時刻
+  const orbLines = computeDayTradePicks().slice(0, 3).map(dp => {
+    const o = orbStatus(dp.s);
+    return o ? `・${dp.s.name}(${dp.s.id})　${o.txt}` : null;
+  }).filter(Boolean);
+  if (orbLines.length) { L.push(''); L.push('【當沖開盤區間 ORB】'); orbLines.forEach(x => L.push(x)); }
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(L.join('\n'));
 }
@@ -6071,6 +6170,7 @@ function notifyAfterClose() {
   if (b.twii?.chg1 != null)
     L.push(`【收盤】加權 ${b.twii.price?.toLocaleString(undefined, { maximumFractionDigits: 0 })}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1.toFixed(2)}%）｜研判分數 ${b.norm > 0 ? '+' : ''}${b.norm}`);
   if (b.instVol.length) { L.push(''); L.push('【今日籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
+  (() => { const dv = derivsSummary(); if (dv) L.push(`・${dv.parts.join('；')}`); })();
   if (b.up.length) L.push(`\n【今日強勢】${b.up.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
   if (b.down.length) L.push(`【今日弱勢】${b.down.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
   if (b.newsSec.length) L.push(`【新聞面】${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
@@ -6544,6 +6644,23 @@ function setHoldingQty(stockId) {
   showToast(`已記錄 ${h.name} 持有 ${qty} 張`, 'success');
 }
 
+// 財報季報截止日（固定法規日期，不需 API）：5/15 Q1、8/14 Q2、11/14 Q3、3/31 年報。
+// 截止日前常見「壓底線」公布，前後易暴雷跳空 — 持倉在截止日 5 天內給警示。
+function earningsDeadline(withinDays = 5) {
+  const today = twClock().date;
+  const y = +today.slice(0, 4);
+  const dl = [
+    { d: `${y}-03-31`, label: '年報' }, { d: `${y}-05-15`, label: '第一季財報' },
+    { d: `${y}-08-14`, label: '第二季財報' }, { d: `${y}-11-14`, label: '第三季財報' },
+    { d: `${y + 1}-03-31`, label: '年報' },
+  ];
+  for (const e of dl) {
+    const days = Math.round((new Date(e.d + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 86400000);
+    if (days >= 0 && days <= withinDays) return { ...e, days };
+  }
+  return null;
+}
+
 // ── 持倉事件風險：未來除權息日警示（TWT48U 預告表）────────────────────────
 let _exDivCal = null;   // fetchExDivCalendar 結果，掃描時載入
 function upcomingExDiv(stockId, withinDays = 7) {
@@ -6883,6 +7000,10 @@ function checkHoldingExit(h) {
     if (level === 'hold') level = 'watch';
     reasons.push(`已達目標價 ${t1Adj}${div > 0 ? '（除息還原後）' : ''}，可考慮減碼鎖利`);
   }
+  // 事件風險：財報截止日將至 → 暴雷跳空風險（全市場性提醒，不改變出場等級）
+  const ed = earningsDeadline(5);
+  if (ed) reasons.push(`📅 ${ed.days === 0 ? '今日' : `${ed.days} 天後`}為${ed.label}截止日（${ed.d}）— 財報公布前後波動放大，留意跳空風險`);
+
   // 事件風險：即將除權息 → 跳空與棄息賣壓，事前提醒（不直接改變出場等級）
   const exEv = upcomingExDiv(h.id, 7);
   if (exEv) {
@@ -6994,6 +7115,28 @@ function overnightGapNote(s) {
   if (chg < -0.5)
     return { pts: -2, txt: `隔夜${src} ${chg}% — 明日恐開低，開低逾 0.5% 依紀律放棄` };
   return { pts: 1, txt: `隔夜${src} ${chg >= 0 ? '+' : ''}${chg}% 持平 — 無不利跳空，訊號有效性維持` };
+}
+
+// ── 開盤區間突破（ORB）：當沖的盤中執行訊號 ───────────────────────────────
+// 開盤前 30 分鐘（09:00~09:29）高低點畫出區間：帶量站上上緣才追多、
+// 跌破下緣放棄。昨晚選的股要不要進，開盤半小時後由這個區間決定。
+function orbStatus(s) {
+  const today = twClock().date;
+  const bars = getIntradayBars(s.id, 5).filter(b => b.time.slice(0, 10) === today);
+  const or = bars.filter(b => { const hm = b.time.slice(11); return hm >= '09:00' && hm < '09:30'; });
+  if (or.length < 3) return null;                     // 桶數不足（開盤資料不完整）不判
+  const hi = +Math.max(...or.map(b => b.high)).toFixed(2);
+  const lo = +Math.min(...or.map(b => b.low)).toFixed(2);
+  const px = s.analysis?.price;
+  if (!(px > 0) || !(hi > lo)) return null;
+  const rangePct = +((hi - lo) / lo * 100).toFixed(2);
+  const state = px > hi ? 'break-up' : px < lo ? 'break-down' : 'inside';
+  const txt = state === 'break-up'
+    ? `已站上開盤區間上緣 ${hi}（區間 ${lo}~${hi}，幅 ${rangePct}%）— 順勢訊號成立，回測 ${hi} 不破可進`
+    : state === 'break-down'
+      ? `跌破開盤區間下緣 ${lo} — 依紀律放棄做多，今日不碰`
+      : `仍在開盤區間 ${lo}~${hi} 內（幅 ${rangePct}%）— 等帶量突破上緣再進，別在區間裡猜方向`;
+  return { hi, lo, rangePct, state, txt };
 }
 
 function computeDayTradePicks() {
@@ -7116,6 +7259,7 @@ function renderEntrySignals() {
         <span style="margin-left:auto;font-size:0.7rem;color:var(--text3)">現價 ${s.analysis.price.toFixed(2)}</span>
       </div>
       <div style="font-size:0.73rem;color:var(--text2);margin-top:4px;line-height:1.6">${why.join('・')}</div>
+      ${(() => { const o = orbStatus(s); return o ? `<div style="font-size:0.73rem;margin-top:4px;color:${o.state === 'break-up' ? 'var(--bull)' : o.state === 'break-down' ? 'var(--bear)' : 'var(--yellow)'}">📐 ORB：${o.txt}</div>` : ''; })()}
       <div style="margin-top:6px">${inH.has(s.id)
         ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
         : `<button class="btn-ghost" style="padding:4px 13px;font-size:0.72rem" onclick="addHolding('${s.id}','day')">⚡ 記錄當沖單</button>`}</div>
