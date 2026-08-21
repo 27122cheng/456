@@ -414,9 +414,11 @@ async function runScan() {
     notifyAfterClose();
     // 其餘推播只在可下單的時段：08:30 盤前 ~ 14:30 盤後定價撮合
     if (!inNotifyWindow()) return;
-    autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
-    notifyEntrySignals();   // 適合進場的訊號
+    // 順序即優先權：簡報與進場訊號（資訊最完整）先發並登記內容，
+    // 強勢多頭／重點關注等摘要型訊號後發、自動略過已推過的股票
+    notifyEntrySignals();   // 適合進場的訊號（含進場區/停損/目標）
     notifyHoldingExits();   // 持倉出場檢查
+    autoNotifyTelegram(); notifyEventPredictions(); notifyDailyFocus();
     notifyWeeklyBrief();    // 週一 09:30 本週佈局（含盤中掛單判定）
     notifyPreOpen();        // 每日 08:30 盤前簡報（昨收＋夜盤＋新聞＋開盤研判）
     notifyDailyBrief();     // 每日 09:00 市場簡報
@@ -5990,8 +5992,14 @@ function notifyPreOpen() {
     b.picks.forEach(({ s, p }) => L.push(`・${s.name}(${s.id})　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}${b.openCall && /開高/.test(b.openCall) ? '（開高逾區間上緣不追）' : ''}`));
   }
   if (b.days.length) L.push(`當沖觀察：${b.days.map(d => d.s.name).join('、')}（開盤跳空逾 +2% 不追、開低逾 -0.5% 放棄）`);
-  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議｜09:00 市場簡報、09:30 開盤後追蹤將另行推送');
+  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議｜09:30 開盤後追蹤將另行推送');
   tgPush(L.join('\n'));
+  // 登記已推內容：這些股票與持倉狀態今天不必再由其他訊號重推一次
+  tgMarkKeys([
+    ...b.picks.map(({ s }) => `sig:${s.id}`),
+    ...b.days.map(d => `sig:${d.s.id}`),
+    ...b.holdings.map(r => `hold:${r.h.id}:${r.level}`),
+  ]);
 }
 
 function notifyDailyBrief() {
@@ -5999,6 +6007,12 @@ function notifyDailyBrief() {
   if (!inNotifyWindow()) return;
   if (t.hour * 60 + t.minute < 9 * 60) return;             // 09:00 起
   if (localStorage.getItem('tg-daily-brief') === t.date) return;
+  // 08:30 盤前簡報已發就不再發 — 兩者內容高度重疊（大盤/美股/持倉/機會），
+  // 30 分鐘連發兩份幾乎相同的報告是重複推送的主要來源
+  if (localStorage.getItem('tg-preopen') === t.date) {
+    localStorage.setItem('tg-daily-brief', t.date);
+    return;
+  }
   const b = buildDailyBrief();
   if (!b) return;
   logSignal('brief', '每日市場簡報已推送', '09:00 盤前：大盤研判、多空家數、重點事件', { dedupKey: 'daily' });
@@ -6026,6 +6040,11 @@ function notifyDailyBrief() {
   }
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(L.join('\n'));
+  tgMarkKeys([
+    ...b.picks.map(p => `sig:${p.s.id}`),
+    ...b.focus.map(f => `sig:${f.s.id}`),
+    ...b.holdings.map(r => `hold:${r.h.id}:${r.level}`),
+  ]);
 }
 
 // ── 每日 09:30 開盤後追蹤 ──────────────────────────────────────────────────
@@ -6110,6 +6129,10 @@ function notifyPostOpen() {
   if (orbLines.length) { L.push(''); L.push('【當沖開盤區間 ORB】'); orbLines.forEach(x => L.push(x)); }
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(L.join('\n'));
+  tgMarkKeys([
+    ...b.focus.map(f => `sig:${f.s.id}`),
+    ...b.holdings.map(r => `hold:${r.h.id}:${r.level}`),
+  ]);
 }
 
 // ── 盤後總結（約 16:30，三大法人買賣超公布後）──────────────────────────────
@@ -7295,6 +7318,13 @@ function notifyHoldingExits() {
   const rows = holdings.map(checkHoldingExit).filter(Boolean);
   if (rows.length < holdings.length) return; // 資料未齊，等下輪再推
 
+  // 內容去重：持倉狀態若已由盤前/每日簡報以「相同等級」報告過，就不再獨立推一次；
+  // 有任一檔出現簡報之後的新變化（等級不同）才值得再發
+  if (!rows.some(r => !tgKeySent(`hold:${r.h.id}:${r.level}`))) {
+    localStorage.setItem('tg-holdings-date', twClock().date);
+    return;
+  }
+
   const icon = { exit: '🔴', watch: '🟡', hold: '🟢' };
   const lines = rows.map(r =>
     `${icon[r.level]} ${r.h.name}(${r.h.id}) ${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%\n` +
@@ -7313,6 +7343,7 @@ function notifyHoldingExits() {
       { id: r.h.id, dir: -1, dedupKey: r.h.id });
   }
   localStorage.setItem('tg-holdings-date', twClock().date);
+  tgMarkKeys(rows.map(r => `hold:${r.h.id}:${r.level}`));
 }
 
 // ── 實績回饋權重：用「已結算的真實成績」自動修正評分，讓系統越用越準 ──────
@@ -7401,7 +7432,8 @@ function notifyEntrySignals() {
   const today = new Date().toISOString().slice(0, 10);
   // 去重鍵用日曆日，理由同 notifyHoldingExits
   if (localStorage.getItem('tg-entry-date') === twClock().date) return;
-  const picks = computeEntrySignals();
+  // 內容去重：盤前簡報等已列過的股票不再重推；濾完沒剩就整則不發
+  const picks = computeEntrySignals().filter(({ s }) => !tgKeySent(`sig:${s.id}`));
   if (!picks.length) return;
 
   const lines = picks.slice(0, 5).map(({ s, p, d }) => {
@@ -7426,6 +7458,7 @@ function notifyEntrySignals() {
   const hw = heatWarning();
   tgPush(`🎯 台股雷達 進場訊號\n${today}\n\n偵測到 ${picks.length} 檔符合進場條件（做多）：\n\n${lines}${dayLines}${hw ? `\n\n${hw}` : ''}\n\n⚠ 僅供參考，非投資建議`);
   localStorage.setItem('tg-entry-date', twClock().date);
+  tgMarkKeys([...picks.map(({ s }) => `sig:${s.id}`), ...days.map(d => `sig:${d.s.id}`)]);
 }
 
 // ── 交易總結頁 ─────────────────────────────────────────────────────────────
@@ -8138,6 +8171,25 @@ function tgPush(text) {
   if (token && chatId) return sendTelegram(token, chatId, text);
 }
 
+// ── 當日已推內容登記表：跨訊息類型的內容去重 ────────────────────────────────
+// 問題：同一檔股票一天會被「強勢多頭」「進場訊號」「重點關注」「簡報推薦」
+// 各推一次 — 每則訊息各自有每日一次的限制，但彼此不知道對方推過什麼。
+// 這裡登記「今天已推過哪些內容鍵」（如 sig:2330、hold:2330:watch），
+// 各推播先濾掉已推過的，濾完沒剩就整則不發。
+function tgSentKeys() {
+  const d = twClock().date;
+  try {
+    const o = JSON.parse(localStorage.getItem('tg-sent-keys') || '{}');
+    return o.date === d && Array.isArray(o.keys) ? o : { date: d, keys: [] };
+  } catch { return { date: d, keys: [] }; }
+}
+function tgKeySent(k) { return tgSentKeys().keys.includes(k); }
+function tgMarkKeys(keys) {
+  const o = tgSentKeys();
+  for (const k of keys) if (k && !o.keys.includes(k)) o.keys.push(k);
+  try { localStorage.setItem('tg-sent-keys', JSON.stringify(o)); } catch {}
+}
+
 // 每日一次：重要數據公布倒數 + AI 方向預測
 function notifyEventPredictions() {
   if (!tgWants('event')) return;
@@ -8166,13 +8218,17 @@ function notifyDailyFocus() {
   const today = new Date().toISOString().slice(0, 10);
   if (localStorage.getItem('tg-focus-sent') === today) return;
 
-  const { daily, weekly } = computeFocusStocks();
-  if (!daily.length) return;
+  const all = computeFocusStocks();
+  // 內容去重：今天已被其他訊號推過的股票不再入列；今日必看濾完沒剩就不發
+  const daily = all.daily.filter(f => !tgKeySent(`sig:${f.s.id}`));
+  const weekly = all.weekly.filter(f => !tgKeySent(`sig:${f.s.id}`));
+  if (!daily.length) { localStorage.setItem('tg-focus-sent', today); return; }
 
   const dLines = daily.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
   const wLines = weekly.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) 20日${f.ret20 >= 0 ? '+' : ''}${f.ret20.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
-  tgPush(`⭐ 台股雷達 每日重點關注 ${today}\n\n📅 今日必看（短線動能）\n${dLines}\n\n🗓 本週追蹤（中期趨勢）\n${wLines}`);
+  tgPush(`⭐ 台股雷達 每日重點關注 ${today}\n\n📅 今日必看（短線動能）\n${dLines}${weekly.length ? `\n\n🗓 本週追蹤（中期趨勢）\n${wLines}` : ''}`);
   localStorage.setItem('tg-focus-sent', today);
+  tgMarkKeys([...daily, ...weekly].map(f => `sig:${f.s.id}`));
 }
 
 async function testTelegramNotif() {
@@ -8210,12 +8266,15 @@ function autoNotifyTelegram() {
   if (localStorage.getItem('tg-strong-sent') === today) return; // 每日一次，避免刷屏
 
   const bullThresh = getThreshold('bull') + 15;
-  const strong = allStocks.filter(s => s.analysis && verdictScore(s) >= bullThresh);
-  if (!strong.length) return;
+  // 內容去重：今天已被進場訊號／簡報／重點關注推過的股票不再重推
+  const strong = allStocks.filter(s => s.analysis && verdictScore(s) >= bullThresh)
+    .filter(s => !tgKeySent(`sig:${s.id}`));
+  if (!strong.length) { localStorage.setItem('tg-strong-sent', today); return; }
 
   const lines = strong.map(s => `${s.name}(${s.id}) 評分 ${verdictScore(s)}｜${verdictSignal(s)}`).join('\n');
   tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
   localStorage.setItem('tg-strong-sent', today);
+  tgMarkKeys(strong.map(s => `sig:${s.id}`));
 }
 
 // ── 大盤 頂/底反轉可能性（儀表板）───────────────────────────────────────────
