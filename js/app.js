@@ -4603,6 +4603,25 @@ async function runDiagnostics() {
         const t = r.find(x => x.id === '2330') || r[0];
         return { ok: true, msg: `${r.length} 檔｜${t.name || t.id} 外資 ${t.foreign.toLocaleString()} 張` };
       } },
+    { name: '除權息預告 (TWT48U)', run: async () => {
+        const r = await fetchExDivCalendar();
+        if (!Array.isArray(r)) return { ok: false, msg: '無回應' };
+        return { ok: true, msg: r.length ? `${r.length} 檔未來除權息事件` : '目前無未來除權息預告（可能為淡季，正常）' };
+      } },
+    { name: '期交所 P/C 比 (PutCallRatio)', run: async () => {
+        const r = await fetchTaifexPCR();
+        return r?.ratio != null ? { ok: true, msg: `P/C ${r.ratio.toFixed(2)}（${r.date || '日期不明'}）` }
+                                : { ok: false, msg: '無資料 — 期交所 OpenAPI 無回應或格式變更' };
+      } },
+    { name: '期交所外資台指期 (三大法人期貨)', run: async () => {
+        const r = await fetchTaifexForeignTX();
+        return r?.net != null ? { ok: true, msg: `外資淨${r.net >= 0 ? '多' : '空'} ${Math.abs(r.net).toLocaleString()} 口（${r.date || '日期不明'}）` }
+                              : { ok: false, msg: '無資料 — 期交所 OpenAPI 無回應或格式變更' };
+      } },
+    { name: '財經新聞 (Google News RSS)', run: async () => {
+        const r = await fetchNewsRSS('台股 股市', 5).catch(() => null);
+        return r?.length ? { ok: true, msg: `${r.length} 則，最新：${r[0].headline.slice(0, 24)}…` } : { ok: false, msg: '無回應' };
+      } },
     { name: '即時報價來源總覽', run: async () => {
         const direct = localStorage.getItem('mis-direct');
         const parts = [`MIS 直連：${direct === 'yes' ? '可用（用你自己的 IP，不受共用限流）' : direct === 'no' ? '不支援（改走共用代理）' : '尚未偵測'}`];
@@ -5964,9 +5983,18 @@ function buildPreOpen() {
     focus = (computeFocusStocks().daily || []).filter(f => !pickIds.has(f.s.id)).slice(0, 3);
   } catch {}
 
+  // ⑧ 族群資金輪動：今天優先看哪個族群
+  let rotation = null;
+  try {
+    const secs = sectorStats().filter(g => g.rotation);
+    const inflow = secs.filter(g => g.rotation.state === 'in').sort((a, b) => b.rotation.accel - a.rotation.accel).slice(0, 3);
+    const outflow = secs.filter(g => g.rotation.state === 'out').sort((a, b) => a.rotation.accel - b.rotation.accel).slice(0, 2);
+    if (inflow.length || outflow.length) rotation = { inflow, outflow };
+  } catch {}
+
   return { date: twClock().date, twii, bullN, bearN, total: ready.length, norm, regime,
            us, vix, ov, openCall, nightNews, newsSec, todayEvts, evtsSoon,
-           holdings, exits, watches, picks, days, focus };
+           holdings, exits, watches, picks, days, focus, rotation };
 }
 
 function notifyPreOpen() {
@@ -6012,6 +6040,11 @@ function notifyPreOpen() {
   }
   if (b.days.length) L.push(`當沖觀察：${b.days.map(d => d.s.name).join('、')}（開盤跳空逾 +2% 不追、開低逾 -0.5% 放棄）`);
   if (b.focus.length) L.push(`重點關注：${b.focus.map(f => `${f.s.name}(${f.s.id})`).join('、')}`);
+  if (b.rotation) {
+    const rIn = b.rotation.inflow.map(g => `${g.sector}（5日${g.rotation.r5 >= 0 ? '+' : ''}${g.rotation.r5}%）`).join('、');
+    const rOut = b.rotation.outflow.map(g => g.sector).join('、');
+    L.push(`族群輪動：${rIn ? `🔥流入 ${rIn}` : ''}${rIn && rOut ? '｜' : ''}${rOut ? `🧊流出 ${rOut}` : ''} — 波段優先選加速中的族群`);
+  }
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議｜09:30 開盤後追蹤將另行推送');
   tgPush(L.join('\n'));
   // 登記已推內容：這些股票與持倉狀態今天不必再由其他訊號重推一次
