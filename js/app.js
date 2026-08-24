@@ -2333,6 +2333,9 @@ function buildEntryPlan(s, m) {
 
   // ── 進場依據：大戶籌碼 / 基本面 / 技術面三個面向的支撐 ──
   const support = { chips: [], fund: [], tech: [] };
+  // 大戶偵測結果（已通過陷阱檢查者）直接寫進進場理由 — 不再獨立推播
+  const wh = whaleFor(s.id);
+  if (wh) support.chips.push(`🐋 大戶動向：${wh.sig.slice(0, 2).join('；')}（已通過誘多/出貨陷阱檢查）`);
   // 大戶籌碼
   const streak = instStreak(s.id);
   if (s.foreign > 1000) support.chips.push(`外資買超 ${s.foreign.toLocaleString()} 張`);
@@ -6288,6 +6291,11 @@ function notifyAfterClose() {
 
 let _whaleResults = [];
 
+// 通過陷阱檢查的大戶偵測結果（供交易建議的進場理由引用）
+function whaleFor(stockId) {
+  return _whaleResults.find(r => r.s.id === stockId && !r.trap.length && r.sig?.length) || null;
+}
+
 function isMarketOpenTW() {
   try {
     const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
@@ -6382,7 +6390,13 @@ async function detectWhales() {
   results.sort((x, y) => y.net - x.net);
   _whaleResults = results.slice(0, 10);
   renderWhales();
-  notifyWhales();
+  // 不再推播 Telegram — 乾淨的偵測結果改寫進交易建議的進場理由（whaleFor），
+  // 儀表板與流水帳仍完整記錄
+  for (const r of _whaleResults) {
+    if (r.trap.length || !r.sig?.length) continue;
+    logSignal('whale', `${r.s.name}（${r.s.id}）大戶動向（已過陷阱檢查）`,
+      r.sig.join('；'), { id: r.s.id, dir: 1, dedupKey: r.s.id });
+  }
 }
 
 function renderWhales() {
@@ -6506,7 +6520,8 @@ function notifyDataDate() {
   return s ? s.ohlcv[s.ohlcv.length - 1].time.slice(0, 10) : new Date().toISOString().slice(0, 10);
 }
 
-// 通過陷阱檢查的大戶訊號 → Telegram（每份法人資料每檔一次），附交易分析
+// 【已退出自動排程】大戶訊號不再獨立推播 — 乾淨的偵測結果由 whaleFor()
+// 寫進交易建議的進場理由，流水帳照記。保留函式供手動觸發。
 function notifyWhales() {
   if (!tgWants('sig')) return;
   if (!inNotifyWindow()) return;   // 假日與非交易時段不推播
