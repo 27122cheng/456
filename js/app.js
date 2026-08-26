@@ -740,8 +740,8 @@ function renderMarketOutlook() {
     ? '。'
     : `，<span style="color:var(--yellow)">資料完整度 ${coverage}%（部分來源未回應，評分僅供參考）</span>。`;
   if (drivers) predict += `主要驅動：${drivers}。`;
-  if (twii) predict += ` 加權指數 5 日${twii.chg5 >= 0 ? '上漲' : '下跌'} ${Math.abs(twii.chg5).toFixed(1)}%`;
-  if (sox)  predict += `，費半 5 日${sox.chg5 >= 0 ? '+' : ''}${sox.chg5.toFixed(1)}%（台股電子權值高度連動）`;
+  if (twii?.chg5 != null) predict += ` 加權指數 5 日${twii.chg5 >= 0 ? '上漲' : '下跌'} ${Math.abs(twii.chg5).toFixed(1)}%`;
+  if (sox?.chg5 != null)  predict += `，費半 5 日${sox.chg5 >= 0 ? '+' : ''}${sox.chg5.toFixed(1)}%（台股電子權值高度連動）`;
   predict += `。<strong>後市看法：${vAction}。</strong>`;
 
   const arrow = d => d === 'up' ? '<span style="color:var(--bull)">▲</span>' : d === 'dn' ? '<span style="color:var(--bear)">▼</span>' : '<span style="color:var(--text3)">─</span>';
@@ -2858,6 +2858,12 @@ function renderPatterns(s) {
   if (a.gaps?.list?.length) parts.push(card('🕳 未回補跳空缺口',
     a.gaps.list.slice(-3).map(g => `${g.type === 'up' ? '⬆ 上跳' : '⬇ 下跳'} ${g.bottom} ~ ${g.top}<span style="font-size:0.72rem;color:var(--text3)">（${g.time}${g.type === 'up' ? '，回測此區有支撐' : '，反彈至此區有壓力'}）</span>`).join('<br>'),
     'var(--blue)'));
+  // 盤中限定：開盤區間突破（ORB）— 有今日分鐘 K 才顯示
+  const orb = orbStatus(s);
+  if (orb) parts.push(card('📐 開盤區間（ORB）', orb.txt +
+    `<br><span style="font-size:0.74rem;color:var(--text3);font-family:var(--mono)">區間 ${orb.lo} ~ ${orb.hi}（幅 ${orb.rangePct}%）</span>`,
+    tone(orb.state === 'break-up' ? 1 : orb.state === 'break-down' ? -1 : 0)));
+
   if (a.ob?.list?.length) {
     const pr = a.price;
     const row = o => {
@@ -5968,9 +5974,18 @@ function buildPreOpen() {
   });
 
   // ⑤-b 近日重要數據倒數（3 天內）＋事前方向判讀 — 原獨立推播，併入盤前
-  const nowD = new Date();
-  const evtsSoon = (getUpcomingEvents() || []).filter(e => (e.date - nowD) / 86400000 <= 3)
-    .map(e => ({ name: e.name, impact: e.impact, days: Math.max(0, Math.ceil((e.date - nowD) / 86400000)) }));
+  // 只列 1~3「日曆日」後的（今日事件已在【今日數據】段，避免同一事件列兩次；
+  // 用時數 ceil 會把今天下午的事件誤標成「1 天後」）
+  const fmtTW = d => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei' }).format(d);
+  const todayTW = twClock().date;
+  const evtsSoon = (getUpcomingEvents() || [])
+    .map(e => {
+      const iso = (() => { try { return fmtTW(e.date instanceof Date ? e.date : new Date(e.date)); } catch { return null; } })();
+      if (!iso) return null;
+      const days = Math.round((new Date(iso + 'T00:00:00Z') - new Date(todayTW + 'T00:00:00Z')) / 86400000);
+      return { name: e.name, impact: e.impact, days };
+    })
+    .filter(e => e && e.days >= 1 && e.days <= 3);
 
   // ⑥ 持倉與交易重點（昨收資料的評估 — 開盤後 09:30 另有追蹤版）
   const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
