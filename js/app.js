@@ -7389,6 +7389,64 @@ function computeDayTradePicks() {
 }
 
 // 持有中頁：今日推薦交易（分三類呈現）
+// ── 長期持有名單（持久化）─────────────────────────────────────────────────
+// 問題：長期名單過去每天從「短線進場訊號」重新海選 — 乖離/量能/品質分
+// 一晃動就進進出出，說是放 3 個月以上的股票卻天天換臉。
+// 原則：慢變數選入、選入後黏住。只有「長期論點壞掉」才剔除：
+//   跌破年線（緩衝 3%）／中期死亡交叉（EMA50<EMA200）／
+//   營收明顯衰退或本業虧損／列入處置。短線拉回不是剔除理由。
+const LT_MAX = 8;
+function getLongTermList() {
+  try { return JSON.parse(localStorage.getItem('longterm-list') || '[]'); } catch { return []; }
+}
+function saveLongTermList(l) { try { localStorage.setItem('longterm-list', JSON.stringify(l.slice(0, LT_MAX))); } catch {} }
+
+// 長期論點是否壞掉（只看慢變數；回傳剔除原因或 null）
+function longTermThesisBroken(s) {
+  const a = s?.analysis;
+  if (!a) return null;                             // 無資料不動名單，等資料
+  if (s._alert?.level === 'punish') return '列入處置股，流動性風險';
+  if (a.ema200 && a.price < a.ema200 * 0.97) return `跌破年線 ${a.ema200.toFixed(2)}（含 3% 緩衝）— 長多結構失效`;
+  if (a.ema50 && a.ema200 && a.ema50 < a.ema200 * 0.995) return '季線跌破年線（中期死亡交叉）';
+  if (s.rev?.yoy != null && s.rev.yoy <= -10) return `月營收年減 ${s.rev.yoy.toFixed(0)}% — 成長論點動搖`;
+  if (s._fin?.netMargin != null && s._fin.netMargin < 0) return '本業轉虧';
+  return null;
+}
+
+// 每輪掃描後維護名單：現有成員只用慢變數審核；新合格者補進（不擠掉舊成員）
+function updateLongTermList() {
+  const list = getLongTermList();
+  const out = [];
+  let changed = false;
+  for (const it of list) {
+    const s = allStocks.find(x => x.id === it.id);
+    if (!s?.analysis) { out.push(it); continue; }        // 沒掃到 → 保留，不亂動
+    if (s._staleDays >= STALE_LIMIT) { out.push(it); continue; }
+    const broken = longTermThesisBroken(s);
+    if (broken) {
+      changed = true;
+      logSignal('exit', `${it.name}（${it.id}）移出長期持有名單`, broken, { id: it.id, dir: -1, dedupKey: `lt-${it.id}` });
+    } else out.push(it);
+  }
+  // 新合格者：今日進場訊號中通過長期分類者（名單未滿才補）
+  if (out.length < LT_MAX) {
+    try {
+      for (const pk of computeEntrySignals()) {
+        if (out.length >= LT_MAX) break;
+        if (out.some(x => x.id === pk.s.id)) continue;
+        const why = classifyLongTerm(pk.s);
+        if (!why) continue;
+        out.push({ id: pk.s.id, name: pk.s.name, addedAt: twClock().date,
+                   basePrice: +pk.s.analysis.price.toFixed(2), why: why.slice(0, 4) });
+        changed = true;
+        logSignal('entry', `${pk.s.name}（${pk.s.id}）入選長期持有名單`, why.slice(0, 3).join('・'), { id: pk.s.id, dir: 1, dedupKey: `lt-${pk.s.id}` });
+      }
+    } catch {}
+  }
+  if (changed) saveLongTermList(out);
+  return out;
+}
+
 function renderEntrySignals() {
   const el = document.getElementById('entry-signals-body');
   if (!el) return;
@@ -7397,13 +7455,41 @@ function renderEntrySignals() {
   const picks = computeEntrySignals();
   const inH = new Set(getHoldings().map(h => h.id));
 
-  const longs = [], swings = [];
-  for (const pk of picks.slice(0, 8)) {
-    const ltWhy = classifyLongTerm(pk.s);
-    if (ltWhy) longs.push({ ...pk, ltWhy });
-    else swings.push(pk);
-  }
+  // 長期：改用持久化名單（慢變數審核，短線波動不換臉）；波段：當日訊號扣除長期成員
+  const ltList = updateLongTermList();
+  const ltIds = new Set(ltList.map(x => x.id));
+  const swings = picks.slice(0, 8).filter(pk => !ltIds.has(pk.s.id) && !classifyLongTerm(pk.s));
   const days = computeDayTradePicks();
+
+  // 長期成員卡：入選日／期間報酬／目前狀態，短線拉回明講「屬正常波動」
+  const ltCard = it => {
+    const s = allStocks.find(x => x.id === it.id);
+    const px = s?.analysis?.price;
+    const ret = px && it.basePrice ? (px / it.basePrice - 1) * 100 : null;
+    const held = tradingDaysBetween(it.addedAt, twClock().date);
+    const timing = (() => {
+      if (!s?.analysis) return null;
+      const ext = s.analysis.ema20 ? (px / s.analysis.ema20 - 1) * 100 : null;
+      if (ext == null) return null;
+      if (ext <= 2.5) return { t: '目前貼近 EMA20 — 屬可加碼位', c: 'var(--bull)' };
+      if (ext >= 6) return { t: `短線乖離 ${ext.toFixed(1)}% — 等拉回再加碼，非賣出訊號`, c: 'var(--yellow)' };
+      return { t: '趨勢持有中，短線波動屬正常', c: 'var(--text3)' };
+    })();
+    return `
+    <div style="padding:11px 13px;border-radius:9px;background:rgba(34,197,94,0.05);border:1px solid rgba(34,197,94,0.16);margin-bottom:9px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:0.88rem;cursor:pointer" onclick="openStock('${it.id}')">${it.name} <span style="color:var(--text3);font-size:0.74rem">${it.id}</span></strong>
+        <span style="font-size:0.66rem;padding:1px 8px;border-radius:9px;background:rgba(34,197,94,0.14);color:var(--bull);font-weight:700">入選 ${held ?? '--'} 個交易日</span>
+        ${ret != null ? `<span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${ret >= 0 ? 'var(--bull)' : 'var(--bear)'}">${ret >= 0 ? '+' : ''}${ret.toFixed(1)}%</span>` : ''}
+      </div>
+      <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">入選日 ${it.addedAt}｜入選價 ${it.basePrice}｜現價 ${px != null ? px.toFixed(2) : '--'}</div>
+      <div style="font-size:0.73rem;color:var(--text2);margin-top:4px;line-height:1.6">${(it.why || []).join('・')}</div>
+      ${timing ? `<div style="font-size:0.7rem;margin-top:3px;color:${timing.c}">${timing.t}</div>` : ''}
+      <div style="margin-top:7px">${inH.has(it.id)
+        ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
+        : `<button class="btn-ghost" style="padding:4px 13px;font-size:0.72rem" onclick="addHolding('${it.id}','long')">📌 記錄持倉</button>`}</div>
+    </div>`;
+  };
 
   const card = ({ s, m, p, d, q, ltWhy }, kind) => `
     <div style="padding:11px 13px;border-radius:9px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.15);margin-bottom:9px">
@@ -7446,8 +7532,8 @@ function renderEntrySignals() {
     : '';
 
   const body =
-    sect('🏛 可長期持有（3 個月以上）', '長期趨勢結構＋至少兩項基本面支撐，適合大部位慢慢佈局、用季線防守',
-      longs.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
+    sect('🏛 長期持有名單（3 個月～半年以上）', '慢變數選入後即固定 — 只有跌破年線/中期死叉/營收轉差/處置才剔除，短線拉回不換股',
+      ltList.map(ltCard).join('')) +
     sect('📈 短期波段（數日～數週）', '技術與籌碼轉強但基本面支撐不足以長抱，按建議停損/目標紀律操作',
       swings.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
     sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋強收盤動能篩選（處置/注意股已排除）。開盤跳空逾 +2% 不追（開高走低是隔日沖最大虧損源）、開低逾 -0.5% 放棄；收盤前務必出場',
