@@ -7069,6 +7069,60 @@ function updateTrailingStops() {
   if (changed) saveHoldings(holdings);
 }
 
+// ── 持倉健康度：進場之後「這筆交易走得怎麼樣」的階段化管理 ────────────────
+// 出場檢查答的是「該不該跑」，健康度答的是「這筆交易現在處於哪個階段、
+// 下一步該做什麼」。以 R 倍數（相對原始停損的風險單位）分段：
+//   試煉期(<0.5R) → 保護期(0.5~1R) → 保本期(≥1R) → 追蹤期(≥2R)
+function holdingHealth(h, s, m) {
+  const a = s?.analysis;
+  if (!a || !h?.entry) return null;
+  const div = exDivAdjust(s.ohlcv, h.addedAt);
+  const stop0 = h.stop0 ?? h.stop;
+  const risk0 = h.entry - stop0;
+  if (!(risk0 > 0)) return null;
+  const rNow = +(((a.price + div) - h.entry) / risk0).toFixed(2);
+
+  const stage = rNow >= 2 ? { k: 'trail', txt: '追蹤期（≥2R）', icon: '🏃' }
+              : rNow >= 1 ? { k: 'be', txt: '保本期（≥1R）', icon: '🛡' }
+              : rNow >= 0.5 ? { k: 'protect', txt: '保護期（0.5~1R）', icon: '🌱' }
+              : { k: 'test', txt: '試煉期（<0.5R）', icon: '🥚' };
+
+  const actions = [];
+  if (stage.k === 'trail') actions.push(`已達 +${rNow}R — 停損只上移不下調，跟隨 EMA20/2×ATR 追蹤，讓利潤奔跑`);
+  else if (stage.k === 'be') {
+    if (h.stop < h.entry - div) actions.push(`已達 +${rNow}R 但停損仍在成本之下 — 依紀律上移至成本 ${(h.entry - div).toFixed(2)} 變保本單`);
+    else actions.push(`保本單成立（停損 ${h.stop} ≥ 成本）— 最壞打平，可安心持有等 2R`);
+  }
+  else if (stage.k === 'protect') actions.push('獲利尚未覆蓋風險 — 不加碼，跌回成本下代表進場點失效');
+  else if (rNow <= -0.5) actions.push(`已回撤 ${rNow}R — 距停損不遠，禁止向下攤平，觸價就走`);
+
+  // 資金效率：持有超過 10 個交易日仍在原地（<0.3R），資金卡在不會動的地方
+  const held = tradingDaysBetween(h.addedAt, twClock().date);
+  const stagnant = held != null && held >= 10 && Math.abs(rNow) < 0.3;
+  if (stagnant) actions.push(`持有 ${held} 個交易日仍在 ±0.3R 內震盪 — 資金效率差，若無催化劑可考慮換股（時間也是成本）`);
+
+  // 上方最近壓力：接近時先減碼再說
+  const res = [];
+  if (a.ob?.resist && a.ob.resist.bottom > a.price) res.push(a.ob.resist.bottom);
+  if (a.vp?.vah > a.price) res.push(a.vp.vah);
+  const nearRes = res.length ? Math.min(...res) : null;
+  if (nearRes && (nearRes - a.price) / a.price <= 0.02 && rNow > 0)
+    actions.push(`距上方壓力 ${nearRes.toFixed(2)} 不到 2% — 可先減碼一部分，突破站穩再接回`);
+
+  // 健康分數（0~100）：方向 40、R 進度 30、量能行為 15、資金效率 15
+  let score = 0;
+  const dir = m?.dir ?? 0;
+  score += dir >= 3 ? 40 : dir >= 1.5 ? 30 : dir >= 0 ? 18 : dir >= -1.5 ? 8 : 0;
+  score += rNow >= 2 ? 30 : rNow >= 1 ? 24 : rNow >= 0.3 ? 16 : rNow >= -0.3 ? 10 : rNow >= -0.7 ? 4 : 0;
+  const bt = a.brk?.type;
+  score += (bt === 'distribution' || bt === 'churn') ? 2 : (bt === 'breakout-vol' || bt === 'accumulation') ? 15 : 9;
+  score += stagnant ? 2 : 15;
+  score = Math.min(100, score);
+  const tone = score >= 70 ? 'good' : score >= 45 ? 'ok' : 'bad';
+
+  return { rNow, stage, actions, score, tone, held, stagnant, nearRes };
+}
+
 // 對單一持倉做出場研判
 function checkHoldingExit(h) {
   const s = allStocks.find(x => x.id === h.id);
@@ -7118,9 +7172,18 @@ function checkHoldingExit(h) {
     if (level === 'hold') level = 'watch';
     reasons.push(`📅 ${exEv.days === 0 ? '今日' : `${exEv.days} 天後（${exEv.date}）`}除權息${exEv.amt ? `（${exEv.type || '息值'} ${exEv.amt} 元）` : ''} — 留意棄息賣壓與跳空，可考慮事件前收緊停損或降部位`);
   }
+  // 持倉健康度：階段化管理建議（R 倍數/資金效率/壓力減碼），最多取兩條
+  const hh = holdingHealth(h, s, m);
+  if (hh) {
+    for (const act of hh.actions.slice(0, 2)) reasons.push(`📊 ${act}`);
+    // 資金效率差且方向轉平 → 至少升為留意（錢卡著不動也是風險）
+    if (hh.stagnant && level === 'hold' && (m?.dir ?? 0) < 1.5) level = 'watch';
+  }
+
   if (!reasons.length) reasons.push(m ? `結構維持「${m.stance}」，續抱` : '結構穩定，續抱');
 
-  return { h, s, price, retPct, level, reasons, stance: m?.stance, trail: m ? +Math.max(price - (m.atr || price * 0.02) * 2, a.ema20 || 0).toFixed(2) : null };
+  return { h, s, price, retPct, level, reasons, stance: m?.stance, health: hh,
+           trail: m ? +Math.max(price - (m.atr || price * 0.02) * 2, a.ema20 || 0).toFixed(2) : null };
 }
 
 // 組合風險總量卡（持倉清單頂部）
@@ -7159,6 +7222,7 @@ function holdingsHTML() {
         <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.07);color:var(--text2)">${r.h.kind === 'day' ? '當沖單' : '長線單'}</span>
         <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:${r.h.src === 'manual' ? 'rgba(245,158,11,0.14)' : 'rgba(0,212,255,0.12)'};color:${r.h.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${r.h.src === 'manual' ? '自行購入' : 'AI 建議'}</span>
         <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${r.pending ? '⏳ 待掃描' : badge[r.level].t}</span>
+        ${r.health ? `<span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.06);color:${r.health.tone === 'good' ? 'var(--bull)' : r.health.tone === 'ok' ? 'var(--yellow)' : 'var(--bear)'}" title="持倉健康度（方向/R 進度/量能/資金效率）">${r.health.stage.icon} ${r.health.stage.txt}・${r.health.rNow >= 0 ? '+' : ''}${r.health.rNow}R・健康 ${r.health.score}</span>` : ''}
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</span>
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
@@ -7341,10 +7405,11 @@ function renderEntrySignals() {
   }
   const days = computeDayTradePicks();
 
-  const card = ({ s, m, p, d, ltWhy }, kind) => `
+  const card = ({ s, m, p, d, q, ltWhy }, kind) => `
     <div style="padding:11px 13px;border-radius:9px;background:rgba(0,212,255,0.05);border:1px solid rgba(0,212,255,0.15);margin-bottom:9px">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <strong style="font-size:0.88rem;cursor:pointer" onclick="openStock('${s.id}')">${s.name} <span style="color:var(--text3);font-size:0.74rem">${s.id}</span></strong>
+        ${q ? `<span style="font-size:0.66rem;padding:1px 8px;border-radius:9px;font-weight:800;background:${q.grade === 'A' ? 'rgba(34,197,94,0.16)' : 'rgba(245,158,11,0.14)'};color:${q.grade === 'A' ? 'var(--bull)' : 'var(--yellow)'}" title="進場品質：位置/趨勢階段/量能/相對強弱/族群輪動/籌碼/一致性/風報比 八因子匯流">品質 ${q.grade}（${q.score}）</span>` : ''}
         <span style="font-size:0.66rem;padding:1px 8px;border-radius:9px;background:rgba(0,212,255,0.14);color:var(--blue);font-weight:700">綜合 ${d.total}</span>
         <span style="font-size:0.66rem;color:${m.stanceColor}">${m.stance}</span>
         <span style="margin-left:auto;font-size:0.7rem;color:var(--text3)">一致性 ${(m.agr * 100).toFixed(0)}%</span>
@@ -7354,6 +7419,8 @@ function renderEntrySignals() {
       </div>
       <div style="font-size:0.7rem;color:var(--blue);margin-top:3px">紀律：觸及 1R（${(p.lo * 2 - p.stop).toFixed(2)}）先減碼一半、停損上移至成本 — 回測驗證可大幅減少「賺過又變虧」</div>
       <div style="font-size:0.73rem;color:var(--text3);margin-top:4px">${(ltWhy || d.reasons).slice(0, 3).join('・')}</div>
+      ${q?.top?.length ? `<div style="font-size:0.7rem;color:var(--blue);margin-top:3px">進場點優勢：${q.top.map(x => x.txt).join('・')}</div>` : ''}
+      ${q?.weak?.length ? `<div style="font-size:0.7rem;color:var(--yellow);margin-top:2px">弱項：${q.weak.slice(0, 2).join('・')}</div>` : ''}
       <div style="margin-top:7px">${inH.has(s.id)
         ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
         : `<button class="btn-primary" style="padding:5px 14px;font-size:0.74rem" onclick="addHolding('${s.id}','${kind}')">📌 買進後記錄持倉</button>`}</div>
@@ -7465,6 +7532,89 @@ function signalPerfStats() {
 }
 
 // 今日符合進場條件的推薦交易（持有中頁與 Telegram 推送共用同一套標準）
+// sectorStats 會掃全池算研判 — 逐檔評品質時每檔都重算會變 O(n²)，記憶化 60 秒
+let _secStatsMemo = null, _secStatsAt = 0;
+function sectorStatsCached() {
+  if (_secStatsMemo && Date.now() - _secStatsAt < 60 * 1000) return _secStatsMemo;
+  _secStatsMemo = sectorStats(); _secStatsAt = Date.now();
+  return _secStatsMemo;
+}
+
+// ── 進場品質評分：多因子「匯流」才是好進場點 ──────────────────────────────
+// 研判分數答的是「這檔強不強」，品質分數答的是「現在進場好不好」—
+// 強勢股在乖離 8% 的位置進場，仍是爛進場。八個因子各自命名計分，
+// 讓每一分都說得出來源，也讓推薦卡能解釋「為什麼是它」。
+function entryQuality(s, m, p) {
+  const a = s.analysis;
+  const f = [];   // { k, pts, max, txt }
+  const push = (k, pts, max, txt) => f.push({ k, pts: Math.max(0, Math.round(pts)), max, txt });
+
+  // ① 進場位置（20）：離 EMA20 越近越好 — 拉回進場優於追突破後的乖離
+  const ext = a.ema20 ? (a.price / a.ema20 - 1) * 100 : null;
+  if (ext == null) push('位置', 8, 20, '無均線資料，位置中性');
+  else if (ext <= 2) push('位置', 20, 20, `貼近 EMA20（乖離 ${ext.toFixed(1)}%）— 拉回進場位`);
+  else if (ext <= 4) push('位置', 13, 20, `乖離 EMA20 ${ext.toFixed(1)}%，位置尚可`);
+  else if (ext <= 6) push('位置', 6, 20, `乖離 EMA20 ${ext.toFixed(1)}%，稍有追高`);
+  else push('位置', 0, 20, `乖離 EMA20 ${ext.toFixed(1)}% — 追高位，回檔空間大`);
+
+  // ② 趨勢階段（15）：初升/主升段給分，末升段大砍 — 追末段是虧損主因
+  const ph = a.trend?.phase, mat = a.trend?.maturity;
+  if (ph === 'strong-up' || ph === 'up')
+    push('趨勢階段', mat === 'early' ? 15 : mat === 'late' ? 4 : 11, 15,
+      `${a.trend.phaseTxt}${mat === 'early' ? '（初段，空間大）' : mat === 'late' ? '（末段，追價風險高）' : ''}`);
+  else push('趨勢階段', 0, 15, '趨勢未確立');
+
+  // ③ 量能確認（10）
+  const bt = a.brk?.type;
+  if (bt === 'breakout-vol' || bt === 'accumulation') push('量能', 10, 10, a.brk.txt);
+  else if (bt === 'breakout-novol' || bt === 'breakout-weak') push('量能', 4, 10, a.brk.txt);
+  else if (bt === 'distribution' || bt === 'churn') push('量能', 0, 10, a.brk.txt);
+  else push('量能', 5, 10, '量能中性');
+
+  // ④ 相對大盤強弱（15）
+  const mret = marketRet20();
+  const closes = s.ohlcv.map(b => b.close);
+  const r20 = closes.length >= 21 ? (a.price - closes[closes.length - 21]) / closes[closes.length - 21] * 100 : null;
+  if (mret == null || r20 == null) push('相對強弱', 6, 15, '無大盤基準，中性');
+  else {
+    const gap = r20 - mret;
+    if (gap >= 8) push('相對強弱', 15, 15, `20 日跑贏大盤 ${gap.toFixed(1)}pp（強勢股）`);
+    else if (gap >= 4) push('相對強弱', 11, 15, `領先大盤 ${gap.toFixed(1)}pp`);
+    else if (gap >= 0) push('相對強弱', 6, 15, '與大盤同步');
+    else push('相對強弱', 0, 15, `落後大盤 ${Math.abs(gap).toFixed(1)}pp — 資金不在這`);
+  }
+
+  // ⑤ 族群輪動（10）：買加速中的族群，不買失寵的
+  let rot = null;
+  try { rot = sectorStatsCached().find(g => g.sector === (s.sector || '其他'))?.rotation ?? null; } catch {}
+  if (rot?.state === 'in') push('族群輪動', 10, 10, `${s.sector}族群資金流入中（5日 ${rot.r5 >= 0 ? '+' : ''}${rot.r5}%）`);
+  else if (rot?.state === 'out') push('族群輪動', 0, 10, `${s.sector}族群資金流出中 — 逆風`);
+  else push('族群輪動', 5, 10, '族群動能中性');
+
+  // ⑥ 籌碼（15）：法人連買＋大戶訊號
+  let chip = 0; const chipTxt = [];
+  const st = instStreak(s.id);
+  if (st?.dir > 0 && st.days >= 3) { chip += 8; chipTxt.push(`法人連 ${st.days} 日買超`); }
+  else if (st?.dir > 0 && st.days >= 2) { chip += 5; chipTxt.push(`法人連 ${st.days} 日買超`); }
+  if (whaleFor(s.id)) { chip += 7; chipTxt.push('大戶訊號（已過陷阱檢查）'); }
+  else if (s.investment > 500) { chip += 3; chipTxt.push('投信買超'); }
+  push('籌碼', Math.min(chip, 15), 15, chipTxt.join('＋') || '無明顯籌碼加持');
+
+  // ⑦ 訊號一致性（10）
+  push('一致性', m.agr >= 0.7 ? 10 : m.agr >= 0.55 ? 7 : m.agr >= 0.4 ? 4 : 0, 10,
+    `證據一致性 ${(m.agr * 100).toFixed(0)}%`);
+
+  // ⑧ 風報比（5）
+  push('風報比', p.rr >= 2 ? 5 : p.rr >= 1.5 ? 3 : 0, 5,
+    p.rr ? `1:${p.rr.toFixed(1)}` : '無固定目標（續抱型）');
+
+  const score = f.reduce((x, y) => x + y.pts, 0);
+  const grade = score >= 75 ? 'A' : score >= 60 ? 'B' : 'C';
+  return { score, grade, factors: f,
+           top: [...f].sort((x, y) => (y.pts / y.max) - (x.pts / x.max)).slice(0, 3),
+           weak: f.filter(x => x.pts === 0).map(x => x.txt) };
+}
+
 function computeEntrySignals() {
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length < 5) return [];
@@ -7505,10 +7655,20 @@ function computeEntrySignals() {
       }
     }
     if (d.total < 65) continue;                      // 扣分後仍需通過五維度綜合門檻
-    picks.push({ s, m, p, d });
+    // 進場品質門檻：研判強（該不該買）之外，還要進場點好（現在買好不好）
+    const q = entryQuality(s, m, p);
+    if (q.score < 55) continue;                      // C 級進場點寧可放掉
+    picks.push({ s, m, p, d, q });
   }
-  picks.sort((a, b) => b.d.total - a.d.total);
-  return picks;
+  // 依進場品質排序（品質同分再比五維度）
+  picks.sort((a, b) => (b.q.score - a.q.score) || (b.d.total - a.d.total));
+  // 族群分散：同族群最多取 2 檔 — 三檔同族群等於同一注押三次
+  const secCnt = {};
+  return picks.filter(pk => {
+    const sec = pk.s.sector || '其他';
+    secCnt[sec] = (secCnt[sec] || 0) + 1;
+    return secCnt[sec] <= 2;
+  });
 }
 
 // 每日一次：適合進場的個股訊號推送
@@ -7521,12 +7681,12 @@ function notifyEntrySignals() {
   const picks = computeEntrySignals().filter(({ s }) => !tgKeySent(`sig:${s.id}`));
   if (!picks.length) return;
 
-  const lines = picks.slice(0, 5).map(({ s, p, d }) => {
+  const lines = picks.slice(0, 5).map(({ s, p, d, q }) => {
     const ltWhy = classifyLongTerm(s);
     const tag = ltWhy ? '🏛 長期持有（3個月以上）' : '📈 短期波段';
     const sup = ltWhy ? ltWhy.slice(0, 2)
       : [...p.support.chips.slice(0, 1), ...p.support.fund.slice(0, 1), ...p.support.tech.slice(0, 1)];
-    return `${tag}｜${s.name}(${s.id})　綜合 ${d.total}／100\n` +
+    return `${tag}｜${s.name}(${s.id})　品質 ${q ? `${q.grade}（${q.score}）` : '--'}｜綜合 ${d.total}\n` +
       `　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）\n` +
       `　${p.holdOn ? '上方無壓力，續抱為主' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}\n` +
       `　1R ${(p.lo * 2 - p.stop).toFixed(2)} 先減半、停損上移成本\n` +
