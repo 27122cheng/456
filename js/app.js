@@ -2439,16 +2439,21 @@ function buildEntryPlan(s, m) {
   // 續抱時的移動停利基準（隨股價墊高，鎖住獲利）
   const trail = +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2);
 
-  // 部位規模：依「單筆最多虧損總資金 2%」與停損距離反推可買張數
+  // 部位規模：預設單筆風險 2%；有 ≥30 筆實績時改用半凱利（上限 2%、下限 0.5%）
+  // — 凱利對參數誤差極敏感，永遠只用半凱利且封頂，這不是保守是常識
   const capital = parseFloat(localStorage.getItem('capital') || '1000000');
   const riskPerShare = lo - stop;
-  const maxLossAmt = capital * 0.02;
+  const est = (() => { try { return expectancyStats(); } catch { return null; } })();
+  const riskFrac = est?.kelly != null ? est.kelly / 100 : 0.02;
+  const maxLossAmt = capital * riskFrac;
   const shares = riskPerShare > 0 ? Math.floor(maxLossAmt / riskPerShare / 1000) : 0;
   const posValue = shares * 1000 * lo;
   const sizing = shares > 0 ? {
     shares, capital, posValue,
     posPct: +(posValue / capital * 100).toFixed(1),
     maxLoss: Math.round(shares * 1000 * riskPerShare),
+    riskPctUsed: +(riskFrac * 100).toFixed(1),
+    kellyBased: est?.kelly != null,
   } : null;
 
   // 教訓學習回饋：過去重複虧損的進場情境再次出現 → 明確警告
@@ -2566,7 +2571,7 @@ function entryPlanHtml(s, m) {
       ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
       ${(p.lessonWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">🧠 教訓提醒：${w}</div>`).join('')}
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
-        📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險上限 2% 計算，
+        📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險 ${p.sizing.riskPctUsed}%${p.sizing.kellyBased ? '（依 ≥30 筆實績的半凱利，非固定值）' : '（固定上限，累積 30 筆實績後改依半凱利）'} 計算，
         可買 <strong style="color:var(--blue)">${p.sizing.shares} 張</strong>（約 ${(p.sizing.posValue/10000).toFixed(1)} 萬，佔 ${p.sizing.posPct}% 資金）；
         若觸及停損，最大虧損約 <strong style="color:var(--bear)">${p.sizing.maxLoss.toLocaleString()} 元</strong>。
         <span style="color:var(--text3);font-size:0.72rem">（可於設定頁調整資金規模）</span>
@@ -5131,6 +5136,12 @@ function updateAiSignals() {
       seen++;
       if (b.exDiv && i > 0) cum += b.divAmt != null ? b.divAmt : Math.max(0, s.ohlcv[i - 1].close - b.open);
       const stopAdj = t.stop - cum, t1Adj = t.t1 != null ? t.t1 - cum : null;
+      // MAE/MFE：持有期間最大不利/有利波動（含息）— 風控學習的原料。
+      // 贏單的 MAE 分佈回答「停損到底該設多遠」，比任何理論值都誠實。
+      const maeP = +(((b.low + cum) - t.entry) / t.entry * 100).toFixed(2);
+      const mfeP = +(((b.high + cum) - t.entry) / t.entry * 100).toFixed(2);
+      if (t.maePct == null || maeP < t.maePct) { t.maePct = maeP; changed = true; }
+      if (t.mfePct == null || mfeP > t.mfePct) { t.mfePct = mfeP; changed = true; }
       if (b.low <= stopAdj) {
         Object.assign(t, { status: 'loss', exitDate: b.time, exitPrice: +stopAdj.toFixed(2),
           retPct: +((stopAdj + cum - t.entry) / t.entry * 100).toFixed(2), exitReason: '跌破停損' });
@@ -7809,7 +7820,91 @@ function switchJournalPeriod(p) {
   renderJournal();
 }
 
+// ── 系統期望值與風控學習 ───────────────────────────────────────────────────
+// 專業交易只看一個數字：期望值（每承擔 1R 風險平均賺多少 R）。
+// 勝率高但期望值負的系統照樣賠錢；這裡把 AI 訊號實績換算成 R 標準化統計，
+// 並從「贏單的 MAE 分佈」反推停損距離、從實績勝率/賠率算半凱利部位。
+function expectancyStats() {
+  const done = getAiSignals().filter(t =>
+    t.status !== 'open' && t.retPct != null && t.entry > 0 && t.stop != null && t.entry > t.stop);
+  if (done.length < 5) return null;
+  const rs = done.map(t => {
+    const riskPct = (t.entry - t.stop) / t.entry * 100;
+    return { r: riskPct > 0 ? +(t.retPct / riskPct).toFixed(2) : 0, t };
+  });
+  const wins = rs.filter(x => x.r > 0), losses = rs.filter(x => x.r <= 0);
+  const W = wins.length / rs.length;
+  const sumWin = wins.reduce((a, b) => a + b.r, 0);
+  const sumLoss = Math.abs(losses.reduce((a, b) => a + b.r, 0));
+  const avgWinR = wins.length ? sumWin / wins.length : 0;
+  const avgLossR = losses.length ? sumLoss / losses.length : 0;
+  const expectancy = +(W * avgWinR - (1 - W) * avgLossR).toFixed(2);
+  const pf = sumLoss > 0 ? +(sumWin / sumLoss).toFixed(2) : null;
+  let cur = 0, maxStreak = 0;
+  for (const x of rs) { if (x.r <= 0) { cur++; maxStreak = Math.max(maxStreak, cur); } else cur = 0; }
+  // 贏單 MAE 90 分位：九成贏單的最大回撤都沒超過這個值 → 停損的實證下限
+  const winMae = wins.map(x => x.t.maePct).filter(v => v != null)
+    .map(v => Math.abs(Math.min(0, v))).sort((a, b) => a - b);
+  const mae90 = winMae.length >= 8 ? +winMae[Math.min(winMae.length - 1, Math.floor(winMae.length * 0.9))].toFixed(1) : null;
+  const avgStopDist = +(done.reduce((a, t) => a + (t.entry - t.stop) / t.entry * 100, 0) / done.length).toFixed(1);
+  // 半凱利（樣本 ≥30 才給；上限 2%、下限 0.5% — 凱利對參數誤差極敏感，全凱利必爆）
+  let kelly = null;
+  if (rs.length >= 30 && avgLossR > 0 && avgWinR > 0) {
+    const f = W - (1 - W) / (avgWinR / avgLossR);
+    kelly = f > 0 ? +Math.min(2, Math.max(0.5, f * 50)).toFixed(1) : 0.5;
+  }
+  return { n: rs.length, W: +(W * 100).toFixed(0), avgWinR: +avgWinR.toFixed(2),
+           avgLossR: +avgLossR.toFixed(2), expectancy, pf, maxStreak, mae90, avgStopDist, kelly,
+           maeN: winMae.length };
+}
+
+// 風控學習建議（實證導向；樣本不足的建議誠實標示不給）
+function riskLearnings(st) {
+  if (!st) return [];
+  const out = [];
+  if (st.expectancy > 0.3) out.push(`✅ R 期望值 +${st.expectancy}：每承擔 1R 風險平均賺 ${st.expectancy}R — 系統有正優勢，重點是紀律執行而非挑訊號`);
+  else if (st.expectancy > 0) out.push(`R 期望值 +${st.expectancy} 為正但偏薄 — 稅費滑價會吃掉一部分，只做品質 A 級進場點可拉高`);
+  else out.push(`⚠ R 期望值 ${st.expectancy} 為負 — 系統目前無優勢，應降低頻率/部位，等實績回饋修正後再放大`);
+  if (st.mae90 != null && st.avgStopDist > 0 && st.mae90 * 1.3 < st.avgStopDist)
+    out.push(`📏 停損可收緊：九成贏單的最大回撤 ≤${st.mae90}%（樣本 ${st.maeN}），現行平均停損 ${st.avgStopDist}% 偏寬 — 收至 ~${(st.mae90 * 1.3).toFixed(1)}%（MAE90×1.3 緩衝）同風險可放大部位`);
+  else if (st.mae90 != null)
+    out.push(`📏 贏單 MAE90 ${st.mae90}% vs 平均停損 ${st.avgStopDist}% — 停損距離與實際波動相稱，不建議再收緊`);
+  if (st.maxStreak >= 3)
+    out.push(`🧊 歷史最大連虧 ${st.maxStreak} 筆 — 以單筆 2% 計連續回撤約 ${(st.maxStreak * 2).toFixed(0)}%，部位規模要以「連虧發生時扛得住」為準`);
+  if (st.kelly != null)
+    out.push(`📦 依實績半凱利：單筆風險 ${st.kelly}%（勝率 ${st.W}%、賠率 ${st.avgWinR}/${st.avgLossR}，樣本 ${st.n}）— 期望值為正時逐步靠近，為負時退回最小`);
+  else out.push(`📦 半凱利部位建議需 ≥30 筆結算樣本（現有 ${st.n} 筆）— 樣本不足前維持固定 2% 風險`);
+  return out;
+}
+
+function renderExpectancy() {
+  const el = document.getElementById('expectancy-body');
+  if (!el) return;
+  const st = expectancyStats();
+  if (!st) {
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">已結算訊號不足 5 筆 — 系統會隨 AI 訊號自動結算累積，無需手動操作。</p>';
+    return;
+  }
+  const eC = st.expectancy > 0.2 ? 'var(--bull)' : st.expectancy > 0 ? 'var(--yellow)' : 'var(--bear)';
+  const cell = (lbl, val, c) => `<div style="padding:9px 10px;background:rgba(255,255,255,0.02);border-radius:8px">
+    <div style="font-size:0.68rem;color:var(--text3)">${lbl}</div>
+    <div style="font-family:var(--mono);font-weight:800;font-size:1rem;color:${c || 'var(--text1)'}">${val}</div></div>`;
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px">
+      ${cell('R 期望值', `${st.expectancy > 0 ? '+' : ''}${st.expectancy}R`, eC)}
+      ${cell('獲利因子 PF', st.pf ?? '--', st.pf >= 1.5 ? 'var(--bull)' : st.pf >= 1 ? 'var(--yellow)' : 'var(--bear)')}
+      ${cell('勝率', `${st.W}%`)}
+      ${cell('平均賺/賠 (R)', `${st.avgWinR} / ${st.avgLossR}`)}
+      ${cell('最大連虧', `${st.maxStreak} 筆`, st.maxStreak >= 4 ? 'var(--bear)' : 'var(--text1)')}
+      ${cell('樣本數', `${st.n} 筆`)}
+    </div>
+    <div style="margin-top:10px;font-size:0.76rem;color:var(--text2);line-height:1.8">
+      ${riskLearnings(st).map(x => `・${x}`).join('<br>')}
+    </div>`;
+}
+
 function renderJournal() {
+  renderExpectancy();
   renderJournalStats();
   renderEquityChart();
   renderJournalLessons();
