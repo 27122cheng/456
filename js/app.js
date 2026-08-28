@@ -7320,20 +7320,49 @@ function renderHoldings() {
 
 function classifyLongTerm(s) {
   const a = s.analysis;
-  // 長期結構：站上年線且中期均線多頭排列（沒有這個，基本面再好也先不標長抱）
+  // ── 長抱的報酬來源只有三個：獲利成長、估值合理、資金持續流入。
+  //    選入精準度 = 三者都要有證據，缺一不可（過去只要基本面湊兩項就過，太鬆）──
+
+  // 結構前提：站上年線且中期均線多頭排列
   if (!(a.ema200 && a.price > a.ema200)) return null;
   if (!(a.ema50 && a.ema50 > a.ema200)) return null;
-  const why = ['站上年線、中期均線多頭排列'];
+  // 防追高：乖離年線 >25% 才入選的長抱，起點就輸 — 等回測季線再說
+  const extYear = (a.price / a.ema200 - 1) * 100;
+  if (extYear > 25) return null;
+  // 長期相對強弱：60 日要贏過大盤 — 長抱弱勢股是報酬率的第一殺手
+  const closes = s.ohlcv?.map(b => b.close);
+  if (closes?.length >= 61 && _twiiSeries?.length >= 61) {
+    const r60 = (a.price - closes[closes.length - 61]) / closes[closes.length - 61] * 100;
+    const tw = _twiiSeries.map(b => b.close).filter(v => v > 0);
+    const m60 = tw.length >= 61 ? (tw[tw.length - 1] - tw[tw.length - 61]) / tw[tw.length - 61] * 100 : null;
+    if (m60 != null && r60 - m60 < 0) return null;   // 60 日輸大盤 → 不長抱
+  }
+
+  const why = [`站上年線（乖離 +${extYear.toFixed(0)}%）、中期均線多頭排列`];
   let f = 0;
+  // 成長證據（含加速度 — 營收「正在變好」比「曾經好」值錢）
+  const rm = revenueMomentum(s.id);
+  if (rm?.dir === 1) { f++; why.push(rm.txt); }
   if (s.rev?.yoy >= 10) { f++; why.push(`月營收年增 +${s.rev.yoy.toFixed(0)}%`); }
   if (s.rev?.cumYoy >= 5) { f++; why.push(`累計營收年增 +${s.rev.cumYoy.toFixed(0)}%`); }
   if (s._fin?.grossMargin >= 25) { f++; why.push(`毛利率 ${s._fin.grossMargin.toFixed(0)}%`); }
   if (s._fin?.roe >= 10) { f++; why.push(`ROE ${s._fin.roe.toFixed(0)}%`); }
+  // 估值：PE 絕對值之外加 PEG 概念 — 高成長可容忍較高 PE，低成長不行
   if (s._fd?.pe > 0 && s._fd.pe < 25) { f++; why.push(`本益比 ${s._fd.pe.toFixed(1)}x 未過熱`); }
+  else if (s._fd?.pe > 0 && s.rev?.yoy > 0 && s._fd.pe / s.rev.yoy <= 1.5) { f++; why.push(`PEG ${(s._fd.pe / s.rev.yoy).toFixed(1)}（成長支撐估值）`); }
   if (s._fd?.divYield >= 0.03) { f++; why.push(`殖利率 ${(s._fd.divYield * 100).toFixed(1)}%`); }
-  if (f < 2) return null; // 基本面證據不足兩項 → 不夠格標「至少抱 3 個月」
+  if (f < 3) return null;   // 由 2 項提高到 3 項 — 長抱要更挑剔
+
+  // 資金流入證據（至少一項）：長抱沒人抬轎，時間只會磨掉耐心
+  const flow = [];
   const st = instStreak(s.id);
-  if (st?.dir > 0 && st.days >= 3) why.push(`法人連 ${st.days} 日買超`);
+  if (st?.dir > 0 && st.days >= 3) flow.push(`法人連 ${st.days} 日買超`);
+  const td = s._tdccTrend;
+  if (td?.dir > 0 && td.dBig >= 0.2) flow.push(`千張大戶持股週增 ${td.dBig}pp`);
+  const fg = s._fgnTrend;
+  if (fg?.delta > 0) flow.push(`外資持股比率上升中（+${fg.delta}pp）`);
+  if (!flow.length) return null;
+  why.push(...flow.slice(0, 2));
   return why;
 }
 
@@ -7473,7 +7502,8 @@ function longTermThesisBroken(s) {
   const a = s?.analysis;
   if (!a) return null;                             // 無資料不動名單，等資料
   if (s._alert?.level === 'punish') return '列入處置股，流動性風險';
-  if (a.ema200 && a.price < a.ema200 * 0.97) return `跌破年線 ${a.ema200.toFixed(2)}（含 3% 緩衝）— 長多結構失效`;
+  // 年線改採「二次確認制」，不在此立即剔除（見 updateLongTermList）—
+  // 單日插針洗出再噴回去，是長抱報酬被吃掉的典型場景
   if (a.ema50 && a.ema200 && a.ema50 < a.ema200 * 0.995) return '季線跌破年線（中期死亡交叉）';
   if (s.rev?.yoy != null && s.rev.yoy <= -10) return `月營收年減 ${s.rev.yoy.toFixed(0)}% — 成長論點動搖`;
   if (s._fin?.netMargin != null && s._fin.netMargin < 0) return '本業轉虧';
@@ -7485,6 +7515,7 @@ function updateLongTermList() {
   const list = getLongTermList();
   const out = [];
   let changed = false;
+  const today = twClock().date;
   for (const it of list) {
     const s = allStocks.find(x => x.id === it.id);
     if (!s?.analysis) { out.push(it); continue; }        // 沒掃到 → 保留，不亂動
@@ -7493,7 +7524,22 @@ function updateLongTermList() {
     if (broken) {
       changed = true;
       logSignal('exit', `${it.name}（${it.id}）移出長期持有名單`, broken, { id: it.id, dir: -1, dedupKey: `lt-${it.id}` });
-    } else out.push(it);
+      continue;
+    }
+    // 年線二次確認制：首次收破年線（含 3% 緩衝）記「保衛戰」，
+    // 之後「另一個交易日」仍破才剔除；收復即解除 — 插針洗盤不出局
+    const a = s.analysis;
+    if (a.ema200 && a.price < a.ema200 * 0.97) {
+      if (it.breachDate && it.breachDate !== today) {
+        changed = true;
+        logSignal('exit', `${it.name}（${it.id}）移出長期持有名單`,
+          `連續兩個交易日收破年線 ${a.ema200.toFixed(2)}（首破 ${it.breachDate}）— 二次確認，長多結構失效`,
+          { id: it.id, dir: -1, dedupKey: `lt-${it.id}` });
+        continue;
+      }
+      if (!it.breachDate) { it.breachDate = today; changed = true; }
+    } else if (it.breachDate) { delete it.breachDate; changed = true; }   // 收復年線，解除警戒
+    out.push(it);
   }
   // 新合格者：今日進場訊號中通過長期分類者（名單未滿才補）
   if (out.length < LT_MAX) {
@@ -7503,8 +7549,11 @@ function updateLongTermList() {
         if (out.some(x => x.id === pk.s.id)) continue;
         const why = classifyLongTerm(pk.s);
         if (!why) continue;
+        const twNow0 = _twiiSeries?.length ? _twiiSeries[_twiiSeries.length - 1].close : null;
         out.push({ id: pk.s.id, name: pk.s.name, addedAt: twClock().date,
-                   basePrice: +pk.s.analysis.price.toFixed(2), why: why.slice(0, 4) });
+                   basePrice: +pk.s.analysis.price.toFixed(2),
+                   twiiBase: twNow0 ? +twNow0.toFixed(0) : null,   // 同日大盤基準 → 之後算 alpha
+                   why: why.slice(0, 4) });
         changed = true;
         logSignal('entry', `${pk.s.name}（${pk.s.id}）入選長期持有名單`, why.slice(0, 3).join('・'), { id: pk.s.id, dir: 1, dedupKey: `lt-${pk.s.id}` });
       }
@@ -7535,11 +7584,19 @@ function renderEntrySignals() {
     const s = allStocks.find(x => x.id === it.id);
     const px = s?.analysis?.price;
     const ret = px && it.basePrice ? (px / it.basePrice - 1) * 100 : null;
+    // Alpha：同期大盤報酬比較 — 長抱輸大盤不如買 0050，這個數字必須攤開
+    const twNow0 = _twiiSeries?.length ? _twiiSeries[_twiiSeries.length - 1].close : null;
+    const alpha = ret != null && it.twiiBase && twNow0
+      ? ret - (twNow0 / it.twiiBase - 1) * 100 : null;
     const held = tradingDaysBetween(it.addedAt, twClock().date);
     const timing = (() => {
       if (!s?.analysis) return null;
-      const ext = s.analysis.ema20 ? (px / s.analysis.ema20 - 1) * 100 : null;
+      if (it.breachDate) return { t: `⚔️ 年線保衛戰中（${it.breachDate} 首破）— 再一日收破即移出名單，持有者應先減碼`, c: 'var(--bear)' };
+      const a2 = s.analysis;
+      const ext = a2.ema20 ? (px / a2.ema20 - 1) * 100 : null;
       if (ext == null) return null;
+      if (a2.ema50 && px <= a2.ema50 * 1.02 && px >= a2.ema50 * 0.98)
+        return { t: `回測季線 ${a2.ema50.toFixed(2)} — 長線分批加碼的標準位置`, c: 'var(--bull)' };
       if (ext <= 2.5) return { t: '目前貼近 EMA20 — 屬可加碼位', c: 'var(--bull)' };
       if (ext >= 6) return { t: `短線乖離 ${ext.toFixed(1)}% — 等拉回再加碼，非賣出訊號`, c: 'var(--yellow)' };
       return { t: '趨勢持有中，短線波動屬正常', c: 'var(--text3)' };
@@ -7549,7 +7606,7 @@ function renderEntrySignals() {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <strong style="font-size:0.88rem;cursor:pointer" onclick="openStock('${it.id}')">${it.name} <span style="color:var(--text3);font-size:0.74rem">${it.id}</span></strong>
         <span style="font-size:0.66rem;padding:1px 8px;border-radius:9px;background:rgba(34,197,94,0.14);color:var(--bull);font-weight:700">入選 ${held ?? '--'} 個交易日</span>
-        ${ret != null ? `<span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${ret >= 0 ? 'var(--bull)' : 'var(--bear)'}">${ret >= 0 ? '+' : ''}${ret.toFixed(1)}%</span>` : ''}
+        ${ret != null ? `<span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${ret >= 0 ? 'var(--bull)' : 'var(--bear)'}">${ret >= 0 ? '+' : ''}${ret.toFixed(1)}%${alpha != null ? ` <span style="font-size:0.68rem;color:${alpha >= 0 ? 'var(--bull)' : 'var(--bear)'}" title="相對同期大盤">α${alpha >= 0 ? '+' : ''}${alpha.toFixed(1)}</span>` : ''}</span>` : ''}
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">入選日 ${it.addedAt}｜入選價 ${it.basePrice}｜現價 ${px != null ? px.toFixed(2) : '--'}</div>
       <div style="font-size:0.73rem;color:var(--text2);margin-top:4px;line-height:1.6">${(it.why || []).join('・')}</div>
@@ -7601,7 +7658,23 @@ function renderEntrySignals() {
     : '';
 
   const body =
-    sect('🏛 長期持有名單（3 個月～半年以上）', '慢變數選入後即固定 — 只有跌破年線/中期死叉/營收轉差/處置才剔除，短線拉回不換股',
+    sect('🏛 長期持有名單（3 個月～半年以上）', (() => {
+      // 記分板：名單平均報酬與平均 alpha — 長抱的成績必須攤開對照大盤
+      const twNow0 = _twiiSeries?.length ? _twiiSeries[_twiiSeries.length - 1].close : null;
+      const rows = ltList.map(it => {
+        const px = allStocks.find(x => x.id === it.id)?.analysis?.price;
+        if (!px || !it.basePrice) return null;
+        const ret = (px / it.basePrice - 1) * 100;
+        const al = it.twiiBase && twNow0 ? ret - (twNow0 / it.twiiBase - 1) * 100 : null;
+        return { ret, al };
+      }).filter(Boolean);
+      const base = '選入更挑剔（成長＋估值＋資金流三證據、60日贏大盤、乖離年線≤25%）；剔除採年線二次確認 — 插針洗盤不出局';
+      if (!rows.length) return base;
+      const avgRet = rows.reduce((a, b) => a + b.ret, 0) / rows.length;
+      const als = rows.filter(r => r.al != null);
+      const avgAl = als.length ? als.reduce((a, b) => a + b.al, 0) / als.length : null;
+      return `名單平均 <b style="color:${avgRet >= 0 ? 'var(--bull)' : 'var(--bear)'}">${avgRet >= 0 ? '+' : ''}${avgRet.toFixed(1)}%</b>${avgAl != null ? `｜相對大盤 α <b style="color:${avgAl >= 0 ? 'var(--bull)' : 'var(--bear)'}">${avgAl >= 0 ? '+' : ''}${avgAl.toFixed(1)}%</b>` : ''}｜${base}`;
+    })(),
       ltList.map(ltCard).join('')) +
     sect('📈 短期波段（數日～數週）', '只列品質 A 級（八因子 ≥75 黃金匯流）— 勝率的第一道防線是出手標準，寧缺勿濫',
       swings.map(pk => card(pk, 'long')).join('')) +
