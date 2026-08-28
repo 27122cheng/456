@@ -2372,9 +2372,22 @@ function buildEntryPlan(s, m) {
   const maxRisk = Math.min(lo * 0.08, atr * 3);
   let stopCapped = false;
   if (lo - stop > maxRisk) { stop = +(lo - maxRisk).toFixed(2); stopCapped = true; }
+  // 實證停損收緊：贏單 MAE90×1.3（＋至少 1.2×ATR 底線）明顯窄於結構停損時，
+  // 改用實證距離 — 同樣的資金風險可以放大部位，且被掃出的機率有數據背書
+  let stopAdaptive = false;
+  const _est = (() => { try { return expectancyStats(); } catch { return null; } })();
+  if (_est?.mae90 != null && _est.maeN >= 8) {
+    const empDist = Math.max(_est.mae90 * 1.3, atr / lo * 100 * 1.2);   // % 距離
+    if (empDist < (lo - stop) / lo * 100 * 0.8) {
+      stop = +(lo * (1 - empDist / 100)).toFixed(2);
+      stopAdaptive = true; stopCapped = false;
+    }
+  }
   const riskPct = (lo - stop) / lo * 100;
   const stopBasis = [];
-  if (stopCapped) {
+  if (stopAdaptive) {
+    stopBasis.push(`依實績收緊：九成贏單最大回撤 ≤${_est.mae90}%（樣本 ${_est.maeN}），停損設 ${riskPct.toFixed(1)}%（MAE90×1.3，含 ATR 底線）— 結構停損偏寬會白扛風險`);
+  } else if (stopCapped) {
     stopBasis.push(`結構支撐距離過遠，改以風險上限 ${riskPct.toFixed(1)}%（${(maxRisk / atr).toFixed(1)}×ATR）設定`);
   } else {
     if (m.sup && stop < m.sup) stopBasis.push(`低於支撐位 ${m.sup}（跌破代表支撐失守）`);
@@ -2863,6 +2876,23 @@ function renderPatterns(s) {
   if (a.gaps?.list?.length) parts.push(card('🕳 未回補跳空缺口',
     a.gaps.list.slice(-3).map(g => `${g.type === 'up' ? '⬆ 上跳' : '⬇ 下跳'} ${g.bottom} ~ ${g.top}<span style="font-size:0.72rem;color:var(--text3)">（${g.time}${g.type === 'up' ? '，回測此區有支撐' : '，反彈至此區有壓力'}）</span>`).join('<br>'),
     'var(--blue)'));
+  // 波動區間預測：以 ATR 推明日/5 日約 68% 機率的價格區間 —
+  // 給「目標價合不合理」與「停損距離夠不夠」一個統計基準（√t 縮放）
+  if (a.price > 0 && s.ohlcv.length >= 15) {
+    const highs2 = s.ohlcv.map(d => d.high), lows2 = s.ohlcv.map(d => d.low), closes2 = s.ohlcv.map(d => d.close);
+    let atrSum = 0;
+    for (let i = s.ohlcv.length - 14; i < s.ohlcv.length; i++)
+      atrSum += Math.max(highs2[i] - lows2[i], Math.abs(highs2[i] - closes2[i - 1]), Math.abs(lows2[i] - closes2[i - 1]));
+    const atr14 = atrSum / 14;
+    const d1 = { lo: +(a.price - atr14).toFixed(2), hi: +(a.price + atr14).toFixed(2) };
+    const d5 = { lo: +(a.price - atr14 * Math.sqrt(5)).toFixed(2), hi: +(a.price + atr14 * Math.sqrt(5)).toFixed(2) };
+    parts.push(card('🎲 波動區間預測（ATR 統計）',
+      `明日約 68% 機率落在 <span style="font-family:var(--mono)">${d1.lo} ~ ${d1.hi}</span><br>` +
+      `5 日約 68% 機率落在 <span style="font-family:var(--mono)">${d5.lo} ~ ${d5.hi}</span>` +
+      `<br><span style="font-size:0.72rem;color:var(--text3)">依 14 日 ATR ${atr14.toFixed(2)}（${(atr14 / a.price * 100).toFixed(1)}%）√t 縮放 — 目標價超出 5 日區間代表需要超額行情才到得了；停損窄於 1 日區間易被日常波動掃出</span>`,
+      'var(--blue)'));
+  }
+
   // 盤中限定：開盤區間突破（ORB）— 有今日分鐘 K 才顯示
   const orb = orbStatus(s);
   if (orb) parts.push(card('📐 開盤區間（ORB）', orb.txt +
@@ -4218,6 +4248,7 @@ async function refreshLivePrices() {
       _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
       // 關鍵：讓即時價真正進入指標與研判，而不只是換掉畫面上的數字
       for (const s of pickRecomputeTargets(touched)) recomputeAnalysis(s);
+      checkStopProximity();   // 持倉逼近/跌破停損 → 盤中即時警報（每檔每日一次）
     }
     else _liveStatus = '報價非今日（休市或收盤）';
     renderLiveTick();
@@ -7080,6 +7111,31 @@ function updateTrailingStops() {
   if (changed) saveHoldings(holdings);
 }
 
+// ── 持倉停損逼近警報（盤中即時）───────────────────────────────────────────
+// 每日持倉檢查是「盤後等級」的節奏；但價格逼近停損是「現在就要知道」的事。
+// 即時報價每輪 tick 檢查：跌破停損立即推、距停損 1% 內預警，各每檔每日一次。
+function checkStopProximity() {
+  if (!tgWants('sig') || !inNotifyWindow()) return;
+  for (const h of getHoldings()) {
+    const s = allStocks.find(x => x.id === h.id);
+    const px = s?.analysis?.price;
+    if (!(px > 0) || !(h.stop > 0)) continue;
+    const div = exDivAdjust(s.ohlcv, h.addedAt);
+    const stopAdj = h.stop - div;
+    if (px <= stopAdj) {
+      if (tgKeySent(`stop-hit:${h.id}`)) continue;
+      tgPush(`🚨 停損觸發：${h.name}(${h.id})\n現價 ${px.toFixed(2)} 已跌破停損 ${stopAdj.toFixed(2)}\n依紀律出場 — 「等反彈再賣」是虧損擴大的起點\n⚠ 僅供參考，非投資建議`);
+      tgMarkKeys([`stop-hit:${h.id}`]);
+      logSignal('exit', `${h.name}（${h.id}）盤中觸發停損`, `現價 ${px.toFixed(2)} ≤ 停損 ${stopAdj.toFixed(2)}`, { id: h.id, dir: -1, dedupKey: `stop-hit-${h.id}` });
+    } else if ((px - stopAdj) / px <= 0.01) {
+      if (tgKeySent(`stop-near:${h.id}`)) continue;
+      tgPush(`⚠️ 逼近停損：${h.name}(${h.id})\n現價 ${px.toFixed(2)}，距停損 ${stopAdj.toFixed(2)} 不到 1%\n先想好：跌破就走，不向下攤平、不臨時移停損\n⚠ 僅供參考，非投資建議`);
+      tgMarkKeys([`stop-near:${h.id}`]);
+      logSignal('alert', `${h.name}（${h.id}）逼近停損`, `現價 ${px.toFixed(2)}，距停損 ${stopAdj.toFixed(2)} <1%`, { id: h.id, dir: -1, dedupKey: `stop-near-${h.id}` });
+    }
+  }
+}
+
 // ── 持倉健康度：進場之後「這筆交易走得怎麼樣」的階段化管理 ────────────────
 // 出場檢查答的是「該不該跑」，健康度答的是「這筆交易現在處於哪個階段、
 // 下一步該做什麼」。以 R 倍數（相對原始停損的風險單位）分段：
@@ -7853,9 +7909,38 @@ function expectancyStats() {
     const f = W - (1 - W) / (avgWinR / avgLossR);
     kelly = f > 0 ? +Math.min(2, Math.max(0.5, f * 50)).toFixed(1) : 0.5;
   }
+  // 出場效率：贏單平均只拿到 MFE（波段最高點）的幾成 — 停利太早/太晚的實證
+  const winMfe = wins.filter(x => x.t.mfePct != null && x.t.mfePct > 0)
+    .map(x => ({ got: x.r, max: x.t.mfePct / ((x.t.entry - x.t.stop) / x.t.entry * 100) }));
+  let capture = null;
+  if (winMfe.length >= 8) {
+    const avgMax = winMfe.reduce((a, b) => a + b.max, 0) / winMfe.length;
+    const avgGot = winMfe.reduce((a, b) => a + b.got, 0) / winMfe.length;
+    if (avgMax > 0) capture = { ratio: +(avgGot / avgMax).toFixed(2), avgMaxR: +avgMax.toFixed(2), n: winMfe.length };
+  }
   return { n: rs.length, W: +(W * 100).toFixed(0), avgWinR: +avgWinR.toFixed(2),
            avgLossR: +avgLossR.toFixed(2), expectancy, pf, maxStreak, mae90, avgStopDist, kelly,
-           maeN: winMae.length };
+           maeN: winMae.length, capture };
+}
+
+// 情境分組期望值：同一套系統在不同情境下的優勢差很多 —
+// 「初升段賺、末升段賠」這種結論只有分組統計看得到。
+function expectancyBySituation() {
+  const done = getAiSignals().filter(t =>
+    t.status !== 'open' && t.retPct != null && t.entry > 0 && t.stop != null && t.entry > t.stop && t.ctx);
+  const groups = {};
+  const add = (k, r) => { (groups[k] = groups[k] || []).push(r); };
+  for (const t of done) {
+    const r = t.retPct / ((t.entry - t.stop) / t.entry * 100);
+    if (t.ctx.trend) add(`趨勢：${{ 'strong-up': '強勢上升', up: '上升', range: '盤整', down: '下降', 'strong-down': '強勢下降' }[t.ctx.trend] || t.ctx.trend}`, r);
+    if (t.ctx.maturity) add(`階段：${{ early: '初段', mid: '主升段', late: '末段' }[t.ctx.maturity] || t.ctx.maturity}`, r);
+    if (t.ctx.pctile) add(`位階：${{ high: '高檔', mid: '中檔', low: '低檔' }[t.ctx.pctile] || t.ctx.pctile}`, r);
+    if (t.ctx.mktNorm != null) add(`大盤：${t.ctx.mktNorm >= 15 ? '偏多' : t.ctx.mktNorm <= -15 ? '偏空' : '中性'}`, r);
+  }
+  return Object.entries(groups)
+    .filter(([, rs]) => rs.length >= 5)
+    .map(([k, rs]) => ({ k, n: rs.length, exp: +(rs.reduce((a, b) => a + b, 0) / rs.length).toFixed(2) }))
+    .sort((a, b) => b.exp - a.exp);
 }
 
 // 風控學習建議（實證導向；樣本不足的建議誠實標示不給）
@@ -7871,6 +7956,14 @@ function riskLearnings(st) {
     out.push(`📏 贏單 MAE90 ${st.mae90}% vs 平均停損 ${st.avgStopDist}% — 停損距離與實際波動相稱，不建議再收緊`);
   if (st.maxStreak >= 3)
     out.push(`🧊 歷史最大連虧 ${st.maxStreak} 筆 — 以單筆 2% 計連續回撤約 ${(st.maxStreak * 2).toFixed(0)}%，部位規模要以「連虧發生時扛得住」為準`);
+  if (st.capture) {
+    if (st.capture.ratio < 0.5)
+      out.push(`⏳ 停利偏早：贏單平均衝到 +${st.capture.avgMaxR}R 只拿到 ${(st.capture.ratio * 100).toFixed(0)}%（樣本 ${st.capture.n}）— 建議 T1 只減半、剩餘改移動停利讓利潤跑`);
+    else if (st.capture.ratio > 0.8)
+      out.push(`✅ 出場效率 ${(st.capture.ratio * 100).toFixed(0)}% — 贏單大部分行情有拿到，停利設定與行情相稱`);
+    else
+      out.push(`出場效率 ${(st.capture.ratio * 100).toFixed(0)}%（贏單平均最高 +${st.capture.avgMaxR}R）— 中規中矩，維持現行分批出場`);
+  }
   if (st.kelly != null)
     out.push(`📦 依實績半凱利：單筆風險 ${st.kelly}%（勝率 ${st.W}%、賠率 ${st.avgWinR}/${st.avgLossR}，樣本 ${st.n}）— 期望值為正時逐步靠近，為負時退回最小`);
   else out.push(`📦 半凱利部位建議需 ≥30 筆結算樣本（現有 ${st.n} 筆）— 樣本不足前維持固定 2% 風險`);
@@ -7900,7 +7993,18 @@ function renderExpectancy() {
     </div>
     <div style="margin-top:10px;font-size:0.76rem;color:var(--text2);line-height:1.8">
       ${riskLearnings(st).map(x => `・${x}`).join('<br>')}
-    </div>`;
+    </div>
+    ${(() => {
+      const sit = expectancyBySituation();
+      if (!sit.length) return '';
+      const row = x => `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.74rem">
+        <span style="color:var(--text2)">${x.k}</span>
+        <span style="font-family:var(--mono);color:${x.exp > 0.2 ? 'var(--bull)' : x.exp < 0 ? 'var(--bear)' : 'var(--yellow)'}">${x.exp > 0 ? '+' : ''}${x.exp}R <span style="color:var(--text3)">（n=${x.n}）</span></span></div>`;
+      return `<div style="margin-top:12px">
+        <div style="font-size:0.72rem;color:var(--text3);margin-bottom:5px">📂 情境分組期望值 — 系統在哪種環境有優勢、哪種環境該收手</div>
+        ${sit.slice(0, 8).map(row).join('')}
+      </div>`;
+    })()}`;
 }
 
 function renderJournal() {
