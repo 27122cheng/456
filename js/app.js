@@ -1378,6 +1378,74 @@ function sectorRotation(stocks) {
            state: accel >= 1.5 ? 'in' : accel <= -1.5 ? 'out' : 'flat' };
 }
 
+// ── 族群論點引擎：哪個族群現在好、為什麼、有什麼佐證 ─────────────────────
+// 「AI 族群🔥流入」只是現象；論點要能回答為什麼 — 動能／量能／籌碼／
+// 新聞／基本面五路證據各自具名，缺哪路就誠實少哪路，湊不齊就不喊看好。
+function sectorThesis() {
+  const stats = sectorStatsCached();
+  const out = [];
+  stats.forEach((g, idx) => {
+    if (g.n < 2) return;                       // 單檔不成族群
+    const ev = [];
+    let pts = 0;
+    // ① 資金動能（輪動加速度）
+    if (g.rotation?.state === 'in') { pts += 2; ev.push(`資金動能：5 日平均 ${g.rotation.r5 >= 0 ? '+' : ''}${g.rotation.r5}%，相對自身月線步調加速（資金流入中）`); }
+    else if (g.rotation?.state === 'out') { pts -= 2; ev.push(`資金動能：5 日 ${g.rotation.r5}%，資金流出中`); }
+    // ② 量能地位
+    if (idx < 5) { pts += 1; ev.push(`量能：成交金額全市場第 ${idx + 1} 名 — 主戰場，進出不愁流動性`); }
+    // ③ 籌碼（成分股法人合計）
+    const net = g.stocks.reduce((a, s) => a + ((s.foreign ?? 0) + (s.investment ?? 0)), 0);
+    if (net > 500) { pts += 1; ev.push(`籌碼：成分股法人合計買超 ${net.toLocaleString()} 張`); }
+    else if (net < -500) { pts -= 1; ev.push(`籌碼：成分股法人合計賣超 ${Math.abs(net).toLocaleString()} 張`); }
+    // ④ 新聞佐證（近 7 日，引用實際標題）
+    const ns = _newsSignals?.sectors?.[g.sector];
+    if (ns && Math.abs(ns.score) >= 2) {
+      pts += ns.score > 0 ? 2 : -2;
+      const cite = ns.items?.length ? `，如「${typeof ns.items[0] === 'object' ? ns.items[0].h : ns.items[0]}」` : '';
+      ev.push(`新聞面：近 7 日 ${ns.n} 則相關新聞偏${ns.score > 0 ? '多' : '空'}${cite}`);
+    }
+    // ⑤ 基本面佐證（成分股營收）
+    const yoys = g.stocks.map(s => s.rev?.yoy).filter(v => v != null);
+    if (yoys.length >= 2) {
+      const avg = yoys.reduce((a, b) => a + b, 0) / yoys.length;
+      const grow = yoys.filter(v => v >= 10).length;
+      if (avg >= 10) { pts += 2; ev.push(`基本面：平均營收年增 +${avg.toFixed(0)}%（${grow}/${yoys.length} 檔雙位數成長）— 漲勢有獲利支撐`); }
+      else if (avg <= -5) { pts -= 2; ev.push(`基本面：平均營收年減 ${avg.toFixed(0)}% — 缺乏獲利支撐`); }
+      else ev.push(`基本面：平均營收年增 ${avg >= 0 ? '+' : ''}${avg.toFixed(0)}% — 支撐普通，漲勢偏資金行情`);
+    }
+    // ⑥ 內部寬度
+    if (g.bull >= 2 && g.bull > g.bear * 2) { pts += 1; ev.push(`寬度：族群內 ${g.bull}/${g.n} 檔偏多 — 是族群行情不是單兵`); }
+    const leader = [...g.stocks].sort((a, b) => verdictScore(b) - verdictScore(a))[0];
+    out.push({ sector: g.sector, pts, ev, n: g.n,
+               leader: leader ? { id: leader.id, name: leader.name, score: verdictScore(leader) } : null });
+  });
+  out.sort((a, b) => b.pts - a.pts);
+  return out;
+}
+
+function renderSectorThesis() {
+  const el = document.getElementById('sector-thesis-body');
+  if (!el) return;
+  const all = sectorThesis();
+  if (!all.length) { el.innerHTML = '<div class="adv-loading">等待掃描完成...</div>'; return; }
+  const good = all.filter(x => x.pts >= 4).slice(0, 3);
+  const bad = all.filter(x => x.pts <= -2).slice(-2);
+  const card = (x, tone) => `
+    <div style="padding:11px 13px;border-radius:9px;background:${tone}0d;border-left:3px solid ${tone};margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <strong style="font-size:0.86rem">${x.sector}</strong>
+        <span style="font-size:0.66rem;padding:1px 8px;border-radius:9px;background:${tone}22;color:${tone};font-weight:700">論點分 ${x.pts > 0 ? '+' : ''}${x.pts}</span>
+        ${x.leader ? `<span style="margin-left:auto;font-size:0.7rem;color:var(--text3)">領頭羊 <span style="cursor:pointer;color:var(--blue)" onclick="openStock('${x.leader.id}')">${x.leader.name}</span>（評分 ${x.leader.score}）</span>` : ''}
+      </div>
+      <div style="font-size:0.75rem;color:var(--text2);margin-top:5px;line-height:1.8">${x.ev.map(e => `・${e}`).join('<br>')}</div>
+    </div>`;
+  el.innerHTML =
+    (good.length
+      ? good.map(x => card(x, 'var(--bull)')).join('')
+      : '<div style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">目前沒有族群同時具備「動能＋佐證」的完整論點（論點分 ≥4）— 輪動不明朗時，個股選擇比族群押注重要。</div>') +
+    (bad.length ? `<div style="font-size:0.72rem;color:var(--text3);margin:6px 0 4px">看淡（證據偏空）</div>` + bad.map(x => card(x, 'var(--bear)')).join('') : '');
+}
+
 function renderSectorRanking() {
   const el = document.getElementById('sector-body');
   if (!el) return;
@@ -1518,6 +1586,7 @@ function renderRanking() {
   });
 
   renderSectorRanking();
+  try { renderSectorThesis(); } catch {}
   if (sectorOpen) openSector(sectorOpen);   // 掃描更新時保持已展開的族群
 
   // 搜尋時把結果表移到族群排名上方 —— 否則結果落在下方看不見，像是「查不到」
@@ -6105,6 +6174,11 @@ function notifyPreOpen() {
     const rOut = b.rotation.outflow.map(g => g.sector).join('、');
     L.push(`族群輪動：${rIn ? `🔥流入 ${rIn}` : ''}${rIn && rOut ? '｜' : ''}${rOut ? `🧊流出 ${rOut}` : ''} — 波段優先選加速中的族群`);
   }
+  // 最強族群論點（論點分 ≥4 才有資格佔簡報版面）
+  try {
+    const th = sectorThesis().filter(x => x.pts >= 4)[0];
+    if (th) L.push(`族群論點：${th.sector}（+${th.pts}）— ${th.ev.slice(0, 2).join('；')}${th.leader ? `｜領頭羊 ${th.leader.name}` : ''}`);
+  } catch {}
   L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議｜09:30 開盤後追蹤將另行推送');
   tgPush(L.join('\n'));
   // 登記已推內容：這些股票與持倉狀態今天不必再由其他訊號重推一次
@@ -8690,9 +8764,10 @@ function buildNewsSignals(news) {
     // 產業指向：關鍵字對應到掃描清單的族群
     for (const [sec, re] of Object.entries(SECTOR_NEWS_KW)) {
       if (re.test(n.headline)) {
-        const o = sig.sectors[sec] = sig.sectors[sec] || { score: 0, n: 0 };
+        const o = sig.sectors[sec] = sig.sectors[sec] || { score: 0, n: 0, items: [] };
         o.score += d;
         o.n++;
+        if (o.items.length < 3) o.items.push({ h: n.headline.slice(0, 40), d });  // 留標題供論點佐證
       }
     }
   }
