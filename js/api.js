@@ -2138,9 +2138,11 @@ async function fetchMTFSignals(stockId, dailyBars = null) {
 const _newsMemo = {};
 
 async function fetchNewsRSS(query, limit = 7) {
-  if (_newsMemo[query] && memoFresh('news:' + query, 30 * 60 * 1000)) return _newsMemo[query];
+  // 盤中新聞要及時：交易時段快取縮至 10 分鐘，其餘 30 分鐘
+  const newsTtl = (typeof isMarketOpenTW === 'function' && isMarketOpenTW()) ? 10 * 60 * 1000 : 30 * 60 * 1000;
+  if (_newsMemo[query] && memoFresh('news:' + query, newsTtl)) return _newsMemo[query];
   const key = `cache:news:${query}`;
-  const cached = cacheGet(key, 30 * 60 * 1000); // 新聞快取 30 分鐘
+  const cached = cacheGet(key, newsTtl);
   if (cached) { _newsMemo[query] = cached; memoStamp('news:' + query); return cached; }
 
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}+when:7d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant`;
