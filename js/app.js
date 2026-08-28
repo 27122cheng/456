@@ -199,11 +199,24 @@ async function runScan() {
     // 逐月累積營收歷史，供「成長動能加速/減速」判斷（官方僅提供最新月）
     try {
       const h = JSON.parse(localStorage.getItem('rev-hist') || '{}');
+      const tracked = new Set([
+        ...getHoldings().map(x => x.id),
+        ...getLongTermList().map(x => x.id),
+        ...getAiSignals().filter(t => t.status === 'open').map(t => t.id),
+      ]);
       allStocks.forEach(s => {
         const r = m[s.id];
         if (!r?.ym) return;
         const arr = h[s.id] = h[s.id] || [];
-        if (!arr.some(x => x.ym === r.ym)) arr.push({ ym: r.ym, yoy: r.yoy, mom: r.mom });
+        if (!arr.some(x => x.ym === r.ym)) {
+          arr.push({ ym: r.ym, yoy: r.yoy, mom: r.mom });
+          // 基本面即時：新月份營收「剛公布」— 標記供研判註記，追蹤標的記入流水帳
+          s._revNew = r.ym;
+          if (tracked.has(s.id) && r.yoy != null)
+            logSignal(r.yoy >= 0 ? 'entry' : 'alert', `${s.name}（${s.id}）${r.ym} 營收公布`,
+              `年增 ${r.yoy >= 0 ? '+' : ''}${r.yoy.toFixed(1)}%${r.mom != null ? `｜月增 ${r.mom >= 0 ? '+' : ''}${r.mom.toFixed(1)}%` : ''} — 剛公布，留意開盤反應`,
+              { id: s.id, dir: r.yoy >= 10 ? 1 : r.yoy <= -10 ? -1 : 0, dedupKey: `rev-${s.id}-${r.ym}` });
+        }
         arr.sort((a, b) => String(a.ym).localeCompare(String(b.ym)));
         h[s.id] = arr.slice(-24);
       });
@@ -883,6 +896,22 @@ function renderSentiment() {
 
 // ── 重要財經事件倒計時 ─────────────────────────────────────────────────────
 
+// N 個日曆日內的重大事件（含今日 day=0）— 簡報倒數與研判環境註記共用。
+// 用台北日曆日差，不用時數（時數 ceil 會把今天下午的事件標成「1 天後」）
+function imminentEvents(withinDays = 5) {
+  const fmtTW = d => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei' }).format(d);
+  const todayTW = twClock().date;
+  return (getUpcomingEvents() || [])
+    .map(e => {
+      const iso = (() => { try { return fmtTW(e.date instanceof Date ? e.date : new Date(e.date)); } catch { return null; } })();
+      if (!iso) return null;
+      const days = Math.round((new Date(iso + 'T00:00:00Z') - new Date(todayTW + 'T00:00:00Z')) / 86400000);
+      return { name: e.name, impact: e.impact, days };
+    })
+    .filter(e => e && e.days >= 0 && e.days <= withinDays)
+    .sort((a, b) => a.days - b.days);
+}
+
 function getUpcomingEvents() {
   const now = new Date();
   const events = [];
@@ -906,6 +935,21 @@ function getUpcomingEvents() {
   const cbcDates = ['2026-03-19','2026-06-18','2026-09-24','2026-12-17'];
   const nextCbc = cbcDates.map(d => new Date(d)).find(d => d > now);
   if (nextCbc) events.push({ name: '台灣央行理監事會議', date: nextCbc, impact: '台股利率' });
+
+  // 台指期結算（每月第三個週三）— 台股自身最固定的波動日，結算前後易有異常拉抬/摜壓
+  const settle = (() => {
+    const d = new Date(now.getFullYear(), now.getMonth(), 1);
+    while (d.getDay() !== 3) d.setDate(d.getDate() + 1);
+    d.setDate(d.getDate() + 14);
+    if (d < now) {
+      const n2 = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+      while (n2.getDay() !== 3) n2.setDate(n2.getDate() + 1);
+      n2.setDate(n2.getDate() + 14);
+      return n2;
+    }
+    return d;
+  })();
+  events.push({ name: '台指期月結算', date: settle, impact: '台股波動' });
 
   // 美國非農（每月第一個週五）
   const nfp = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -2052,6 +2096,15 @@ function buildManagerAnalysis(s) {
     else notes.push(`盤中五檔 委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張，掛單均衡`);
   }
 
+  // 重大事件環境註記：FOMC/結算/央行 2 天內 → 波動放大提醒（不計方向分，
+  // 事件是波動放大器不是方向指標 — 但倉位該知道自己正站在事件前）
+  try {
+    for (const e of imminentEvents(2)) {
+      if (/FOMC|結算|央行|CPI/.test(e.name))
+        notes.push(`⚡ ${e.days === 0 ? '今日' : `${e.days} 天後`}${e.name} — 事件前後波動放大，新倉宜縮、停損宜緊`);
+    }
+  } catch {}
+
   // 期貨籌碼（市場環境證據）：外資期貨部位是現貨買賣超看不到的方向表態
   const dv = derivsSummary();
   if (dv) {
@@ -2072,6 +2125,7 @@ function buildManagerAnalysis(s) {
 
   // ⑥ 基本面
   const rev = s.rev, fin = s._fin;
+  if (s._revNew) notes.push(`📢 ${s._revNew} 月營收剛公布 — 數字已納入下方評分，公布日常有跳空與放量，短線追價需謹慎`);
   if (rev?.yoy != null) {
     if (rev.yoy >= 30) add(1.5, 1, `月營收年增 +${rev.yoy.toFixed(1)}%（高成長）`, 'fund');
     else if (rev.yoy >= 10) add(0.8, 1, `月營收年增 +${rev.yoy.toFixed(1)}%`, 'fund');
@@ -4415,6 +4469,47 @@ function startLiveQuotes() {
     refreshLivePrices();
   }, 15000);
   refreshLivePrices();
+  startNewsCycle();
+}
+
+// ── 盤中新聞即時分析：每 10 分鐘重抓重判，追蹤標的的新新聞記入流水帳 ──────
+// 新聞不是盤後才看的東西 — 盤中一則「調降財測」足以讓技術面全部失效。
+let _newsTimer = null;
+let _newsSeen = new Set();
+function startNewsCycle() {
+  clearInterval(_newsTimer);
+  _newsTimer = setInterval(() => {
+    if (document.hidden || !isMarketOpenTW()) return;
+    refreshNewsIntraday();
+  }, 10 * 60 * 1000);
+}
+
+async function refreshNewsIntraday() {
+  try {
+    const news = (await fetchNewsRSS('台股 股市', 12).catch(() => null) || [])
+      .map(n => ({ impact: n.source || '台股', ...n }));
+    if (!news.length) return;
+    _newsRaw = news;
+    buildNewsSignals(news);          // 讓 buildManagerAnalysis 的新聞證據即刻更新
+    // 追蹤標的（持倉/長期名單/AI 訊號）被新新聞點名 → 記入流水帳
+    const tracked = new Map();
+    for (const h of getHoldings()) tracked.set(h.name, h.id);
+    for (const it of getLongTermList()) tracked.set(it.name, it.id);
+    for (const t of getAiSignals().filter(x => x.status === 'open')) tracked.set(t.name, t.id);
+    const cutoff = Date.now() - 45 * 60 * 1000;
+    for (const n of news) {
+      if (!n.ts || n.ts < cutoff || _newsSeen.has(n.headline)) continue;
+      for (const [name, id] of tracked) {
+        if (name.length >= 2 && n.headline.includes(name)) {
+          _newsSeen.add(n.headline);
+          logSignal('alert', `新聞點名 ${name}（${id}）${n.dir && n.dir !== '中性' ? `・${n.dir}` : ''}`,
+            n.headline, { id, dir: n.dir === '偏多' ? 1 : n.dir === '偏空' ? -1 : 0, dedupKey: `news-${id}-${n.headline.slice(0, 12)}` });
+          break;
+        }
+      }
+    }
+    if (_newsSeen.size > 200) _newsSeen = new Set([..._newsSeen].slice(-100));
+  } catch (e) { console.warn('盤中新聞更新失敗:', e); }
 }
 
 function startRefreshCycle() {
@@ -6085,18 +6180,8 @@ function buildPreOpen() {
   });
 
   // ⑤-b 近日重要數據倒數（3 天內）＋事前方向判讀 — 原獨立推播，併入盤前
-  // 只列 1~3「日曆日」後的（今日事件已在【今日數據】段，避免同一事件列兩次；
-  // 用時數 ceil 會把今天下午的事件誤標成「1 天後」）
-  const fmtTW = d => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei' }).format(d);
-  const todayTW = twClock().date;
-  const evtsSoon = (getUpcomingEvents() || [])
-    .map(e => {
-      const iso = (() => { try { return fmtTW(e.date instanceof Date ? e.date : new Date(e.date)); } catch { return null; } })();
-      if (!iso) return null;
-      const days = Math.round((new Date(iso + 'T00:00:00Z') - new Date(todayTW + 'T00:00:00Z')) / 86400000);
-      return { name: e.name, impact: e.impact, days };
-    })
-    .filter(e => e && e.days >= 1 && e.days <= 3);
+  // 只列 1~5「日曆日」後的（今日事件已在【今日數據】段，避免同一事件列兩次）
+  const evtsSoon = imminentEvents(5).filter(e => e.days >= 1);
 
   // ⑥ 持倉與交易重點（昨收資料的評估 — 開盤後 09:30 另有追蹤版）
   const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
@@ -6215,6 +6300,14 @@ function notifyDailyBrief() {
   if (b.us.length) L.push(`【美股】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
   if (b.ov?.adr) L.push(`【隔夜】台積電 ADR ${b.ov.adr.chg1 >= 0 ? '+' : ''}${b.ov.adr.chg1}%${b.ov.premium != null ? `（溢價 ${b.ov.premium >= 0 ? '+' : ''}${b.ov.premium}%）` : ''}`);
   if (b.instVol.length) { L.push(''); L.push('【籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
+  // 重大事件倒數（5 天內每天提醒到事件結束 — 與盤前簡報同一套資料）
+  (() => {
+    const ev = imminentEvents(5);
+    if (!ev.length) return;
+    L.push(''); L.push('【重大事件倒數】');
+    ev.forEach(e => L.push(`・${e.days === 0 ? '📌 今日' : `⏳ ${e.days} 天後`} ${e.name}（${e.impact}）`));
+    L.push('事件前波動放大：新倉縮小、持倉停損收緊');
+  })();
   L.push(''); L.push('【今日重點關注】');
   b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
   if (b.holdings.length) {
@@ -7541,6 +7634,12 @@ function computeDayTradePicks() {
       ? `官方當沖成交佔今日量 ${(dtRatio * 100).toFixed(0)}%（可現股當沖、有實際參與者）`
       : '⚠ 官方當日無此股當沖成交紀錄 — 可能不可現股當沖或無人參與，下單前請先確認';
 
+    // 結算日警告：台指期結算當天現貨常有異常拉抬/摜壓，當沖假訊號特別多
+    const settleWarn = (() => {
+      try { return imminentEvents(0).some(e => e.name.includes('結算')) ? '⚠ 今日台指期結算 — 尾盤易有異常波動，當沖假訊號多，部位減半' : null; }
+      catch { return null; }
+    })();
+
     out.push({ s, m, hasChips: net > 0 ? 1 : 0, why: [
       `今日量 ${(last.volume / avg).toFixed(1)} 倍均量收紅（+${chg.toFixed(1)}%）`,
       dtNote,
@@ -7550,6 +7649,7 @@ function computeDayTradePicks() {
       ...(gapWarn ? [gapWarn.txt] : []),
       `日均波動 ${atrPct.toFixed(1)}%、成交 ${Math.round(volZ).toLocaleString()} 張`,
       `來回稅費 ${dayCost}% — 獲利未達 ${(dayCost * 2).toFixed(2)}% 前都在幫券商打工，出手要挑波段`,
+      ...(settleWarn ? [settleWarn] : []),
     ], score: (net > 0 ? Math.min(chipRatio * 100, 30) : -5) + chg + atrPct + (gapWarn?.pts ?? 0)
               + (dtRatio != null ? Math.min(dtRatio * 20, 8) : -4) });
   }
