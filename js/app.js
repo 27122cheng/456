@@ -7519,14 +7519,16 @@ function renderEntrySignals() {
   if (!el) return;
   const ready = allStocks.filter(s => s.analysis).length;
   if (ready < 5) { el.innerHTML = '<div class="adv-loading">等待掃描完成...</div>'; return; }
-  const picks = computeEntrySignals();
   const inH = new Set(getHoldings().map(h => h.id));
 
   // 長期：改用持久化名單（慢變數審核，短線波動不換臉）；波段：當日訊號扣除長期成員
   const ltList = updateLongTermList();
   const ltIds = new Set(ltList.map(x => x.id));
-  const swings = picks.slice(0, 8).filter(pk => !ltIds.has(pk.s.id) && !classifyLongTerm(pk.s));
+  const all = computeEntrySignals({ includeWatch: true });
+  const swings = all.filter(pk => pk.q.grade === 'A' && !ltIds.has(pk.s.id) && !classifyLongTerm(pk.s)).slice(0, 4);
+  const watchers = all.filter(pk => pk.q.grade !== 'A' && !ltIds.has(pk.s.id)).slice(0, 4);
   const days = computeDayTradePicks();
+  const hwNow = marketHeadwind();
 
   // 長期成員卡：入選日／期間報酬／目前狀態，短線拉回明講「屬正常波動」
   const ltCard = it => {
@@ -7601,14 +7603,17 @@ function renderEntrySignals() {
   const body =
     sect('🏛 長期持有名單（3 個月～半年以上）', '慢變數選入後即固定 — 只有跌破年線/中期死叉/營收轉差/處置才剔除，短線拉回不換股',
       ltList.map(ltCard).join('')) +
-    sect('📈 短期波段（數日～數週）', '技術與籌碼轉強但基本面支撐不足以長抱，按建議停損/目標紀律操作',
-      swings.slice(0, 4).map(pk => card(pk, 'long')).join('')) +
+    sect('📈 短期波段（數日～數週）', '只列品質 A 級（八因子 ≥75 黃金匯流）— 勝率的第一道防線是出手標準，寧缺勿濫',
+      swings.map(pk => card(pk, 'long')).join('')) +
+    sect('👀 觀察名單（品質 B — 等更好的位置）', '條件成立但進場點不夠好（多半是位置偏高或量能未確認）。回檔至 EMA20 附近或帶量突破時會升級為進場訊號，現在追進勝率打折',
+      watchers.map(pk => card(pk, 'long')).join('')) +
     sect('⚡ 當沖參考（極高風險）', '流動性＋波動＋強收盤動能篩選（處置/注意股已排除）。開盤跳空逾 +2% 不追（開高走低是隔日沖最大虧損源）、開低逾 -0.5% 放棄；收盤前務必出場',
-      days.filter(dp => !picks.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
+      days.filter(dp => !all.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
 
   const hw = heatWarning();
-  el.innerHTML = (hw && body ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);font-size:0.76rem;color:var(--bear);margin-bottom:10px">${hw}</div>` : '') + body ||
-    '<p style="font-size:0.8rem;color:var(--text3)">今日三類皆無符合條件的推薦 — 標準較嚴（研判偏多 + 綜合 ≥65 + 非追高 + 非處置股），寧可空手也不硬給訊號。</p>';
+  const hwBanner = hwNow ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);font-size:0.76rem;color:var(--yellow);margin-bottom:10px">🛑 大盤研判 ${hwNow.norm}（偏空）— 新多單訊號暫停，僅保留 20 日跑贏大盤 ≥10pp 的極強勢股。逆風做多是實證上最大的虧損來源，空手也是部位。</div>` : '';
+  el.innerHTML = hwBanner + (hw && body ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);font-size:0.76rem;color:var(--bear);margin-bottom:10px">${hw}</div>` : '') + (body ||
+    '<p style="font-size:0.8rem;color:var(--text3)">今日皆無符合條件的推薦 — 標準已提高（研判偏多＋綜合 ≥65＋品質 A＋風報比 ≥1.5＋大盤不逆風），寧可空手也不硬給訊號。</p>');
 }
 
 // 每日一次：持倉出場訊號 Telegram 推送
@@ -7757,9 +7762,9 @@ function entryQuality(s, m, p) {
   push('一致性', m.agr >= 0.7 ? 10 : m.agr >= 0.55 ? 7 : m.agr >= 0.4 ? 4 : 0, 10,
     `證據一致性 ${(m.agr * 100).toFixed(0)}%`);
 
-  // ⑧ 風報比（5）
-  push('風報比', p.rr >= 2 ? 5 : p.rr >= 1.5 ? 3 : 0, 5,
-    p.rr ? `1:${p.rr.toFixed(1)}` : '無固定目標（續抱型）');
+  // ⑧ 風報比（5）：續抱型（上方無壓力）是優勢不是缺陷，給 4 分
+  push('風報比', p.holdOn ? 4 : p.rr >= 2 ? 5 : p.rr >= 1.5 ? 3 : 0, 5,
+    p.holdOn ? '上方無壓力，續抱型（不受固定目標限制）' : p.rr ? `1:${p.rr.toFixed(1)}` : '風報比不明');
 
   const score = f.reduce((x, y) => x + y.pts, 0);
   const grade = score >= 75 ? 'A' : score >= 60 ? 'B' : 'C';
@@ -7768,19 +7773,38 @@ function entryQuality(s, m, p) {
            weak: f.filter(x => x.pts === 0).map(x => x.txt) };
 }
 
-function computeEntrySignals() {
+// 大盤逆風濾網狀態（供 UI 誠實說明為何今天沒訊號）
+function marketHeadwind() {
+  const norm = Math.round(outlookData.norm ?? 0);
+  return norm <= -15 ? { norm } : null;
+}
+
+function computeEntrySignals(opts = {}) {
   const ready = allStocks.filter(s => s.analysis);
   if (ready.length < 5) return [];
+  // 硬濾網①：大盤逆風（研判 ≤ -15）暫停所有新多單訊號 —
+  // 逆風做多是實證上最大的虧損來源，過去只「警告」照樣推，現在直接停。
+  // 唯一例外：20 日跑贏大盤 ≥10pp 的極強勢股（資金避風港）仍可入列。
+  const hw = marketHeadwind();
   const perfRules = signalPerfStats();
   const mktNow = Math.round(outlookData.norm ?? 0);
+  const mret = marketRet20();
   const picks = [];
   for (const s of ready) {
     if (s._staleDays >= STALE_LIMIT) continue;       // 資料過期不推薦
+    if (hw) {
+      const closes = s.ohlcv?.map(b => b.close);
+      const r20 = closes?.length >= 21 ? (s.analysis.price - closes[closes.length - 21]) / closes[closes.length - 21] * 100 : null;
+      if (mret == null || r20 == null || r20 - mret < 10) continue;
+    }
     const m = buildManagerAnalysis(s);
     if (!m || m.dir < 3) continue;                   // 只推研判強度足夠者
     const p = buildEntryPlan(s, m);
     if (!p?.ok) continue;
     if (s.analysis.price > p.hi * 1.02) continue;    // 已明顯追高不推
+    // 硬濾網②：風報比 <1.5 且有固定目標 → 不推。小賺大賠是報酬不理想的
+    // 數學根源：1:1.2 的單要 55% 勝率才打平，過去只警告仍照推。
+    if (!p.holdOn && p.rr != null && p.rr < 1.5) continue;
     const d = scoreStockDimensions(s, marketRet20() ?? 0);
     if (!d || d.excluded) continue;
     // 實績回饋（雙向）：命中「實證低勝率」情境每項 −6、「實證高勝率」情境每項 +4
@@ -7817,11 +7841,15 @@ function computeEntrySignals() {
   picks.sort((a, b) => (b.q.score - a.q.score) || (b.d.total - a.d.total));
   // 族群分散：同族群最多取 2 檔 — 三檔同族群等於同一注押三次
   const secCnt = {};
-  return picks.filter(pk => {
+  const out = picks.filter(pk => {
     const sec = pk.s.sector || '其他';
     secCnt[sec] = (secCnt[sec] || 0) + 1;
     return secCnt[sec] <= 2;
   });
+  // 硬濾網③：分級 — 只有品質 A（≥75，黃金匯流）才是「進場訊號」；
+  // B 級降為觀察名單（等回檔到更好位置），不推播、不建檔追蹤。
+  // 勝率不理想時的正解是提高出手標準，不是換指標。
+  return opts.includeWatch ? out : out.filter(pk => pk.q.grade === 'A');
 }
 
 // 每日一次：適合進場的個股訊號推送
