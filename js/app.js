@@ -901,14 +901,26 @@ function renderSentiment() {
 function imminentEvents(withinDays = 5) {
   const fmtTW = d => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Taipei' }).format(d);
   const todayTW = twClock().date;
-  return (getUpcomingEvents() || [])
+  const dirLbl = { in: '資金流入', out: '資金流出', mix: '雙向波動' };
+  // 數據行事曆＋資金面季節行事曆（繳稅/農曆年/連假/外資長假…）一併倒數
+  const merged = [
+    ...(getUpcomingEvents() || []),
+    ...(getCapitalFlowEvents() || []).map(e => ({ name: e.name, date: e.date, impact: dirLbl[e.dir] || '資金面', dir: e.dir, desc: e.desc })),
+  ];
+  const seen = new Set();
+  return merged
     .map(e => {
       const iso = (() => { try { return fmtTW(e.date instanceof Date ? e.date : new Date(e.date)); } catch { return null; } })();
       if (!iso) return null;
       const days = Math.round((new Date(iso + 'T00:00:00Z') - new Date(todayTW + 'T00:00:00Z')) / 86400000);
-      return { name: e.name, impact: e.impact, days };
+      return { name: e.name, impact: e.impact, days, dir: e.dir ?? null, desc: e.desc ?? null };
     })
-    .filter(e => e && e.days >= 0 && e.days <= withinDays)
+    .filter(e => {
+      if (!e || e.days < 0 || e.days > withinDays) return false;
+      if (seen.has(e.name)) return false;
+      seen.add(e.name);
+      return true;
+    })
     .sort((a, b) => a.days - b.days);
 }
 
@@ -1100,16 +1112,38 @@ function getCapitalFlowEvents() {
     const diff = d - now;
     if (diff > -86400000 && diff <= horizon) out.push({ date: d, name, dir, desc });
   };
+  // 農曆春節（查表 — 農曆無法用公式算；表外年份誠實跳過該項）
+  const CNY = { 2026: '2026-02-17', 2027: '2027-02-06', 2028: '2028-01-26' };
+  // 台灣主要連假首日（清明/端午/中秋/國慶；端午中秋依農曆，逐年查表）
+  const TW_HOLIDAYS = {
+    2026: [['2026-04-03', '清明連假'], ['2026-06-19', '端午連假'], ['2026-09-25', '中秋連假'], ['2026-10-09', '國慶連假']],
+    2027: [['2027-04-03', '清明連假'], ['2027-06-09', '端午連假'], ['2027-09-15', '中秋連假'], ['2027-10-09', '國慶連假']],
+  };
   for (const y of [now.getFullYear(), now.getFullYear() + 1]) {
-    push(new Date(y, 0, 10), '年終獎金行情', 'in', '散戶資金回流，中小型與題材股活躍');
-    push(new Date(y, 4, 1),  '綜所稅繳稅賣壓（5月）', 'out', '繳稅資金抽離市場，量能轉弱');
+    push(new Date(y, 0, 10), '年終獎金＋外資年初回補行情', 'in', '散戶資金回流、外資年度預算重啟布局，1 月常見淨流入');
+    push(new Date(y, 4, 1),  '綜所稅繳稅賣壓（5月）', 'out', '繳稅資金抽離市場＋Sell in May 全球資金季節性同步，量能轉弱');
     push(new Date(y, 6, 1),  '除權息旺季（7-8月）', 'in', '現金股利逾兆元回流市場，高股息與權值股受惠');
+    push(new Date(y, 11, 15), '外資年終長假效應（12月中旬起）', 'out', '外資交易員休假、量縮，年底常見獲利了結與投組調整');
     for (const m of [1, 4, 7, 10]) push(new Date(y, m, 28), 'MSCI 季度調整生效', 'mix', '外資被動資金調整台股權重，尾盤爆量');
     for (const m of [2, 5, 8, 11]) push(thirdFriday(y, m), '富時/ETF 成分股調整', 'mix', '0050 等被動基金換股，成分股進出現大量');
     for (const m of [2, 5, 8, 11]) push(new Date(y, m + 1, 0), '投信季底作帳', 'in', '投信拉抬持股淨值，集中買超中小型股');
     for (const m of [0, 3, 6, 9]) push(new Date(y, m, 15), '台積電法說會', 'mix', '電子權值風向球，半導體族群波動加大');
+    // 美國感恩節（11 月第四個週四）：外資休假、國際量縮
+    const tg = new Date(y, 10, 1);
+    while (tg.getDay() !== 4) tg.setDate(tg.getDate() + 1);
+    tg.setDate(tg.getDate() + 21);
+    push(tg, '美國感恩節連假（外資量縮）', 'mix', '外資休假、國際市場量縮，台股易窄幅盤整');
+    // 農曆年：年前現金需求賣壓 → 年後紅包行情
+    if (CNY[y]) {
+      const cny = new Date(CNY[y] + 'T00:00:00');
+      push(new Date(cny.getTime() - 10 * 86400000), '農曆年前資金需求（春節前約兩週）', 'out', '年前現金需求＋長假風險趨避，外資與散戶同步降風險；台股休市期間國際變化無法反應');
+      push(new Date(cny.getTime() + 6 * 86400000), '春節開紅盤行情', 'in', '長假資金回流，歷史上開紅盤週上漲機率偏高');
+    }
+    // 台灣連假：假前降風險（休市期間國際風險無法即時反應）
+    for (const [d, name] of (TW_HOLIDAYS[y] || []))
+      push(new Date(d + 'T00:00:00'), `${name}前風險調整`, 'mix', '連假休市期間國際變化無法反應，假前外資常先降風險、量縮');
   }
-  return out.sort((a, b) => a.date - b.date).slice(0, 8);
+  return out.sort((a, b) => a.date - b.date).slice(0, 10);
 }
 
 function renderCapitalFlow() {
@@ -2096,12 +2130,21 @@ function buildManagerAnalysis(s) {
     else notes.push(`盤中五檔 委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張，掛單均衡`);
   }
 
-  // 重大事件環境註記：FOMC/結算/央行 2 天內 → 波動放大提醒（不計方向分，
-  // 事件是波動放大器不是方向指標 — 但倉位該知道自己正站在事件前）
+  // 重大事件環境註記（2 天內）：
+  // - 數據型（FOMC/結算/央行/CPI）：波動放大提醒，不計方向分
+  // - 資金面季節型（繳稅/農曆年前/連假/外資長假…）：依歷史資金方向給語氣，
+  //   同樣不計分 — 季節性是「環境」，個股證據才是「理由」
   try {
     for (const e of imminentEvents(2)) {
+      const when = e.days === 0 ? '今日' : `${e.days} 天後`;
       if (/FOMC|結算|央行|CPI/.test(e.name))
-        notes.push(`⚡ ${e.days === 0 ? '今日' : `${e.days} 天後`}${e.name} — 事件前後波動放大，新倉宜縮、停損宜緊`);
+        notes.push(`⚡ ${when}${e.name} — 事件前後波動放大，新倉宜縮、停損宜緊`);
+      else if (e.dir === 'out')
+        notes.push(`💸 ${when}起${e.name} — 資金面季節性逆風（${e.desc || '歷史上此時段資金偏流出'}），做多順位降低`);
+      else if (e.dir === 'in')
+        notes.push(`💰 ${when}${e.name} — 資金面季節性順風（${e.desc || '歷史上此時段資金偏流入'}）`);
+      else if (e.dir === 'mix')
+        notes.push(`🔀 ${when}${e.name} — ${e.desc || '雙向波動時段，倉位保守'}`);
     }
   } catch {}
 
