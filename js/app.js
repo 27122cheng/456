@@ -4282,6 +4282,8 @@ function manualRefresh() {
 // 這裡以 MIS 批次報價每 15 秒刷新價格與成交量，技術指標仍隨掃描更新。
 let liveTimer = null;
 let _liveBusy = false;
+let _fmLastAt = 0;   // FinMind 備援上次呼叫時間（配額保護：5 分鐘冷卻）
+let _yhLastAt = 0;   // Yahoo 備援上次呼叫時間（共用代理 IP 保護：2 分鐘冷卻）
 let _lastQuoteTime = '';
 let _liveStatus = '';          // 供導覽列顯示：報價時間或失敗原因
 let _liveFail = '';            // 失敗的具體原因（顯示在價格旁，手機也看得到）
@@ -4355,21 +4357,34 @@ async function refreshLivePrices() {
   try {
     let map = await fetchRealtimeBatch(ids);
     let src = localStorage.getItem('mis-direct') === 'yes' ? 'MIS 直連' : 'MIS';
-    // FinMind（使用者自己的免費 token）：額度不與他人共用，優先於 Yahoo 備援
+    // ── 備援配額保護 ──
+    // FinMind 免費額度約 300~600 次/小時、每檔 tick = 1 request；
+    // 若跟著 15 秒 tick 打（12 檔 × 240 tick/hr = 2,880 req/hr）幾分鐘就燒光，
+    // 之後一整天都不能用。備援必須「降頻＋縮量」：寧可價格慢 5 分鐘，
+    // 不可額度歸零全天沒價格。Yahoo 走共用代理 IP，同理限 120 秒一輪。
     if (!Object.keys(map).length && finmindToken()) {
-      const prio = [currentStockId, ...getHoldings().map(h => h.id),
-        ...[...allStocks].filter(x => x.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(x => x.id)];
-      map = await fetchFinMindQuotes([...new Set(prio.filter(Boolean))], 12);
-      src = 'FinMind';
+      if (Date.now() - _fmLastAt >= 5 * 60 * 1000) {
+        _fmLastAt = Date.now();
+        const prio = [currentStockId, ...getHoldings().map(h => h.id),
+          ...[...allStocks].filter(x => x.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(x => x.id)];
+        map = await fetchFinMindQuotes([...new Set(prio.filter(Boolean))], 6);   // 每 5 分鐘最多 6 檔 → ~72 req/hr
+        src = 'FinMind（備援降頻中）';
+      } else src = 'FinMind 冷卻中';
     }
     if (!Object.keys(map).length) {
-      // MIS 取不到 → 改用 Yahoo 分鐘線備援（每檔一請求，故只取重點標的：
-      // 正在檢視的個股、持倉、評分前段），至少讓最在意的價格是即時的
-      const prio = [currentStockId, ...getHoldings().map(h => h.id),
-        ...[...allStocks].filter(s2 => s2.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(s2 => s2.id)];
-      const uniq = [...new Set(prio.filter(Boolean))];
-      map = await fetchYahooQuotes(uniq, 15);
-      src = 'Yahoo 備援';
+      if (Date.now() - _yhLastAt >= 2 * 60 * 1000) {
+        _yhLastAt = Date.now();
+        // MIS 取不到 → Yahoo 分鐘線備援（每檔一請求，只取重點標的）
+        const prio = [currentStockId, ...getHoldings().map(h => h.id),
+          ...[...allStocks].filter(s2 => s2.analysis).sort((a, b) => verdictScore(b) - verdictScore(a)).map(s2 => s2.id)];
+        const uniq = [...new Set(prio.filter(Boolean))];
+        map = await fetchYahooQuotes(uniq, 10);   // 每 2 分鐘最多 10 檔 → ≤300 req/hr
+        src = 'Yahoo 備援（降頻中）';
+      } else {
+        _liveStatus = '備援冷卻中（保護免費額度，最多 2 分鐘後重試）';
+        renderLiveTick();
+        return 0;
+      }
     }
     if (!Object.keys(map).length) {               // 靜默失敗是先前查不出問題的原因，改為明示
       _liveFail = `${lastQuoteFail || 'MIS 無回應'}`
