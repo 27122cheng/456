@@ -4549,9 +4549,11 @@ async function refreshLivePrices() {
       } catch {}
       checkStopProximity();      // 持倉逼近/跌破停損 → 盤中即時警報（每檔每日一次）
       try { notifyDayTradeTriggers(); } catch {}   // 當沖 ORB 觸發 → 立即可掛單的價格
-      try { notifyDayCloseout(); } catch {}        // 收盤前當沖平倉提醒
     }
     else _liveStatus = '報價非今日（休市或收盤）';
+    // 平倉提醒是「時間驅動」的紀律事項 —— 報價失敗時更該提醒，
+    // 因此放在成功分支之外（先前放在 if(n) 內是缺口）
+    try { notifyDayCloseout(); } catch {}
     renderLiveTick();
     return n;
   } catch (e) {
@@ -7564,7 +7566,11 @@ function notifyDayCloseout() {
   const mins = t.hour * 60 + t.minute;
   if (mins < 12 * 60 + 50 || mins > 13 * 60 + 20) return;
   const days = getHoldings().filter(h => h.kind === 'day');
-  if (!days.length) return;
+  // 系統當日已觸發過的當沖訊號也要提醒 —— 使用者可能照做但沒按「記錄持倉」
+  const triggered = todaySignalLog()
+    .filter(x => x.kind === 'entry' && /當沖.*訊號觸發/.test(x.title) && x.id)
+    .filter(x => !days.some(h => h.id === x.id));
+  if (!days.length && !triggered.length) return;
   if (tgKeySent('dt-closeout')) return;
   const rows = days.map(h => {
     const s = allStocks.find(x => x.id === h.id);
@@ -7572,10 +7578,13 @@ function notifyDayCloseout() {
     const ret = px && h.entry ? (px / h.entry - 1) * 100 : null;
     return `・${h.name}(${h.id})　成本 ${h.entry}｜現價 ${px != null ? px.toFixed(2) : '--'}${ret != null ? `　${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%` : ''}`;
   }).join('\n');
-  tgPush(`⏰ 當沖平倉提醒（收盤前 30 分）\n\n目前有 ${days.length} 筆當沖單：\n${rows}\n\n` +
-         `當沖留倉＝把已知風險換成隔夜跳空的未知風險。無論盈虧，收盤前一律出清。\n⚠ 僅供參考，非投資建議`);
+  const trigRows = triggered.map(x => `・${x.title.replace(/（.*/, '')}（今日曾發出訊號，若有進場請一併出清）`).join('\n');
+  tgPush(`⏰ 當沖平倉提醒（收盤前 30 分）\n\n` +
+         (days.length ? `已記錄的當沖單 ${days.length} 筆：\n${rows}\n` : '') +
+         (trigRows ? `${days.length ? '\n' : ''}今日發出過訊號：\n${trigRows}\n` : '') +
+         `\n當沖留倉＝把已知風險換成隔夜跳空的未知風險。無論盈虧，收盤前一律出清。\n⚠ 僅供參考，非投資建議`);
   tgMarkKeys(['dt-closeout']);
-  logSignal('exit', '當沖平倉提醒', `${days.length} 筆當沖單需於收盤前出清`, { dir: 0, dedupKey: 'dt-closeout' });
+  logSignal('exit', '當沖平倉提醒', `${days.length} 筆已記錄＋${triggered.length} 筆訊號需於收盤前出清`, { dir: 0, dedupKey: 'dt-closeout' });
 }
 
 // ── 持倉停損逼近警報（盤中即時）───────────────────────────────────────────
