@@ -140,7 +140,7 @@ async function initApp() {
   safe('本週新聞', renderWeeklyNews);
   safe('頂底反轉', renderTopBottomReversal);
   safe('刷新循環', startRefreshCycle);
-  safe('每日簡報', startDailyBriefingCheck);
+  safe('推播排程器', startNotificationScheduler);
   safe('掃描', startScan);
 }
 
@@ -422,22 +422,8 @@ async function runScan() {
   after('價格警報', checkAlerts);
   after('本週開盤佈局', () => { renderWeeklyBrief(); });
   after('訊號流水帳', () => { renderSignalLog(); });
-  after('Telegram 推送', () => {
-    // 盤後總結（約 16:30 法人資料出爐後，一天一則）
-    notifyAfterClose();
-    // 其餘推播只在可下單的時段：08:30 盤前 ~ 14:30 盤後定價撮合
-    if (!inNotifyWindow()) return;
-    // 訊息紀律：一天固定三份報告（08:30 盤前、09:30 開盤後、16:30 盤後），
-    // 其餘只在「有事發生」時推（新進場訊號、持倉等級變化、大戶動向、價格警報）。
-    // 強勢多頭／重點關注／數據倒數原為獨立推播 — 內容已併入簡報，
-    // 不再單獨發送：相似訊息太多則，比重複更擾人。
-    notifyPreOpen();        // 每日 08:30 盤前簡報（昨收＋夜盤＋新聞＋數據＋關注＋機會）
-    notifyDailyBrief();     // 09:00 市場簡報 — 僅在盤前簡報未發出時補位
-    notifyEntrySignals();   // 事件型：簡報之後出現的「新」進場訊號才發
-    notifyHoldingExits();   // 事件型：持倉等級變化才發
-    notifyWeeklyBrief();    // 週一 09:30 本週佈局（每週一次）
-    notifyPostOpen();       // 每日 09:30 開盤後追蹤
-  });
+  // 掃描剛完成、資料最新 → 立刻檢查一次排程推播（平時由每分鐘的排程器負責）
+  after('Telegram 推送', () => { runScheduledNotifications(); });
 }
 
 // ── Dashboard Rendering ────────────────────────────────────────────────────
@@ -6466,13 +6452,19 @@ function notifyPreOpen() {
   if (mins < 8 * 60 + 30 || mins >= 9 * 60) return;               // 只在 08:30~08:59
   if (localStorage.getItem('tg-preopen') === t.date) return;
   const b = buildPreOpen();
-  if (!b) return;                                                  // 資料不足不發，等下輪掃描再試
-  logSignal('brief', '盤前簡報已推送', '08:30：昨收＋美股夜盤＋隔夜新聞＋今日開盤研判與交易重點', { dedupKey: 'preopen' });
+  if (!b) return;                                                  // 資料不足不發，下一分鐘再試
+  notifyPreOpenSend(b, false);
+}
+
+// 實際組裝與發送（排程與手動共用同一份格式）
+function notifyPreOpenSend(b, manual) {
+  const t = twClock();
+  logSignal('brief', '盤前簡報已推送', '08:30：昨收＋美股夜盤＋隔夜新聞＋今日開盤研判與交易重點', { dedupKey: manual ? `preopen-manual-${t.hour}${t.minute}` : 'preopen' });
   localStorage.setItem('tg-preopen', t.date);
   if (!tgWants('sig')) return;
 
   const L = [];
-  L.push(`🌅 盤前簡報　${b.date} 08:30`);
+  L.push(`🌅 盤前簡報　${b.date}${manual ? '（手動發送）' : ' 08:30'}`);
   L.push('');
   L.push(`【昨日收盤】${b.twii?.price != null ? `加權 ${b.twii.price.toFixed(0)}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1?.toFixed(2) ?? '--'}%）｜` : ''}研判${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）｜掃描池 多 ${b.bullN} / 空 ${b.bearN} / 共 ${b.total}`);
   if (b.us.length) L.push(`【美股夜盤】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
@@ -6537,12 +6529,18 @@ function notifyDailyBrief() {
   }
   const b = buildDailyBrief();
   if (!b) return;
-  logSignal('brief', '每日市場簡報已推送', '09:00 盤前：大盤研判、多空家數、重點事件', { dedupKey: 'daily' });
+  notifyDailyBriefSend(b, false);
+}
+
+// 實際組裝與發送（排程與手動共用同一份格式）
+function notifyDailyBriefSend(b, manual) {
+  const t = twClock();
+  logSignal('brief', '每日市場簡報已推送', '09:00：大盤研判、多空家數、事件倒數、重點關注', { dedupKey: manual ? `daily-manual-${t.hour}${t.minute}` : 'daily' });
   localStorage.setItem('tg-daily-brief', t.date);
   if (!tgWants('sig')) return;
 
   const L = [];
-  L.push(`📊 每日市場簡報　${b.date} 09:00`);
+  L.push(`📊 每日市場簡報　${b.date}${manual ? '（手動發送）' : ' 09:00'}`);
   L.push('');
   L.push(`【大盤】${b.regime}（${b.norm > 0 ? '+' : ''}${b.norm}）`);
   if (b.us.length) L.push(`【美股】${b.us.join('・')}${b.vix?.price != null ? `｜VIX ${b.vix.price.toFixed(1)}` : ''}`);
@@ -9912,38 +9910,42 @@ function manualSendDailyBriefing(silent = false) {
     if (!silent) showToast('請先等掃描完成', 'error');
     return false;
   }
-
-  const norm = outlookData.norm ?? 0;
-  const mkt = norm >= 15 ? '📈 偏多' : norm <= -15 ? '📉 偏空' : '➡️ 中性';
-  const { daily } = computeFocusStocks();
-  const dLines = daily.slice(0, 5).map((f, i) => `${i + 1}. ${f.s.name}(${f.s.id}) ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
-  const now = new Date();
-  const events = getUpcomingEvents().slice(0, 3).map(e => {
-    const days = Math.ceil((e.date - now) / 86400000);
-    return `・${e.name}（${days <= 0 ? '今日' : days + '天後'}）`;
-  }).join('\n');
-  const bulls = allStocks.filter(s => s.analysis?.score >= getThreshold('bull')).length;
-  const bears = allStocks.filter(s => s.analysis && verdictScore(s) <= getThreshold('bear')).length;
-
-  tgPush(`📊 台股雷達 每日市場簡報\n${now.toLocaleDateString('zh-TW')}\n\n🌡 大盤環境：${mkt}（多空總覽 ${Math.round(norm)} 分）\n市場寬度：多頭 ${bulls} 檔 / 空頭 ${bears} 檔\n\n⭐ 今日重點關注\n${dLines}\n\n🗓 即將公布\n${events}\n\n⚠ 僅供參考，非投資建議`);
+  // 手動觸發一律送「當下最完整的那一份」：盤前時段送盤前簡報，其餘送每日簡報。
+  // 先前手動版是另一套較簡略的格式，與排程版並存造成兩種樣貌 —— 已統一。
+  const t = twClock();
+  const mins = t.hour * 60 + t.minute;
+  const preOpenSlot = mins < 9 * 60;
+  const b = preOpenSlot ? buildPreOpen() : buildDailyBrief();
+  if (!b) { if (!silent) showToast('資料尚未就緒，請稍候再試', 'error'); return false; }
+  // 清掉今日去重鍵讓它真的送出（手動＝使用者明確要求）
+  localStorage.removeItem(preOpenSlot ? 'tg-preopen' : 'tg-daily-brief');
+  if (preOpenSlot) notifyPreOpenSend(b, true);
+  else notifyDailyBriefSend(b, true);
+  if (!silent) showToast('已發送市場簡報', 'success');
   return true;
 }
 
-// ── 每日簡報自動發送（每天 9:00，開啟網頁時若已過 9 點且未發送則補發）──
-function startDailyBriefingCheck() {
-  const tryDailyBrief = () => {
-    if (!inNotifyWindow()) return;          // 非交易時段不發
-    const now = new Date();
-    if (now.getHours() < 9) return;
-    const today = now.toDateString();
-    if (localStorage.getItem('daily-brief-sent') === today) return;
-    if (manualSendDailyBriefing(true)) {
-      localStorage.setItem('daily-brief-sent', today);
-    }
-  };
-  // 掃描完成後補發一次 + 之後每分鐘檢查（準時 9 點觸發）
-  setTimeout(tryDailyBrief, 60 * 1000);
-  setInterval(tryDailyBrief, 60 * 1000);
+// ── 排程推播的唯一入口（每分鐘檢查）─────────────────────────────────────
+// 先前所有排程報告都掛在「掃描完成」的回呼裡 —— 掃描每 5 分鐘一輪，
+// 只有剛好完成在 08:30~08:59 的那輪才會發盤前簡報，錯過就整天沒有。
+// （舊的 09:00 簡報因為自己有 setInterval 每分鐘檢查，所以只有它準時發，
+//   使用者因此只收得到 09:00 那則 —— 這是「只剩九點」的真正原因。）
+// 統一改為每分鐘檢查：各報自己判斷時段與去重，資料未就緒時下一分鐘再試。
+function runScheduledNotifications() {
+  try { notifyAfterClose(); } catch {}          // 16:30~21:00 盤後總結
+  if (!inNotifyWindow()) return;                // 其餘只在可下單時段
+  try { notifyPreOpen(); } catch {}             // 08:30~08:59 盤前簡報
+  try { notifyDailyBrief(); } catch {}          // 09:00 起（盤前已發則跳過）
+  try { notifyEntrySignals(); } catch {}        // 事件型：新進場訊號
+  try { notifyHoldingExits(); } catch {}        // 事件型：持倉等級變化
+  try { notifyWeeklyBrief(); } catch {}         // 週一 09:30 本週佈局
+  try { notifyPostOpen(); } catch {}            // 09:30 開盤後追蹤
+  try { notifyDayCloseout(); } catch {}         // 12:50 當沖平倉提醒
+}
+
+function startNotificationScheduler() {
+  runScheduledNotifications();
+  setInterval(runScheduledNotifications, 60 * 1000);
 }
 
 // ── 策略歷史回測 ────────────────────────────────────────────────────────────
