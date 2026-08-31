@@ -9943,9 +9943,49 @@ function runScheduledNotifications() {
   try { notifyDayCloseout(); } catch {}         // 12:50 當沖平倉提醒
 }
 
-function startNotificationScheduler() {
+// 排程時刻表：到點時「先掃描一次、再用最新資料推送」。
+// 每分鐘的檢查只是看時鐘（不打 API）；真正的掃描只發生在這些時刻各一次。
+const NOTIFY_SLOTS = [
+  { k: 'preopen',    h: 8,  m: 30, sent: () => localStorage.getItem('tg-preopen') === twClock().date },
+  { k: 'daily',      h: 9,  m: 0,  sent: () => localStorage.getItem('tg-daily-brief') === twClock().date
+                                            || localStorage.getItem('tg-preopen') === twClock().date },
+  { k: 'postopen',   h: 9,  m: 30, sent: () => localStorage.getItem('tg-postopen') === twClock().date },
+  { k: 'afterclose', h: 16, m: 30, sent: () => localStorage.getItem('tg-afterclose') === twClock().date },
+];
+
+// 到點且今日尚未發送 → 回傳該時段（容許 20 分鐘的補發窗口：
+// 網頁晚開或掃描較慢時仍會補上，不會整天沒訊息）
+function dueNotifySlot() {
+  const t = twClock();
+  if (!isTradingDayTW()) return null;
+  const now = t.hour * 60 + t.minute;
+  for (const s of NOTIFY_SLOTS) {
+    const at = s.h * 60 + s.m;
+    if (now >= at && now < at + 20 && !s.sent()) return s;
+  }
+  return null;
+}
+
+let _slotScanBusy = false;
+async function scheduledTick() {
+  // 先用現有資料檢查一次（事件型推播如停損、當沖觸發不必等掃描）
   runScheduledNotifications();
-  setInterval(runScheduledNotifications, 60 * 1000);
+  // 到了排程時刻且今日未發 → 觸發一次掃描，掃完再推送最新內容
+  const slot = dueNotifySlot();
+  if (!slot || _slotScanBusy || scanning) return;
+  _slotScanBusy = true;
+  try {
+    await startScan();               // 掃描完成的回呼本身也會呼叫 runScheduledNotifications
+    runScheduledNotifications();     // 保險：確保掃完立即嘗試發送
+  } catch (e) {
+    console.warn('排程掃描失敗:', e);
+    runScheduledNotifications();     // 掃描失敗也用現有資料試一次，總比沒訊息好
+  } finally { _slotScanBusy = false; }
+}
+
+function startNotificationScheduler() {
+  scheduledTick();
+  setInterval(scheduledTick, 60 * 1000);
 }
 
 // ── 策略歷史回測 ────────────────────────────────────────────────────────────
