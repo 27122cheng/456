@@ -236,6 +236,22 @@ async function runScan() {
   fetchTWFundAll().then(m => {
     if (!m) return;
     allStocks.forEach(s => { if (m[s.id]) s._fd = m[s.id]; });
+    // 估值歷史：每日記一筆 PE，累積成「這檔自己的估值區間」。
+    // PE 20 對台積電可能偏貴、對某傳產可能便宜 —— 絕對值沒有意義，
+    // 相對自身歷史的位階才有。無外部歷史 API，只能自己一天天累積。
+    try {
+      const h = JSON.parse(localStorage.getItem('pe-hist') || '{}');
+      const d = twClock().date;
+      for (const s of allStocks) {
+        const pe = m[s.id]?.pe;
+        if (!(pe > 0) || pe > 200) continue;              // 異常值不入庫
+        const arr = h[s.id] = h[s.id] || [];
+        if (!arr.some(x => x.d === d)) arr.push({ d, pe: +pe.toFixed(1) });
+        h[s.id] = arr.slice(-500);                        // 約兩年交易日
+      }
+      localStorage.setItem('pe-hist', JSON.stringify(h));
+      allStocks.forEach(s => { s._pePct = peValuation(s.id, s._fd?.pe); });
+    } catch {}
   }).catch(() => {});
   // 使用者於目錄頁啟用的額外資料集
   loadEnabledDatasets().catch(() => {});
@@ -653,6 +669,26 @@ function scoreFactor(f) {
   return { pts, dir: pts > 0.05 ? 'up' : pts < -0.05 ? 'dn' : 'flat' };
 }
 
+// 各成分的歷史獨立命中率（從預測日誌的成分快照回推）
+function componentAccuracy() {
+  const out = {};
+  try {
+    for (const p of getPredLog()) {
+      if (!p.resolved || !p.comps || p.market?.actualChg == null) continue;
+      const actual = Math.sign(p.market.actualChg);
+      if (actual === 0 || Math.abs(p.market.actualChg) < 0.5) continue;   // 持平不計分
+      for (const [k, sc] of Object.entries(p.comps)) {
+        if (!sc) continue;
+        const o = out[k] = out[k] || { n: 0, hit: 0 };
+        o.n++;
+        if (Math.sign(sc) === actual) o.hit++;
+      }
+    }
+  } catch {}
+  for (const k of Object.keys(out)) out[k].pct = out[k].n ? out[k].hit / out[k].n * 100 : null;
+  return out;
+}
+
 // ── 大盤走向引擎 ───────────────────────────────────────────────────────────
 // 舊版 norm 幾乎全由「國際指數昨日/五日漲跌」決定 —— 那是同步指標不是領先指標，
 // 拿它預測台股 7 日後的方向，準確度自然接近擲硬幣。
@@ -712,6 +748,22 @@ function marketRegime() {
       if (d >= 0.08) { sc += 0.3; txt += `｜寬度改善 +${(d * 100).toFixed(0)}pp`; }
       else if (d <= -0.08) { sc -= 0.3; txt += `｜寬度惡化 ${(d * 100).toFixed(0)}pp`; }
     }
+    // 寬度背離：指數創高但參與家數萎縮＝少數權值撐盤（頂部前兆）；
+    // 指數破底但下跌家數收斂＝賣壓衰竭（底部前兆）。最經典的領先訊號。
+    if (prev && prev.breadth != null && _twiiSeries?.length >= 6) {
+      const tw = _twiiSeries.map(b => b.close).filter(v => v > 0);
+      const hi5 = Math.max(...tw.slice(-6, -1));
+      const lo5 = Math.min(...tw.slice(-6, -1));
+      const pxNow = tw[tw.length - 1];
+      const dB = pct - prev.breadth;
+      if (pxNow >= hi5 && dB <= -0.05) {
+        sc -= 0.5;
+        txt += '｜⚠ 寬度背離：指數創 5 日新高但參與家數萎縮 — 少數權值撐盤，追高風險';
+      } else if (pxNow <= lo5 && dB >= 0.05) {
+        sc += 0.5;
+        txt += '｜寬度背離：指數破 5 日低但下跌家數收斂 — 賣壓衰竭跡象';
+      }
+    }
     add('市場寬度', sc, 0.20, txt);
   }
 
@@ -737,6 +789,18 @@ function marketRegime() {
               `${(tv.amount / 1e8).toFixed(0)} 億（20日均量 ${tv.ratio.toFixed(2)} 倍）`);
 
   if (!comps.length) return { score: 0, confidence: 0, comps: [], coverage: 0 };
+  // 成分權重自我校正：以各成分的歷史獨立命中率調整權重（0.6~1.4 倍）。
+  // 長期表現差的成分自動降權 — 有預測日誌卻不回頭學習等於白記。
+  const acc = componentAccuracy();
+  for (const c of comps) {
+    const a = acc[c.k];
+    if (a && a.n >= 12) {
+      const mult = Math.max(0.6, Math.min(1.4, 0.6 + (a.pct / 100) * 1.6));
+      c.wBase = c.w;
+      c.w = +(c.w * mult).toFixed(3);
+      c.accTxt = `實績命中 ${a.pct.toFixed(0)}%（${a.n} 次）→ 權重 ×${mult.toFixed(2)}`;
+    }
+  }
   const wSum = comps.reduce((n, c) => n + c.w, 0);
   // 分母固定為 1（完整成分權重）：資料缺漏時分數自然縮小，不會虛張聲勢
   const score = Math.round(comps.reduce((n, c) => n + c.score * c.w, 0) / Math.max(wSum, 0.75) * 100);
@@ -2013,6 +2077,28 @@ function institutionalCost(stockId) {
 
 // ── 營收動能加速度：YoY 是在改善還是惡化 ────────────────────────────────────
 // 單看本月 YoY 不夠 —— 從 +30% 掉到 +10% 是減速，從 -20% 回到 -5% 是改善。
+// 估值歷史分位：現在的 PE 在自己過去區間的第幾百分位
+function peValuation(stockId, curPe) {
+  if (!(curPe > 0)) return null;
+  let arr = [];
+  try { arr = JSON.parse(localStorage.getItem('pe-hist') || '{}')[stockId] || []; } catch {}
+  const pes = arr.map(x => x.pe).filter(v => v > 0);
+  if (pes.length < 40) return { pe: +curPe.toFixed(1), n: pes.length, insufficient: true,
+    txt: `本益比 ${curPe.toFixed(1)}x（自身歷史樣本 ${pes.length} 日，不足 40 日無法判斷位階 — 系統每日累積中）` };
+  const sorted = [...pes].sort((a, b) => a - b);
+  const below = sorted.filter(v => v < curPe).length;
+  const pct = Math.round(below / sorted.length * 100);
+  const lo = sorted[Math.floor(sorted.length * 0.2)], hi = sorted[Math.floor(sorted.length * 0.8)];
+  const zone = pct >= 80 ? 'high' : pct <= 20 ? 'low' : 'mid';
+  return {
+    pe: +curPe.toFixed(1), pct, n: pes.length, zone,
+    lo: +lo.toFixed(1), hi: +hi.toFixed(1),
+    txt: `本益比 ${curPe.toFixed(1)}x 位於自身 ${sorted.length} 日歷史的第 ${pct} 百分位` +
+         `（常態區間 ${lo.toFixed(1)}~${hi.toFixed(1)}x）` +
+         `${zone === 'high' ? ' — 估值偏貴，長抱的安全邊際較薄' : zone === 'low' ? ' — 估值相對便宜，長抱起點有利' : ''}`,
+  };
+}
+
 function revenueMomentum(stockId) {
   let hist = [];
   try { hist = JSON.parse(localStorage.getItem('rev-hist') || '{}')[stockId] || []; } catch {}
@@ -2265,6 +2351,14 @@ function buildManagerAnalysis(s) {
   // ⑥ 基本面
   const rev = s.rev, fin = s._fin;
   if (s._revNew) notes.push(`📢 ${s._revNew} 月營收剛公布 — 數字已納入下方評分，公布日常有跳空與放量，短線追價需謹慎`);
+  {
+    const pv = s._pePct || peValuation(s.id, s._fd?.pe);
+    if (pv && !pv.insufficient) {
+      if (pv.zone === 'high') add(0.6, -1, pv.txt, 'fund');
+      else if (pv.zone === 'low') add(0.6, 1, pv.txt, 'fund');
+      else notes.push(pv.txt);
+    } else if (pv) notes.push(pv.txt);
+  }
   if (rev?.yoy != null) {
     if (rev.yoy >= 30) add(1.5, 1, `月營收年增 +${rev.yoy.toFixed(1)}%（高成長）`, 'fund');
     else if (rev.yoy >= 10) add(0.8, 1, `月營收年增 +${rev.yoy.toFixed(1)}%`, 'fund');
@@ -7152,6 +7246,31 @@ function tradeCostPct(kind = 'long') {
   return kind === 'day' ? +(0.1425 * 2 + 0.15).toFixed(3) : +(0.1425 * 2 + 0.3).toFixed(3);
 }
 
+// 台股跳動單位（tick size）— 買賣價差是當沖的隱形成本，先前完全沒算。
+// 600 元的股票一檔 1 元＝0.167%，來回 0.33%，幾乎與稅費同級；
+// 50 元的股票一檔 0.05 元只有 0.1%。兩者一視同仁等於高價股少算近一倍成本。
+function tickSize(price) {
+  if (!(price > 0)) return 0.01;
+  if (price < 10) return 0.01;
+  if (price < 50) return 0.05;
+  if (price < 100) return 0.1;
+  if (price < 500) return 0.5;
+  if (price < 1000) return 1;
+  return 5;
+}
+
+// 來回價差成本（%）：保守以「半個 tick 滑價 × 兩趟」估計。
+// 實務上急單常吃到整檔，這裡取半檔是偏樂觀但不誇張的估計。
+function spreadCostPct(price) {
+  if (!(price > 0)) return 0;
+  return +((tickSize(price) / price) * 100).toFixed(3);
+}
+
+// 全成本（%）：手續費＋交易稅＋買賣價差
+function allInCostPct(price, kind = 'day') {
+  return +(tradeCostPct(kind) + spreadCostPct(price)).toFixed(3);
+}
+
 // ── 組合風險總量（Portfolio Heat）───────────────────────────────────────────
 // 單筆 2% 的限制擋不住「五檔各 2% 同時停損 = -10%」，也看不出
 // 三檔同族群其實是同一注押三次。這裡把兩件事都攤開。
@@ -7180,7 +7299,36 @@ function portfolioHeat() {
   }
   const conc = Object.entries(bySec).filter(([, v]) => v.length >= 2)
     .map(([sec, names]) => ({ sec, names }));
+  // 相關性：同族群 ≠ 相關。台積電與聯發科不同族群卻高度連動；
+  // 買三檔「不同族群」的電子股，實際上還是同一注。用 60 日報酬相關係數檢查。
+  const corr = [];
+  const rets = {};
+  for (const h of holdings) {
+    const st = allStocks.find(x => x.id === h.id);
+    const c = st?.ohlcv?.map(b => b.close);
+    if (!c || c.length < 61) continue;
+    const r = [];
+    for (let i = c.length - 60; i < c.length; i++) if (c[i - 1] > 0) r.push((c[i] - c[i - 1]) / c[i - 1]);
+    if (r.length >= 55) rets[h.id] = { name: h.name, r };
+  }
+  const ids = Object.keys(rets);
+  for (let i = 0; i < ids.length; i++) for (let j = i + 1; j < ids.length; j++) {
+    const a = rets[ids[i]].r, b = rets[ids[j]].r;
+    const n = Math.min(a.length, b.length);
+    const ma = a.slice(-n).reduce((x, y) => x + y, 0) / n, mb = b.slice(-n).reduce((x, y) => x + y, 0) / n;
+    let cov = 0, va = 0, vb = 0;
+    for (let k = 0; k < n; k++) {
+      const da = a[a.length - n + k] - ma, db = b[b.length - n + k] - mb;
+      cov += da * db; va += da * da; vb += db * db;
+    }
+    const denom = Math.sqrt(va * vb);
+    if (!(denom > 0)) continue;
+    const c2 = cov / denom;
+    if (c2 >= 0.7) corr.push({ a: rets[ids[i]].name, b: rets[ids[j]].name, c: +c2.toFixed(2) });
+  }
+  corr.sort((x, y) => y.c - x.c);
   return { rows, heat, riskAmt: Math.round(riskAmt), capital, knownN, unknownN, conc,
+           corr: corr.slice(0, 3),
            over: heat != null && heat >= 6 };
 }
 
@@ -7190,6 +7338,7 @@ function heatWarning() {
   if (!ph) return null;
   if (ph.over) return `⚠ 組合風險已達 ${ph.heat}%（全部持倉同時停損的總虧損，上限 6%）— 新倉建議暫緩，或先降既有部位`;
   if (ph.conc.length) return `⚠ 族群集中：${ph.conc.map(c => `${c.sec}（${c.names.join('、')}）`).join('；')} — 同族群同漲同跌，等於同一注加倍押`;
+  if (ph.corr?.length) return `⚠ 高相關持倉：${ph.corr.map(c => `${c.a}↔${c.b}（60 日相關 ${c.c}）`).join('；')} — 雖非同族群，實際走勢高度連動，分散效果有限`;
   return null;
 }
 
@@ -7713,6 +7862,19 @@ function checkHoldingExit(h) {
     if (level === 'hold') level = 'watch';
     reasons.push(`📅 ${exEv.days === 0 ? '今日' : `${exEv.days} 天後（${exEv.date}）`}除權息${exEv.amt ? `（${exEv.type || '息值'} ${exEv.amt} 元）` : ''} — 留意棄息賣壓與跳空，可考慮事件前收緊停損或降部位`);
   }
+  // 時間停損（實盤）：回測有 40/120 日，實盤先前完全沒有 —— 錢卡在不動的
+  // 股票上，機會成本是隱形的虧損。當沖不適用（本來就當日出清）。
+  if (h.kind !== 'day') {
+    const heldD = tradingDaysBetween(h.addedAt, twClock().date);
+    const limit = h.src === 'lt' || getLongTermList().some(x => x.id === h.id) ? 120 : 40;
+    if (heldD != null && heldD >= limit) {
+      if (level === 'hold') level = 'watch';
+      reasons.push(`⏳ 時間停損：已持有 ${heldD} 個交易日（上限 ${limit} 日）— 進場論點未在合理時間內兌現，建議換到更有效率的機會`);
+    } else if (heldD != null && heldD >= limit * 0.75) {
+      reasons.push(`⏳ 已持有 ${heldD}／${limit} 個交易日，接近時間停損 — 若無新催化劑，開始物色替代標的`);
+    }
+  }
+
   // 持倉健康度：階段化管理建議（R 倍數/資金效率/壓力減碼），最多取兩條
   const hh = holdingHealth(h, s, m);
   if (hh) {
@@ -7744,6 +7906,7 @@ function portfolioHeatHTML() {
       </div>
       ${ph.over ? `<div style="margin-top:6px;padding:6px 10px;background:rgba(239,68,68,0.08);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.74rem;color:var(--bear)">⚠ 總風險超標 — 新倉暫緩；優先把獲利中持倉的停損上移（風險歸零後即可騰出額度）</div>` : ''}
       ${ph.conc.length ? `<div style="margin-top:6px;font-size:0.73rem;color:var(--yellow)">⚠ 族群集中：${ph.conc.map(c => `${c.sec}（${c.names.join('、')}）`).join('；')} — 同族群同漲同跌，等於同一注加倍押</div>` : ''}
+      ${ph.corr?.length ? `<div style="margin-top:4px;font-size:0.73rem;color:var(--yellow)">⚠ 高相關持倉：${ph.corr.map(c => `${c.a}↔${c.b}（${c.c}）`).join('；')} — 60 日報酬高度連動，即使不同族群也不算分散</div>` : ''}
     </div>`;
 }
 
@@ -7822,7 +7985,13 @@ function classifyLongTerm(s) {
   if (s._fin?.grossMargin >= 25) { f++; why.push(`毛利率 ${s._fin.grossMargin.toFixed(0)}%`); }
   if (s._fin?.roe >= 10) { f++; why.push(`ROE ${s._fin.roe.toFixed(0)}%`); }
   // 估值：PE 絕對值之外加 PEG 概念 — 高成長可容忍較高 PE，低成長不行
-  if (s._fd?.pe > 0 && s._fd.pe < 25) { f++; why.push(`本益比 ${s._fd.pe.toFixed(1)}x 未過熱`); }
+  // 估值：優先用「自身歷史分位」（絕對值對不同產業沒有可比性）
+  const pv = s._pePct || peValuation(s.id, s._fd?.pe);
+  if (pv && !pv.insufficient) {
+    if (pv.zone === 'high') return null;                 // 估值在自身歷史頂部 → 長抱起點太差
+    if (pv.zone === 'low') { f++; why.push(`估值位階第 ${pv.pct} 百分位（自身 ${pv.n} 日歷史，相對便宜）`); }
+    else { f++; why.push(`估值位階第 ${pv.pct} 百分位（自身歷史常態區間內）`); }
+  } else if (s._fd?.pe > 0 && s._fd.pe < 25) { f++; why.push(`本益比 ${s._fd.pe.toFixed(1)}x 未過熱`); }
   else if (s._fd?.pe > 0 && s.rev?.yoy > 0 && s._fd.pe / s.rev.yoy <= 1.5) { f++; why.push(`PEG ${(s._fd.pe / s.rev.yoy).toFixed(1)}（成長支撐估值）`); }
   if (s._fd?.divYield >= 0.03) { f++; why.push(`殖利率 ${(s._fd.divYield * 100).toFixed(1)}%`); }
   if (f < 3) return null;   // 由 2 項提高到 3 項 — 長抱要更挑剔
@@ -7926,6 +8095,33 @@ function weeklyBias(s) {
   return { dir: 0, txt: '週線中性盤整（日內順勢基礎不足）' };
 }
 
+// ── 日內相對強度：今天開盤到現在，這檔比大盤強還是弱 ─────────────────────
+// 日線 RS（20 日跑贏大盤）答的是「這個月誰強」；當沖真正該問的是「今天誰強」。
+// 強於大盤才做多、弱於大盤才做空 —— 這是日內選邊最有效的單一指標。
+function intradayRS(s) {
+  const today = twClock().date;
+  const bars = getIntradayBars(s.id, 5).filter(b => b.time.slice(0, 10) === today);
+  if (bars.length < 3) return null;
+  const openPx = bars[0].open, nowPx = s.analysis?.price ?? bars[bars.length - 1].close;
+  if (!(openPx > 0) || !(nowPx > 0)) return null;
+  const stockChg = (nowPx - openPx) / openPx * 100;
+  // 大盤日內漲幅：優先用 MIS 即時指數，其次用加權指數日線的今日開盤
+  let mktChg = null;
+  const live = outlookData.twiiLive;
+  if (live?.chgPct != null) mktChg = live.chgPct;
+  else {
+    const f = outlookData.factors?.find(x => x.sym === '^TWII');
+    if (f?.chg1 != null) mktChg = f.chg1;
+  }
+  if (mktChg == null) return null;
+  const rs = +(stockChg - mktChg).toFixed(2);
+  return {
+    rs, stockChg: +stockChg.toFixed(2), mktChg: +mktChg.toFixed(2),
+    strong: rs >= 1, weak: rs <= -1,
+    txt: `日內相對強度 ${rs >= 0 ? '+' : ''}${rs}pp（個股 ${stockChg >= 0 ? '+' : ''}${stockChg.toFixed(2)}% vs 大盤 ${mktChg >= 0 ? '+' : ''}${mktChg.toFixed(2)}%）`,
+  };
+}
+
 // ── 5 分 K 交易計畫：進場/停損/停利，含「通知後可掛單」的緩衝 ──────────────
 // 通知到你看到手機、開 App、輸入單子，現實中至少 1~3 分鐘。
 // 直接給「現價」當進場價是假的 —— 這裡一律給可掛的限價與有效區間。
@@ -7943,7 +8139,9 @@ function dayTradePlan(s, side, atrPct) {
   }
   // 緩衝：以日內波動的 1/8 或 0.15% 取大者，代表「通知後 1~3 分鐘的合理滑價」
   const buf = +Math.max(px * 0.0015, px * (atrPct / 100) / 8).toFixed(2);
-  const cost = tradeCostPct('day');
+  const feeCost = tradeCostPct('day');
+  const spCost = spreadCostPct(px);
+  const cost = +(feeCost + spCost).toFixed(3);   // 全成本：稅費＋買賣價差
   const long = side === 'long';
   // 進場：優先掛「回測關鍵位」的限價（ORB 上緣/VWAP），不追市價
   const anchor = long
@@ -7968,7 +8166,8 @@ function dayTradePlan(s, side, atrPct) {
   const netPct = +((Math.abs(target - entryRef) / entryRef * 100) - cost).toFixed(2);
   return {
     side, entryLo, entryHi, entryRef, stop, target, riskPct: +riskPct.toFixed(2),
-    rewardPct: +(Math.abs(target - entryRef) / entryRef * 100).toFixed(2), netPct, cost, buf,
+    rewardPct: +(Math.abs(target - entryRef) / entryRef * 100).toFixed(2), netPct, cost, feeCost, spCost, buf,
+    tick: tickSize(px),
     vwap, orb: orb ? { hi: orb.hi, lo: orb.lo, state: orb.state } : null,
     bars5: bars5.length,
     note: long
@@ -8015,7 +8214,9 @@ function computeDayTradePicks() {
     // ── ② 波動足夠且能覆蓋稅費 ──
     const atrPct = (m.atr / a.price) * 100;
     if (atrPct < 1.8) continue;
-    if (atrPct / 2 < dayCost * 2) continue;      // 吃不到來回成本 2 倍，期望值為負
+    // 全成本＝稅費＋買賣價差。高價股（tick 大）門檻自然更嚴 —— 這才公平
+    const allCost = allInCostPct(a.price, 'day');
+    if (atrPct / 2 < allCost * 2) continue;      // 吃不到全成本 2 倍，期望值為負
 
     // ── ③ 漲跌停距離（追價風險）──
     const ld = limitDistance(s);
@@ -8053,11 +8254,18 @@ function computeDayTradePicks() {
     // 大盤中性時要求更強證據（雙邊都能做 → 標準拉高）
     const pick = cands.sort((x, y) => y.base - x.base)[0];
     if (mktSide === 0 && pick.base < 12) continue;
+    // 日內相對強度：有資料時，與大盤逆向者直接剔除（做多卻弱於大盤 = 選錯邊）
+    const irs = intradayRS(s);
+    if (irs) {
+      if (pick.side === 'long' && irs.rs <= -0.5) continue;
+      if (pick.side === 'short' && irs.rs >= 0.5) continue;
+      if ((pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak)) pick.base += 6;
+    }
 
     const long = pick.side === 'long';
     const plan = dayTradePlan(s, pick.side, atrPct);
     if (!plan) continue;
-    if (plan.netPct <= dayCost) continue;        // 稅費後淨利吃不到成本，不推
+    if (plan.netPct <= allCost) continue;        // 全成本後淨利仍吃不到成本，不推
 
     // ── ⑤ 證據彙整（日線/週線/量能/籌碼/新聞/當沖實績/跳空/結算）──
     const dt = s._dayTrade;
@@ -8076,17 +8284,19 @@ function computeDayTradePicks() {
         : '⚠ 官方當日無此股當沖成交紀錄 — 可能不可現股當沖或無人參與，下單前請先確認',
       `大盤：研判 ${mktNorm >= 0 ? '+' : ''}${mktNorm}（信心 ${(mktConf * 100).toFixed(0)}%）${mktSide === 0 ? ' — 方向不明，已提高選股標準' : `，本單為${long ? '順勢做多' : '順勢做空'}`}`,
     ];
+    if (irs) why.push(`${irs.txt} — ${(pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak) ? '與大盤同向且明顯領先，選邊正確' : '方向一致但領先幅度普通'}`);
+    else why.push('日內相對強度：尚無今日 5 分 K（開盤後累積中，屆時會自動納入選邊判斷）');
     if (newsScore !== 0) why.push(`新聞面：近 7 日${newsScore > 0 ? '偏多' : '偏空'}（${_newsSignals.stocks[s.id].items?.[0] || ''}）`);
     if (ld?.toUp != null) why.push(`距漲停 ${ld.toUp}%／距跌停 ${ld.toDown}%`);
     if (dFin != null && dFin > 0 && volZ > 0 && dFin >= volZ * 0.08) why.push(`⚠ 融資大增 ${dFin.toLocaleString()} 張，散戶追價籌碼偏髒`);
     if (gapWarn) why.push(gapWarn.txt);
     if (!long) why.push('⚠ 做空限制：現股當沖「先賣後買」需平盤之上才可放空，且非所有標的可借券 — 下單前務必確認券源與規則');
     if (settleWarn) why.push(settleWarn);
-    why.push(`來回稅費 ${dayCost}%，本計畫稅費後淨利約 ${plan.netPct}%`);
+    why.push(`全成本 ${allCost}%（稅費 ${dayCost}%＋買賣價差 ${plan.spCost}%，跳動單位 ${plan.tick} 元）— 本計畫扣除後淨利約 ${plan.netPct}%`);
     why.push('⏰ 當沖紀律：13:00 前未達停利即準備平倉，收盤前務必出清，絕不留倉');
 
     out.push({
-      s, m, side: pick.side, plan, wk, atrPct, turnoverVal,
+      s, m, side: pick.side, plan, wk, atrPct, turnoverVal, irs,
       hasChips: (long ? net > 0 : net < 0) ? 1 : 0,
       why,
       // 排序：流動性為主（當沖第一原則），再看證據強度
@@ -8999,6 +9209,12 @@ function recordPredictions() {
                      dir: (conf == null || conf >= 0.35) ? (norm >= 15 ? 1 : norm <= -15 ? -1 : 0) : 0,
                      twii } : null,
     breadth: ready.length ? +(bullN / ready.length).toFixed(3) : null,
+    // 各成分當下方向快照 → 結算後可回推「哪個成分真的準」，供權重自我校正
+    comps: (() => {
+      const o = {};
+      for (const c of (outlookData.regime?.comps || [])) o[c.k] = +c.score.toFixed(2);
+      return Object.keys(o).length ? o : null;
+    })(),
     focus: focus.length ? focus : null,
     resolved: false,
   });
