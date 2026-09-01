@@ -63,6 +63,10 @@
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 7h-9M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
           持有中
         </a>
+        <a class="nav-link" data-page="daytrade" onclick="navigateTo('daytrade')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          當沖
+        </a>
         <a class="nav-link" data-page="journal" onclick="navigateTo('journal')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
           交易總結
@@ -720,6 +724,49 @@
     </section>
 
     <!-- ═══════════════════ 持有中頁面 ═══════════════════ -->
+    <!-- ═══════════════════ 當沖頁面 ═══════════════════ -->
+    <section class="page" id="page-daytrade">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">當沖</h1>
+          <p class="page-subtitle">多空雙向・進場／止盈／止損價位一次給齊・止損自動學習原因並回饋到之後的選股</p>
+        </div>
+      </div>
+
+      <div class="market-outlook-card" style="margin-bottom:16px">
+        <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+          <h3 style="font-size:0.9rem;font-weight:700">⚡ 今日當沖訊號</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">掛單價已含通知後的滑價緩衝；全成本＝手續費＋交易稅＋買賣價差</span>
+          <button class="btn-ghost" style="margin-left:auto;padding:3px 12px;font-size:0.7rem" onclick="renderDayTradePage()">重新整理</button>
+        </div>
+        <div id="dt-signals-body" style="margin-top:10px"><div class="adv-loading">掃描完成後產生當沖訊號...</div></div>
+      </div>
+
+      <div class="market-outlook-card" style="margin-bottom:16px">
+        <h3 style="font-size:0.9rem;font-weight:700">📊 今日追蹤中</h3>
+        <span style="font-size:0.7rem;color:var(--text3)">系統對每個發出的訊號自動紙上追蹤：觸及止盈／止損／收盤即結算，成為學習樣本</span>
+        <div id="dt-open-body" style="margin-top:10px"><div class="adv-loading">尚無追蹤中的當沖訊號</div></div>
+      </div>
+
+      <div class="market-outlook-card">
+        <div class="tf-group" style="margin-bottom:12px">
+          <button class="tf-btn active" id="dtab-lab" onclick="switchDayTab('lab')">🧪 策略實驗室</button>
+          <button class="tf-btn" id="dtab-log" onclick="switchDayTab('log')">📒 交易紀錄與止損學習</button>
+        </div>
+        <div id="dt-tab-lab">
+          <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <span style="font-size:0.72rem;color:var(--text3)">10 組當沖策略同池競賽 — 用歷史資料回測排名，前三名自動成為現行策略；每次掃描重新驗證，表現變差即被換掉</span>
+            <button class="btn-primary" style="margin-left:auto;padding:6px 16px;font-size:0.76rem" onclick="runStrategyLab()">▶ 執行實驗</button>
+          </div>
+          <div id="dt-lab-body"><div class="adv-loading">尚未執行實驗 — 按「執行實驗」開始</div></div>
+        </div>
+        <div id="dt-tab-log" style="display:none">
+          <div style="font-size:0.72rem;color:var(--text3);margin-bottom:8px">詳細交易保留最近 30 筆（超過從最舊刪除細項）；<strong style="color:var(--text2)">止損原因與學習統計永久保留，不會被刪</strong></div>
+          <div id="dt-log-body"><div class="adv-loading">尚無交易紀錄</div></div>
+        </div>
+      </div>
+    </section>
+
     <section class="page" id="page-holdings">
       <div class="page-header">
         <div>
