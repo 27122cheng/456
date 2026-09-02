@@ -2688,6 +2688,45 @@ function renderManagerVerdict(s) {
 // ── AI 進場建議（做多）───────────────────────────────────────────────────────
 // 在所有分析（技術／基本面／籌碼／量價／多週期）完成後才生成，
 // 條件不足時明確說明「不建議進場」而非硬給一組數字。
+// ── 續漲動力鏈與「已反映」檢查 ──────────────────────────────────────────────
+// 股票要漲通常是：利多發酵 → 公司賺更多 → 市場上修 → 股價漲。
+// 進場前要能說出這條鏈的哪一環正在發生；說不出來，買的只是氣氛。
+// 另外：你剛知道 ≠ 市場剛知道 —— 人人都知道的利多大概率已 price in。
+function catalystChain(s, m) {
+  const a = s.analysis;
+  const links = [];
+  const rm = revenueMomentum(s.id);
+  if (rm?.dir === 1) links.push({ k: 'earn', txt: `公司賺更多：${rm.txt}` });
+  else if (s.rev?.yoy >= 15) links.push({ k: 'earn', txt: `公司賺更多：月營收年增 +${s.rev.yoy.toFixed(0)}%（持續）` });
+  const ns = _newsSignals?.stocks?.[s.id];
+  const secNs = s.sector ? _newsSignals?.sectors?.[s.sector] : null;
+  if (ns?.score > 0) links.push({ k: 'news', txt: `利多發酵：新聞點名偏多「${ns.items?.[0] || ''}」` });
+  else if (secNs?.score >= 2) links.push({ k: 'news', txt: `利多發酵：${s.sector}族群近 7 日新聞偏多${secNs.items?.[0]?.h ? `「${secNs.items[0].h}」` : ''}` });
+  const st = instStreak(s.id);
+  if (st?.dir > 0 && st.days >= 3) links.push({ k: 'upgrade', txt: `市場上修：法人連 ${st.days} 日買超（累計 ${st.total.toLocaleString()} 張）` });
+  else if (s._fgnTrend?.delta > 0) links.push({ k: 'upgrade', txt: `市場上修：外資持股比率上升中（+${s._fgnTrend.delta}pp）` });
+  let rot = null;
+  try { rot = sectorStatsCached().find(g => g.sector === s.sector)?.rotation; } catch {}
+  if (rot?.state === 'in') links.push({ k: 'flow', txt: `資金流入：${s.sector}族群輪動加速中（5 日 +${rot.r5}%）` });
+  const ev = (() => { try { return imminentEvents(10).filter(e => /營收|財報|法說/.test(e.name)).slice(0, 1); } catch { return []; } })();
+  if (ev.length) links.push({ k: 'event', txt: `即將驗證：${ev[0].days === 0 ? '今日' : `${ev[0].days} 天後`}${ev[0].name} — 論點會被數字檢驗` });
+
+  // 已反映程度：漲很多 ≠ 貴，但「漲很多＋高位階＋人人都在講」= 利多大概率已反映
+  const closes = s.ohlcv?.map(b => b.close) || [];
+  const r20 = closes.length >= 21 ? (a.price - closes[closes.length - 21]) / closes[closes.length - 21] * 100 : 0;
+  const buzz = (ns?.score ?? 0) + (secNs?.score ?? 0);
+  const pricedIn = r20 >= 15 && a.pctile?.zone === 'high' && buzz >= 2;
+  const pricedInTxt = pricedIn
+    ? `⚠ 利多可能已反映：20 日已漲 ${r20.toFixed(0)}%、位於長期高位階、新聞討論度高 — 你剛知道，不代表市場剛知道`
+    : (r20 >= 15 ? `20 日已漲 ${r20.toFixed(0)}% — 漲多≠貴，但要確認接下來靠什麼續漲` : null);
+
+  return {
+    links, n: links.length, pricedIn, pricedInTxt,
+    verdict: links.length >= 2 ? `續漲動力明確（${links.length} 環）` : links.length === 1 ? '續漲動力單薄（僅 1 環）— 若這環消失就沒有理由續抱' : '❌ 說不出續漲動力 — 買的可能只是氣氛，錢會變成別人的養分',
+    weak: links.length < 1,
+  };
+}
+
 function buildEntryPlan(s, m) {
   const a = s.analysis;
   if (!a || !m) return null;
@@ -2842,6 +2881,37 @@ function buildEntryPlan(s, m) {
   // 續抱時的移動停利基準（隨股價墊高，鎖住獲利）
   const trail = +Math.max(price - atr * 2, a.ema20 || 0).toFixed(2);
 
+  // ── 三情境估算（樂觀／中性／悲觀）：買之前先知道「看對賺多少、看錯賠多少」──
+  // 不求精準（也不可能），但不對稱的單（樂觀 +8%、悲觀 -15%）在這裡就會被攔下。
+  const scen = (() => {
+    const neutral = t1 ? (t1 - lo) / lo * 100 : atr * Math.sqrt(5) / lo * 100;
+    // 樂觀：有第二壓力用第二壓力；續抱型（上方無壓力）用趨勢延續估計
+    // （近 20 日漲幅與 20 日 ATR 擴散取大者），且永遠 ≥ 中性 ×1.3
+    let optimistic = t2 ? (t2 - lo) / lo * 100 : null;
+    const trendExt = Math.max(m.ret20 > 0 ? m.ret20 : 0, atr * Math.sqrt(20) / lo * 100);
+    if (optimistic == null || holdOn) optimistic = Math.max(optimistic ?? 0, trendExt);
+    optimistic = Math.max(optimistic, neutral * 1.3);
+    // 悲觀：結構支撐失守後的下一層（VAL／多方 OB 下緣／季線／近半年回撤）取最深者，不只是停損
+    const deeper = [];
+    if (a.vp?.val > 0 && a.vp.val < lo) deeper.push((a.vp.val - lo) / lo * 100);
+    if (a.ob?.support?.bottom > 0 && a.ob.support.bottom < lo) deeper.push((a.ob.support.bottom - lo) / lo * 100);
+    if (a.ema50 > 0 && a.ema50 < lo) deeper.push((a.ema50 - lo) / lo * 100);
+    if (a.risk?.mdd != null) deeper.push(Math.max(a.risk.mdd, -60) * 0.6);   // 歷史最大回撤的六成
+    // 悲觀＝停損失守後跌到「下一層」結構位（候選由淺到深取第二層），
+    // 不取最深者 —— 一律取最深會把每筆單都判成不對稱，等於永遠不能買
+    const sortedD = [...deeper].sort((x, y) => y - x);            // 由淺（接近 0）到深
+    const pick = sortedD.length >= 2 ? sortedD[1] : sortedD[0];
+    const pessimistic = pick != null ? Math.min(pick, -riskPct) : -Math.max(riskPct * 2, 8);
+    // 不對稱：悲觀虧損逼近甚至超過樂觀獲利（續抱型無固定上限，門檻放寬為 1.0）
+    const asym = Math.abs(pessimistic) > optimistic * (holdOn ? 1.0 : 0.8);
+    return { optimistic: +optimistic.toFixed(1), neutral: +neutral.toFixed(1), pessimistic: +pessimistic.toFixed(1), asym,
+             txt: asym ? `⚠ 不對稱：樂觀約 +${optimistic.toFixed(0)}% 但悲觀約 ${pessimistic.toFixed(0)}% — 好公司買在錯的價格一樣是壞投資，寧可等` 
+                       : `樂觀 +${optimistic.toFixed(0)}%／中性 +${neutral.toFixed(0)}%／悲觀 ${pessimistic.toFixed(0)}% — 賠率合理` };
+  })();
+
+  // ── 續漲動力：接下來靠什麼漲？說不出來就是買氣氛 ──
+  const cat = catalystChain(s, m);
+
   // 部位規模：預設單筆風險 2%；有 ≥30 筆實績時改用半凱利（上限 2%、下限 0.5%）
   // — 凱利對參數誤差極敏感，永遠只用半凱利且封頂，這不是保守是常識
   const capital = parseFloat(localStorage.getItem('capital') || '1000000');
@@ -2850,7 +2920,15 @@ function buildEntryPlan(s, m) {
   let riskFrac = est?.kelly != null ? est.kelly / 100 : 0.02;
   if (outlookData.regime?.vol?.level === 'high') riskFrac *= 0.75;   // 高波動位階：部位縮至 3/4
   const maxLossAmt = capital * riskFrac;
-  const shares = riskPerShare > 0 ? Math.floor(maxLossAmt / riskPerShare / 1000) : 0;
+  const stopShares = riskPerShare > 0 ? Math.floor(maxLossAmt / riskPerShare / 1000) : 0;
+  // 災難情境法：部位上限 = 最多能接受賠的錢 ÷ 最慘可能跌幅。
+  // 「有 1000 萬最多賠 100 萬、這隻最慘跌 50% → 上限 200 萬」— 不管多看好都不歐印。
+  const maxAcceptPct = parseFloat(localStorage.getItem('max-accept-loss') || '10');   // 佔資金 %
+  const worstDrop = Math.max(Math.abs(scen.pessimistic), riskPct, 5) / 100;
+  const disasterCap = capital * (maxAcceptPct / 100) / worstDrop;                  // 元
+  const disasterShares = Math.floor(disasterCap / lo / 1000);
+  const shares = Math.max(0, Math.min(stopShares, disasterShares));
+  const sizingBasis = shares === disasterShares && disasterShares < stopShares ? 'disaster' : 'stop';
   const posValue = shares * 1000 * lo;
   const sizing = shares > 0 ? {
     shares, capital, posValue,
@@ -2858,6 +2936,7 @@ function buildEntryPlan(s, m) {
     maxLoss: Math.round(shares * 1000 * riskPerShare),
     riskPctUsed: +(riskFrac * 100).toFixed(1),
     kellyBased: est?.kelly != null,
+    stopShares, disasterShares, sizingBasis, maxAcceptPct, worstDropPct: +(worstDrop * 100).toFixed(1),
   } : null;
 
   // 教訓學習回饋：過去重複虧損的進場情境再次出現 → 明確警告
@@ -2900,7 +2979,7 @@ function buildEntryPlan(s, m) {
 
   return {
     ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn, sizing, lessonWarns,
-    scale, costPct,
+    scale, costPct, scen, cat,
     netReward1: t1 ? +((t1 - lo) / lo * 100 - costPct).toFixed(2) : null,
     conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
@@ -2965,6 +3044,16 @@ function entryPlanHtml(s, m) {
         <span>參考持有 ${p.horizon}</span>
         ${p.netReward1 != null ? `<span>目標一稅費後淨利 <strong style="color:${p.netReward1 > 0 ? 'var(--bull)' : 'var(--bear)'}">${p.netReward1 >= 0 ? '+' : ''}${p.netReward1}%</strong> <span style="font-size:0.68rem">（來回成本 ${p.costPct}%）</span></span>` : ''}
       </div>
+      ${p.cat ? `<div style="margin-top:9px;padding:8px 11px;background:${p.cat.weak ? 'rgba(239,68,68,0.07)' : 'rgba(255,255,255,0.02)'};border-radius:7px;font-size:0.75rem;color:var(--text2);line-height:1.8">
+        🔗 <strong>接下來靠什麼漲</strong>：<span style="color:${p.cat.weak ? 'var(--bear)' : p.cat.n >= 2 ? 'var(--bull)' : 'var(--yellow)'}">${p.cat.verdict}</span>
+        ${p.cat.links.map(l => `<br>・${l.txt}`).join('')}
+        ${p.cat.pricedInTxt ? `<br><span style="color:${p.cat.pricedIn ? 'var(--bear)' : 'var(--text3)'}">${p.cat.pricedInTxt}</span>` : ''}
+      </div>` : ''}
+      ${p.scen ? `<div style="margin-top:9px;padding:8px 11px;background:${p.scen.asym ? 'rgba(239,68,68,0.07)' : 'rgba(255,255,255,0.02)'};border-radius:7px;font-size:0.75rem;color:var(--text2);line-height:1.8">
+        ⚖️ <strong>看對賺多少、看錯賠多少</strong><br>
+        <span style="font-family:var(--mono)">樂觀 <span style="color:var(--bull)">+${p.scen.optimistic}%</span>　中性 <span style="color:var(--bull)">+${p.scen.neutral}%</span>　悲觀 <span style="color:var(--bear)">${p.scen.pessimistic}%</span></span><br>
+        <span style="color:${p.scen.asym ? 'var(--bear)' : 'var(--text3)'}">${p.scen.txt}</span>
+      </div>` : ''}
       ${p.scale ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.75rem;color:var(--text2);line-height:1.8">
         🪜 <strong>分批計畫</strong><br>
         進場：① ${p.scale.e1}<br>　　　② ${p.scale.e2}<br>
@@ -2977,8 +3066,9 @@ function entryPlanHtml(s, m) {
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
         📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險 ${p.sizing.riskPctUsed}%${p.sizing.kellyBased ? '（依 ≥30 筆實績的半凱利，非固定值）' : '（固定上限，累積 30 筆實績後改依半凱利）'} 計算，
         可買 <strong style="color:var(--blue)">${p.sizing.shares} 張</strong>（約 ${(p.sizing.posValue/10000).toFixed(1)} 萬，佔 ${p.sizing.posPct}% 資金）；
-        若觸及停損，最大虧損約 <strong style="color:var(--bear)">${p.sizing.maxLoss.toLocaleString()} 元</strong>。
-        <span style="color:var(--text3);font-size:0.72rem">（可於設定頁調整資金規模）</span>
+        若觸及停損，最大虧損約 <strong style="color:var(--bear)">${p.sizing.maxLoss.toLocaleString()} 元</strong>。<br>
+        🛡 <strong>災難情境法</strong>：最多能接受賠資金 ${p.sizing.maxAcceptPct}%、此股最慘約跌 ${p.sizing.worstDropPct}% → 部位上限 ${p.sizing.disasterShares} 張${p.sizing.sizingBasis === 'disaster' ? '<span style="color:var(--yellow)">（比停損法更嚴，以此為準 — 就算看對也不保證股價不跌，不歐印）</span>' : '（停損法較嚴，以停損法為準）'}
+        <span style="color:var(--text3);font-size:0.72rem">（資金規模與可接受虧損 % 可於設定頁調整）</span>
       </div>` : ''}
 
       <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
@@ -4853,6 +4943,8 @@ function loadSettings() {
 
   const sCap = document.getElementById('s-capital');
   if (sCap) sCap.value = localStorage.getItem('capital') || '1000000';
+  const sML = document.getElementById('s-max-loss');
+  if (sML) sML.value = localStorage.getItem('max-accept-loss') || '10';
   const sTF = document.getElementById('s-timeframe');
   if (sTF) sTF.value = tf;
   const sR  = document.getElementById('s-refresh');
@@ -4902,6 +4994,8 @@ function saveAllSettings() {
   if (bear) localStorage.setItem('bear-threshold', bear);
   const capEl = document.getElementById('s-capital');
   if (capEl?.value) localStorage.setItem('capital', capEl.value);
+  const mlEl = document.getElementById('s-max-loss');
+  if (mlEl?.value) localStorage.setItem('max-accept-loss', mlEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
@@ -7520,6 +7614,39 @@ function getHoldings() {
 }
 function saveHoldings(h) { localStorage.setItem('my-holdings', JSON.stringify(h)); }
 
+// 進場論點快照：結構化旗標，之後才能回答「買進理由還在不在」
+function thesisSnapshot(s, m) {
+  const a = s?.analysis; if (!a) return null;
+  const st = instStreak(s.id);
+  let rot = null; try { rot = sectorStatsCached().find(g => g.sector === s.sector)?.rotation?.state ?? null; } catch {}
+  return {
+    trendUp: !!(a.trend?.phase && /up/.test(a.trend.phase)),
+    aboveEma50: !!(a.ema50 && a.price > a.ema50),
+    revGrow: s.rev?.yoy != null ? s.rev.yoy >= 10 : null,
+    instBuy: !!(st?.dir > 0 && st.days >= 2),
+    sectorIn: rot === 'in' ? true : rot === 'out' ? false : null,
+    bullStance: !!(m && m.dir >= 1.5),
+  };
+}
+// 論點檢查：逐項比對「當時為什麼買」與「現在還成不成立」→ 跌時該加碼還是止損
+function thesisCheck(h, s, m) {
+  const t0 = h.thesis; if (!t0) return null;
+  const now = thesisSnapshot(s, m); if (!now) return null;
+  const items = [];
+  const cmp = (k, label, was, is) => { if (was === true) items.push({ k, label, ok: is !== false }); };
+  cmp('trendUp', '趨勢向上', t0.trendUp, now.trendUp);
+  cmp('aboveEma50', '站上季線', t0.aboveEma50, now.aboveEma50);
+  cmp('revGrow', '營收成長', t0.revGrow, now.revGrow);
+  cmp('instBuy', '法人買超', t0.instBuy, now.instBuy);
+  cmp('sectorIn', '族群資金流入', t0.sectorIn, now.sectorIn);
+  cmp('bullStance', '研判偏多', t0.bullStance, now.bullStance);
+  if (!items.length) return null;
+  const broken = items.filter(x => !x.ok), intact = items.filter(x => x.ok);
+  const ratio = intact.length / items.length;
+  return { items, broken, intact, ratio,
+    verdict: ratio >= 0.75 ? 'intact' : ratio >= 0.5 ? 'weak' : 'broken' };
+}
+
 function addHolding(stockId, kind = 'long') {
   const s = allStocks.find(x => x.id === stockId);
   if (!s?.analysis) { showToast('資料未就緒，稍後再試', 'error'); return; }
@@ -7542,6 +7669,7 @@ function addHolding(stockId, kind = 'long') {
     stop: p?.ok ? p.stop : +(entry * 0.93).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
     src: 'ai', kind: kind === 'day' ? 'day' : 'long',
+    thesis: thesisSnapshot(s, m),
     planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
     addedAt: new Date().toISOString().slice(0, 10),
     // 進場情境快照 — 結案後檢討「當時憑什麼進場」的依據
@@ -7634,6 +7762,7 @@ async function addManualHolding() {
     stop: (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2),
     t1: p?.ok && p.t1 ? p.t1 : null,
     src: 'manual', kind,
+    thesis: s?.analysis ? thesisSnapshot(s, m) : null,
     planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
     addedAt: new Date().toISOString().slice(0, 10),
     ctx: s?.analysis ? {
@@ -8005,6 +8134,20 @@ function checkHoldingExit(h) {
     }
   }
 
+  // 買進理由還在不在？跌多少不是加碼/止損的依據，論點是否失效才是。
+  const tc = thesisCheck(h, s, m);
+  if (tc) {
+    const dd = retPct;   // 含息報酬
+    if (tc.verdict === 'broken') {
+      if (level !== 'exit') level = 'watch';
+      reasons.push(`🧭 買進理由已失效（${tc.broken.map(x => x.label).join('、')}不再成立）— 就算價格很香也該減碼或出清，不向下攤平`);
+    } else if (tc.verdict === 'weak') {
+      reasons.push(`🧭 買進理由部分動搖（${tc.broken.map(x => x.label).join('、')}）— 不加碼，等理由重新成立`);
+    } else if (dd <= -5 && h.kind !== 'day') {
+      reasons.push(`🧭 買進理由仍在（${tc.intact.map(x => x.label).join('、')}）但價格回落 ${dd.toFixed(1)}% — 屬「論點沒變、價格變便宜」，可依分批計畫在支撐加碼（限總風險內）`);
+    }
+  }
+
   // 持倉健康度：階段化管理建議（R 倍數/資金效率/壓力減碼），最多取兩條
   const hh = holdingHealth(h, s, m);
   if (hh) {
@@ -8015,7 +8158,7 @@ function checkHoldingExit(h) {
 
   if (!reasons.length) reasons.push(m ? `結構維持「${m.stance}」，續抱` : '結構穩定，續抱');
 
-  return { h, s, price, retPct, level, reasons, stance: m?.stance, health: hh,
+  return { h, s, price, retPct, level, reasons, stance: m?.stance, health: hh, thesis: tc,
            trail: m ? +Math.max(price - (m.atr || price * 0.02) * 2, a.ema20 || 0).toFixed(2) : null };
 }
 
@@ -8057,6 +8200,7 @@ function holdingsHTML() {
         <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:${r.h.src === 'manual' ? 'rgba(245,158,11,0.14)' : 'rgba(0,212,255,0.12)'};color:${r.h.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${r.h.src === 'manual' ? '自行購入' : 'AI 建議'}</span>
         <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${r.pending ? '⏳ 待掃描' : badge[r.level].t}</span>
         ${r.health ? `<span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.06);color:${r.health.tone === 'good' ? 'var(--bull)' : r.health.tone === 'ok' ? 'var(--yellow)' : 'var(--bear)'}" title="持倉健康度（方向/R 進度/量能/資金效率）">${r.health.stage.icon} ${r.health.stage.txt}・${r.health.rNow >= 0 ? '+' : ''}${r.health.rNow}R・健康 ${r.health.score}</span>` : ''}
+        ${r.thesis ? `<span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.06);color:${r.thesis.verdict === 'intact' ? 'var(--bull)' : r.thesis.verdict === 'weak' ? 'var(--yellow)' : 'var(--bear)'}" title="買進理由檢查：${r.thesis.items.map(x => `${x.label}${x.ok ? '✓' : '✗'}`).join(' ')}">🧭 理由 ${r.thesis.intact.length}/${r.thesis.items.length} 成立</span>` : ''}
         <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</span>
       </div>
       <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
@@ -8956,6 +9100,9 @@ function computeEntrySignals(opts = {}) {
       if (AF.minRevYoy != null && s.rev?.yoy != null && s.rev.yoy < AF.minRevYoy) continue;
       if (AF.noSectorOut) { try { if (sectorStatsCached().find(g => g.sector === s.sector)?.rotation?.state === 'out') continue; } catch {} }
     }
+    // 買前五問的兩道硬門檻：賠率不對稱不買；說不出續漲動力不買；利多已反映不追
+    if (p.scen?.asym) continue;
+    if (p.cat?.weak || p.cat?.pricedIn) continue;
     // 進場品質門檻：研判強（該不該買）之外，還要進場點好（現在買好不好）
     const q = entryQuality(s, m, p);
     if (q.score < 55) continue;                      // C 級進場點寧可放掉
@@ -9009,7 +9156,9 @@ function notifyEntrySignals() {
       `　進場 ${p.lo}~${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）\n` +
       `　${p.holdOn ? '上方無壓力，續抱為主' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}\n` +
       `　1R ${(p.lo * 2 - p.stop).toFixed(2)} 先減半、停損上移成本\n` +
-      `　依據：${sup.join('・') || '技術面轉強'}`;
+      `　依據：${sup.join('・') || '技術面轉強'}` +
+      (p.scen ? `\n　情境：樂觀 +${p.scen.optimistic}%／中性 +${p.scen.neutral}%／悲觀 ${p.scen.pessimistic}%${p.scen.asym ? '（⚠ 不對稱）' : ''}` : '') +
+      (p.cat ? `\n　續漲動力：${p.cat.n ? p.cat.links.slice(0, 2).map(l => l.txt.split('：')[0]).join('＋') : '❌ 說不出來，僅氣氛'}${p.cat.pricedIn ? '（⚠ 利多可能已反映）' : ''}` : '');
   }).join('\n\n');
 
   // 當沖參考獨立列出（極高風險，僅日線資料篩選）
