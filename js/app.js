@@ -253,8 +253,8 @@ async function runScan() {
       allStocks.forEach(s => { s._pePct = peValuation(s.id, s._fd?.pe); });
     } catch {}
   }).catch(() => {});
-  // 使用者於目錄頁啟用的額外資料集
-  loadEnabledDatasets().catch(() => {});
+  // 使用者於目錄頁啟用的額外資料集，之後自動補上優先序清單（不重複、有預算）
+  loadEnabledDatasets().catch(() => {}).then(() => loadAutoDatasets().catch(e => console.warn('自動資料集載入失敗:', e)));
   // FinMind 啟用的資料集（每檔一請求，故只取重點標的）
   (async () => {
     const prio = [currentStockId, ...getHoldings().map(h => h.id),
@@ -5347,7 +5347,99 @@ const OAPI_SIGNALS = [
     note: v => `借券賣出餘額 ${Math.round(v / 1000).toLocaleString()} 張（空方潛在賣壓）`, w: 0.6 },
   { path: /t187ap45_L/, field: /現金股利|股利.*合計/, label: '股利分派',
     dir: () => 0, note: v => `現金股利 ${v} 元（僅供參考，殖利率已由估值資料計入）`, w: 0 },
+  // ── 自動納入資料集的規則（欄位含義明確者才計分，其餘註記）──
+  { path: /./, field: /質押.*(比率|比例|成數|%)|設質.*(比率|比例)/, label: '董監質押比',
+    dir: v => v >= 50 ? -1 : 0, w: 0.6,
+    note: v => `董監質押比 ${v}%${v >= 50 ? ' — 大股東資金緊俏，股價下跌易引發斷頭賣壓' : '（可控範圍）'}` },
+  { path: /./, field: /董監.*持股.*(比率|比例|%)|全體董監持股/, label: '董監持股比',
+    dir: () => 0, w: 0, note: v => `董監持股比 ${v}%（僅供參考：高持股＝利益一致，低持股＝經營層與股東綁定弱）` },
+  { path: /./, field: /已買回.*股數|買回股數|預定買回/, label: '庫藏股',
+    dir: v => v > 0 ? 1 : 0, w: 0.4, note: v => `庫藏股執行中（已買回 ${Number(v).toLocaleString()} 股）— 公司認為價格偏低` },
+  { path: /./, field: /^營業利益率|營業利益率\(%\)/, label: '營業利益率',
+    dir: v => v < 0 ? -1 : v >= 15 ? 1 : 0, w: 0.5,
+    note: v => `營業利益率 ${v}%${v < 0 ? '（本業虧損）' : v >= 15 ? '（本業獲利能力佳）' : ''}` },
+  { path: /./, field: /^稅前純益率|稅前.*純益率/, label: '稅前純益率',
+    dir: v => v < 0 ? -1 : 0, w: 0.4, note: v => `稅前純益率 ${v}%${v < 0 ? '（虧損）' : ''}` },
+  { path: /./, field: /減資.*(比率|比例|%)|減資比/, label: '減資',
+    dir: v => v > 0 ? -1 : 0, w: 0.5, note: v => `減資 ${v}% — 減資後籌碼縮減、每股淨值上升，但多屬彌補虧損，中期偏空看待` },
 ];
+
+// ── 自動納入的證交所 OpenAPI 資料集（優先序）──────────────────────────────
+// 使用者要「能加多少加多少」，但配額與穩定性有限，所以：
+//   ・用目錄關鍵字自動找端點（端點名稱可能變動，靠 summary 比對最穩）
+//   ・每日最多載入 OAPI_AUTO_BUDGET 個，逐一請求、間隔 400ms，不並發
+//   ・失敗/404/空資料 → 標記 3 天不重試（不會反覆打壞掉的端點）
+//   ・每個都有明確的評分或註記規則；含義不明的欄位只顯示不計分
+const OAPI_AUTO = [
+  { k: 'borrow',   why: '借券賣出餘額 — 空方潛在賣壓（籌碼）',        match: /借券.*餘額|借券賣出|TWT93U/ },
+  { k: 'pledge',   why: '董監持股與質押 — 大股東資金與斷頭風險（籌碼）', match: /董監.*質押|質押.*董監|董監事.*持股/ },
+  { k: 'treasury', why: '庫藏股買回 — 公司認為價格偏低（籌碼）',        match: /庫藏股/ },
+  { k: 'margin',   why: '營益分析 — 本業獲利率變化（基本面）',          match: /營益分析|營業利益率/ },
+  { k: 'top20',    why: '成交量前二十 — 市場焦點股（量能）',            match: /成交量前二十|成交量前20|前二十名/ },
+  { k: 'capred',   why: '減資 — 籌碼縮減與虧損彌補（基本面）',          match: /減資/ },
+  { k: 'dividend', why: '股利分派 — 殖利率背景（基本面，註記）',        match: /股利分派|t187ap45/ },
+  { k: 'oddlot',   why: '盤後零股 — 散戶參與度（量能，註記）',           match: /零股/ },
+];
+const OAPI_AUTO_BUDGET = 8;
+let _oapiAutoStatus = [];   // 供目錄頁顯示每項的實際狀態
+
+function oapiAutoDead() { try { return JSON.parse(localStorage.getItem('oapi-auto-dead') || '{}'); } catch { return {}; } }
+function oapiMarkDead(path) {
+  const d = oapiAutoDead(); d[path] = twClock().date;
+  try { localStorage.setItem('oapi-auto-dead', JSON.stringify(d)); } catch {}
+}
+function oapiIsDead(path) {
+  const at = oapiAutoDead()[path]; if (!at) return false;
+  const days = Math.round((new Date(twClock().date + 'T00:00:00Z') - new Date(at + 'T00:00:00Z')) / 86400000);
+  return days < 3;
+}
+// 從目錄挑出每個優先項對應的端點（找不到就誠實標示）
+function pickAutoDatasets(catalog) {
+  const used = new Set();
+  const out = [];
+  for (const a of OAPI_AUTO) {
+    const hit = (catalog || []).find(c => !used.has(c.path) &&
+      (a.match.test(c.path || '') || a.match.test(c.summary || '')));
+    if (hit) { used.add(hit.path); out.push({ ...a, path: hit.path, summary: hit.summary }); }
+    else out.push({ ...a, path: null });
+  }
+  return out;
+}
+async function loadAutoDatasets() {
+  let catalog = null;
+  try { catalog = await fetchTWSESwagger(); } catch {}
+  if (!catalog?.length) { _oapiAutoStatus = OAPI_AUTO.map(a => ({ ...a, path: null, status: '目錄未取得' })); return; }
+  const picks = pickAutoDatasets(catalog);
+  const enabled = new Set(getEnabledDatasets());
+  let loaded = 0;
+  const status = [];
+  for (const a of picks) {
+    if (!a.path) { status.push({ ...a, status: '目錄中找不到對應端點' }); continue; }
+    if (enabled.has(a.path)) { status.push({ ...a, status: '已由使用者手動啟用' }); continue; }
+    if (oapiIsDead(a.path)) { status.push({ ...a, status: '近 3 日無資料，暫停重試' }); continue; }
+    if (loaded >= OAPI_AUTO_BUDGET) { status.push({ ...a, status: '超出每日預算，未載入' }); continue; }
+    let d = null;
+    try { d = await fetchOpenApiDataset(a.path); } catch {}
+    loaded++;
+    if (!d) { oapiMarkDead(a.path); status.push({ ...a, status: '無回應/無資料（3 日內不重試）' }); }
+    else if (!d.perStock) status.push({ ...a, status: `非個股層級（${d.n} 筆，僅目錄顯示）` });
+    else {
+      let hit = 0;
+      for (const s of allStocks) { const row = d.map[s.id]; if (row) { s._oapi = s._oapi || {}; s._oapi[a.path] = row; hit++; } }
+      status.push({ ...a, status: `已納入分析（掃描池命中 ${hit} 檔）` });
+    }
+    await new Promise(r => setTimeout(r, 400));   // 不並發、不轟炸
+  }
+  _oapiAutoStatus = status;
+}
+function autoDatasetStatusHTML() {
+  if (!_oapiAutoStatus.length) return '';
+  return `<div style="margin-bottom:12px;padding:9px 12px;border-radius:8px;background:rgba(0,212,255,0.05);border-left:3px solid var(--blue)">
+    <div style="font-size:0.76rem;font-weight:700;color:var(--blue)">🤖 自動納入（依重要性排序，每日最多 ${OAPI_AUTO_BUDGET} 個，失敗即跳過）</div>
+    <div style="font-size:0.72rem;color:var(--text2);line-height:1.8;margin-top:4px">
+      ${_oapiAutoStatus.map((a, i) => `${i + 1}. ${a.why}<br><span style="color:${/已納入/.test(a.status) ? 'var(--bull)' : 'var(--text3)'};font-size:0.68rem">　${a.path || '—'}｜${a.status}</span>`).join('<br>')}
+    </div></div>`;
+}
 
 function oapiFieldSignal(path, key, val, s) {
   const num = parseFloat(String(val ?? '').replace(/,/g, ''));
@@ -5365,7 +5457,7 @@ async function loadEnabledDatasets() {
   if (!paths.length) return;
   const results = await Promise.all(paths.map(p =>
     fetchOpenApiDataset(p).then(d => ({ p, d })).catch(() => ({ p, d: null }))));
-  for (const s of allStocks) s._oapi = {};
+  for (const s of allStocks) s._oapi = s._oapi || {};   // 不整批清空：FinMind 與自動納入的資料共用此物件
   for (const { p, d } of results) {
     if (!d?.perStock || !d.map) continue;
     for (const s of allStocks) { const row = d.map[s.id]; if (row) s._oapi[p] = row; }
@@ -5378,7 +5470,7 @@ function renderExtraData(s) {
   if (!el) return;
   const sets = s?._oapi ? Object.entries(s._oapi) : [];
   if (!sets.length) {
-    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">尚未啟用額外資料集。到「設定 → 證交所 OpenAPI 目錄」勾選要納入的端點，下輪掃描即會帶入。</p>';
+    el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">此股尚無額外官方資料。系統每輪掃描會自動載入優先序清單（借券／董監質押／庫藏股／營益分析／成交量前二十／減資／股利／零股）中有此股資料的端點；也可到「設定 → 證交所 OpenAPI 目錄」手動加入其他端點。</p>';
     return;
   }
   el.innerHTML = sets.map(([path, row]) => {
@@ -5507,7 +5599,7 @@ async function renderApiCatalog() {
   }
   const order = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
 
-  el.innerHTML = `
+  el.innerHTML = autoDatasetStatusHTML() + `
     <div style="padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.03);margin-bottom:10px;font-size:0.82rem">
       官方目錄共 <b>${list.length}</b> 個端點｜內建已使用 <b>${USED_OPENAPI.length}</b> 個｜額外啟用 <b>${enabled.size}</b> 個｜尚未使用 <b>${unused.length}</b> 個
       <br><span style="font-size:0.72rem;color:var(--text3)">按「＋ 納入」即會在下輪掃描抓取並顯示於個股頁；意義明確的欄位會進評分，其餘標為僅供參考</span>
