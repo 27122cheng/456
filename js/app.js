@@ -475,12 +475,7 @@ function renderDashboard() {
     ? bearSorted.map(s => stockTableRow(s)).join('')
     : '<tr><td colspan="6" style="text-align:center;color:var(--text3);padding:16px">目前無空頭訊號</td></tr>';
 
-  // Reversal grid
-  const reversals = ready.filter(s => s.reversal).slice(0, 8);
-  document.getElementById('rev-count').textContent = reversals.length;
-  document.getElementById('reversal-grid').innerHTML = reversals.length
-    ? reversals.map(s => reversalCard(s)).join('')
-    : '<div class="rev-placeholder">目前無明顯反轉訊號</div>';
+  // 反轉機會區塊已移除：逆勢抄底與整套順勢系統矛盾，擺在頁面上只是在誘惑逆勢單
 }
 
 function stockTableRow(s) {
@@ -517,22 +512,6 @@ function stockTableRow(s) {
     <td class="${rsiClass(a.rsi)}">${a.rsi?.toFixed(1) ?? '--'}</td>
     <td class="vol-cell">${fmtVol(a.lastVol)}</td>
   </tr>`;
-}
-
-function reversalCard(s) {
-  const r = s.reversal;
-  const a = s.analysis;
-  return `<div class="rev-card" onclick="openStock('${s.id}')">
-    <div class="rev-card-top">
-      <div>
-        <div class="rev-card-id">${s.id}</div>
-        <div class="rev-card-name">${s.name}</div>
-      </div>
-      <span class="rev-card-type">${r.type}</span>
-    </div>
-    <div class="rev-card-price">${a.price?.toFixed(2) ?? '--'}</div>
-    <div class="rev-card-rsi">${r.desc}</div>
-  </div>`;
 }
 
 // ── Market Outlook (多空總覽) ──────────────────────────────────────────────
@@ -2151,6 +2130,20 @@ function revenueMomentum(stockId) {
 // 綜合技術、趨勢強度、動能、量能、法人籌碼、融資融券 O.I、多週期、波動、
 // 相對位置，輸出一位資深操盤手的完整決策：方向、當沖適配、進出場點位、
 // 持有期、長線出場價、關鍵風險。s._inst / s._oi / s._mtf 到齊時自動升級。
+// 證據家族上限：任何單一家族最多貢獻這麼多方向分，避免同質證據堆疊
+const FAMILY_CAP = { trend: 3.0, momentum: 2.5, volume: 2.5, chips: 3.0, fund: 2.5, context: 2.0, news: 0.8, risk: 3.0 };
+function evidenceFamily(e) {
+  if (e.kind === 'chip') return 'chips';
+  if (e.kind === 'fund') return 'fund';
+  if (e.kind === 'risk') return 'risk';
+  if (e.kind === 'news') return 'news';
+  const t = e.txt || '';
+  if (/趨勢|均線|排列|EMA|年線|季線|MACD|結構|道氏|斜率|跑贏大盤|落後大盤|領先大盤|與大盤同步|同步偏多|同步偏空|週線/.test(t)) return 'trend';
+  if (/量|突破|出貨|吸籌|訂單塊|價值區|缺口|VAH|VAL|POC|委買|委賣|爆量|籌碼/.test(t)) return 'volume';
+  if (/RSI|動能|背離|型態|K 棒|K棒|假跌破|假突破|Spring|Upthrust|力道|晨星|夜星|吞噬|錘|十字|三兵|三烏鴉/.test(t)) return 'momentum';
+  return 'context';   // 位階、乖離、族群、事件、期貨、大盤環境…
+}
+
 function buildManagerAnalysis(s) {
   const a = s.analysis;
   if (!a || !s.ohlcv?.length) return null;
@@ -2548,14 +2541,18 @@ function buildManagerAnalysis(s) {
   // ── 彙總：淨方向、一致性、信心度 ──
   // ⑧ 新聞面（保守小權重）：本週新聞明確點名此股或其產業才注入，
   // 關鍵字判讀非語意理解 — 權重刻意壓低，只作佐證不作主導
+  // 新聞情緒是全站最弱的資料（關鍵字判多空，「跌深反彈」同時含跌與反彈）。
+  // 降權：個股被 ≥2 則同向新聞點名才計小分（0.6）；單則與族群新聞只作註記。
   if (_newsSignals) {
     const st = _newsSignals.stocks[s.id];
     if (st && st.score !== 0) {
-      add(1.2, st.score > 0 ? 1 : -1,
-        `新聞面${st.score > 0 ? '利多' : '利空'}：「${st.items[0]}」${st.items.length > 1 ? `等 ${st.items.length} 則` : ''}`, 'news');
+      const strong = Math.abs(st.score) >= 2 && st.items.length >= 2;
+      const txt = `新聞面${st.score > 0 ? '利多' : '利空'}：「${st.items[0]}」${st.items.length > 1 ? `等 ${st.items.length} 則` : ''}`;
+      if (strong) add(0.6, st.score > 0 ? 1 : -1, txt, 'news');
+      else notes.push(`${txt}（單則／訊號弱，僅供參考）`);
     } else if (s.sector && _newsSignals.sectors[s.sector] && Math.abs(_newsSignals.sectors[s.sector].score) >= 2) {
       const sec = _newsSignals.sectors[s.sector];
-      add(0.6, sec.score > 0 ? 1 : -1, `${s.sector}族群本週新聞面${sec.score > 0 ? '偏多' : '偏空'}（${sec.n} 則相關）`, 'news');
+      notes.push(`${s.sector}族群本週新聞面${sec.score > 0 ? '偏多' : '偏空'}（${sec.n} 則相關，僅供參考）`);
     }
   }
 
@@ -2573,9 +2570,25 @@ function buildManagerAnalysis(s) {
         : `ADR 折價 ${ovn.premium}% — 外資評價低於台股現價，開盤有補跌壓力`);
   }
 
-  let dir = ev.reduce((acc, e) => acc + e.w * e.d, 0);
+  // ── 證據家族化彙總 ──
+  // 趨勢引擎、均線結構、年線、MACD、道氏結構、RS… 量的是同一件事（價格在漲）。
+  // 逐項相加會讓一個訊號被數七次，「一致性 90%」很多時候只是一票灌成七票。
+  // 改為：每項證據歸入家族，家族貢獻設上限；方向＝家族貢獻相加；
+  // 一致性改在「家族之間」算 —— 七項趨勢證據同向只算一票。
+  const fams = {};
+  for (const e of ev) {
+    const f = evidenceFamily(e); e.fam = f;
+    const o = fams[f] = fams[f] || { raw: 0, w: 0, n: 0 };
+    o.raw += e.w * e.d; o.w += e.w; o.n++;
+  }
+  let dir = 0, absSum = 0;
+  for (const [f, o] of Object.entries(fams)) {
+    const cap = FAMILY_CAP[f] ?? 2.0;
+    o.contrib = +Math.max(-cap, Math.min(cap, o.raw)).toFixed(2);
+    dir += o.contrib; absSum += Math.abs(o.contrib);
+  }
   const totalW = ev.reduce((acc, e) => acc + e.w, 0);
-  const agr = totalW > 0 ? Math.abs(dir) / totalW : 0;   // 0=完全矛盾, 1=完全一致
+  const agr = absSum > 0 ? Math.abs(dir) / absSum : 0;   // 家族層級一致性：0=家族互相矛盾, 1=全部同向
 
   // ADX 於最後才放大方向：它衡量「趨勢強度」而非方向，
   // 必須在所有證據彙總後才知道要放大哪一邊（先前寫在中段會依程式碼順序誤判）
@@ -2603,8 +2616,10 @@ function buildManagerAnalysis(s) {
     notes.push(`大盤偏空（${Math.round(mktNorm)}），做多逆風、訊號打折`);
   }
 
-  // 信心度：一致性 × 證據充分度（證據太少也不該有高信心）
-  const coverage = Math.min(1, totalW / 8);
+  // 信心度：一致性 × 證據充分度 —— 充分度看「有幾個家族發聲」，不看證據件數
+  //（同一家族堆 20 件證據不等於充分，五個家族各一件才是）
+  const famCount = Object.keys(fams).filter(f => f !== 'risk').length;
+  const coverage = Math.min(1, famCount / 5);
   const conf = Math.round(agr * coverage * 100);
 
   const bull = ev.filter(e => e.d > 0).sort((x, y) => y.w - x.w).map(e => e.txt);
@@ -2630,7 +2645,7 @@ function buildManagerAnalysis(s) {
 
 
   return {
-    dir, conf, agr, evidence: ev, stance, stanceColor, bull, bear, notes,
+    dir, conf, agr, evidence: ev, fams, stance, stanceColor, bull, bear, notes,
     horizon, horizonDays, atr, atrPct, ret20Z, flowPct,
     sup: +sup.toFixed(2), res: +res.toFixed(2), hi20: +hi20.toFixed(2), lo20: +lo20.toFixed(2),
     ret5, ret20, mtfAligned, oi, price,
@@ -3459,8 +3474,11 @@ function renderPatterns(s) {
       </div>
     </div>`);
 
-  el.innerHTML = parts.length ? parts.join('')
-    : '<p style="color:var(--text3);font-size:0.85rem">目前無明顯型態訊號（趨勢結構需至少 40 根 K 棒）</p>';
+  // 進階面板摺疊：費波那契、多空力道等參考用指標會稀釋真正重要的東西，收進「進階」
+  const ADV_RE = /費波那契|多空力道|量價關係|價格位階|風險指標|法人成本估算|營收動能|波動狀態|波動區間預測/;
+  const coreParts = parts.filter(h => !ADV_RE.test(h)), advParts = parts.filter(h => ADV_RE.test(h));
+  el.innerHTML = (coreParts.length ? coreParts.join('') : '<p style="color:var(--text3);font-size:0.85rem">目前無明顯型態訊號</p>')
+    + (advParts.length ? `<details style="margin-top:8px"><summary style="cursor:pointer;font-size:0.76rem;color:var(--text3)">進階指標（${advParts.length}）— 參考用，不影響研判主結論</summary><div style="margin-top:8px">${advParts.join('')}</div></details>` : '');
 }
 
 // ── 未平倉部位 O.I（融資融券）───────────────────────────────────────────────
@@ -5034,6 +5052,11 @@ function getThreshold(type) {
 const SYNC_KEYS = [
   'my-holdings', 'price-alerts', 'custom-stocks', 'pred-log',
   'inst-hist', 'fin-hist', 'tdcc-hist',
+  // 學習資料 —— 先前全部漏掉：清一次快取或換裝置，幾個月的學習就歸零
+  'ai-signals', 'dt-trades', 'dt-strategy-rank', 'dt-strategy-tuned', 'learn-state',
+  'lt-removals', 'pe-hist', 'longterm-list', 'signal-log', 'rev-hist', 'fgn-hist',
+  'trade-journal', 'exdiv-hist', 'auto-stocks', 'backtest-result',
+  'capital', 'max-accept-loss', 'finmind-token',
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
   'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
@@ -5742,7 +5765,7 @@ function classifySwingLoss(t, s) {
   return { lossCause: 'other', lossCauseTxt: '無單一主因 — 屬正常機率內的虧損（任何策略都會有）' };
 }
 function aiLossLearnings() {
-  const done = getAiSignals().filter(t => t.status !== 'open' && t.retPct != null);
+  const done = getAiSignals().filter(t => t.status !== 'open' && t.retPct != null).slice(-LEARN_WINDOW);   // 衰減窗
   const losses = done.filter(t => t.status === 'loss' && t.lossCause);
   if (losses.length < 3) return { n: losses.length, total: done.length, rules: [], insufficient: true };
   const by = {};
@@ -5761,6 +5784,7 @@ function aiLossLearnings() {
   const rules = Object.entries(by).map(([k, arr]) => ({
     k, n: arr.length, pct: Math.round(arr.length / losses.length * 100),
     txt: SWING_LOSS_RULES.find(r => r.k === k)?.txt || '其他', fix: fix[k] || '',
+    active: learnState('swing', k).on, status: learnStatusTxt('swing', k),
   })).sort((a, b) => b.n - a.n);
   return { n: losses.length, total: done.length, rules, insufficient: false };
 }
@@ -5770,8 +5794,11 @@ function aiLearnedFilters() {
               needVolConfirm: false, minRevYoy: null, noSectorOut: false, learned: [] };
   const L = aiLossLearnings();
   if (L.insufficient) return f;
+  const settled = getAiSignals().filter(t => t.status !== 'open' && t.retPct != null);
+  const win = settled.slice(-LEARN_WINDOW);
+  const expNow = win.length ? win.reduce((a, b) => a + (b.retPct || 0), 0) / win.length : null;
   for (const r of L.rules) {
-    if (r.n < 2) continue;
+    if (!learnGate('swing', r.k, r.n, r.pct / 100, expNow, settled.length)) continue;
     if (r.k === 'mkt-flip') f.headwind = -5;
     if (r.k === 'late-stage') f.noLate = true;
     if (r.k === 'high-pctile') f.noHighPctile = true;
@@ -5794,8 +5821,42 @@ function renderAiLossLearning() {
   }
   el.innerHTML = `<div style="font-size:0.75rem;color:var(--text2);line-height:1.8">
     共 ${L.n} 筆止損（總結算 ${L.total} 筆）：<br>
-    ${L.rules.map(r => `・<strong>${r.txt.split(' —')[0]}</strong>　${r.n} 次（${r.pct}%）${r.n >= 2 ? `<span style="color:var(--bull)">${r.fix}</span>` : '<span style="color:var(--text3)">（僅 1 次，尚不視為模式）</span>'}`).join('<br>')}
+    ${L.rules.map(r => `・<strong>${r.txt.split(' —')[0]}</strong>　${r.n} 次（${r.pct}%）${r.active ? `<span style="color:var(--bull)">${r.fix}</span>` : ''}<br><span style="font-size:0.7rem;color:var(--text3)">　${r.status}</span>`).join('<br>')}
   </div>`;
+}
+
+// ── 學習安全閥（三套學習共用）────────────────────────────────────────────
+// 先前同一原因出現 2 次就永久加嚴，且沒有任何回退 —— 兩筆是雜訊不是模式，
+// 棘輪只會越鎖越死。改為：
+//   啟用：最近 40 筆窗口內，該原因 ≥5 次且占虧損 ≥30%
+//   評估：啟用後再累積 20 筆結算，期望值沒改善 → 自動回退並冷卻 30 筆
+const LEARN_WINDOW = 40, LEARN_MIN_N = 5, LEARN_MIN_SHARE = 0.3, LEARN_EVAL_AFTER = 20, LEARN_COOLDOWN = 30;
+function learnStateAll() { try { return JSON.parse(localStorage.getItem('learn-state') || '{}'); } catch { return {}; } }
+function learnState(store, cause) { return learnStateAll()[`${store}:${cause}`] || { on: false }; }
+function learnGate(store, cause, n, share, expNow, settledN) {
+  const all = learnStateAll();
+  const key = `${store}:${cause}`;
+  const rec = all[key] || { on: false };
+  const qualifies = n >= LEARN_MIN_N && share >= LEARN_MIN_SHARE;
+  if (!rec.on) {
+    if (rec.cooldownUntil != null && settledN < rec.cooldownUntil) { /* 冷卻中 */ }
+    else if (qualifies) {
+      rec.on = true; rec.at = twClock().date; rec.expAt = expNow; rec.settledAt = settledN; rec.reverted = false;
+    }
+  } else if (settledN - (rec.settledAt ?? settledN) >= LEARN_EVAL_AFTER && expNow != null && rec.expAt != null) {
+    if (expNow <= rec.expAt) {        // 加嚴後期望值沒改善 → 回退
+      rec.on = false; rec.reverted = true; rec.revertedAt = twClock().date; rec.cooldownUntil = settledN + LEARN_COOLDOWN;
+    } else { rec.expAt = expNow; rec.settledAt = settledN; }   // 有效 → 續用並重設基準
+  }
+  all[key] = rec;
+  try { localStorage.setItem('learn-state', JSON.stringify(all)); } catch {}
+  return !!rec.on;
+}
+function learnStatusTxt(store, cause) {
+  const r = learnState(store, cause);
+  if (r.on) return `已啟用（${r.at}），啟用後 20 筆結算若期望值未改善將自動回退`;
+  if (r.reverted) return `已回退（${r.revertedAt}：加嚴後期望值未改善），冷卻中`;
+  return '未達啟用門檻（需最近 40 筆內 ≥5 次且占虧損 ≥30%）';
 }
 
 function updateAiSignals() {
@@ -7308,34 +7369,6 @@ function notifyDataDate() {
   return s ? s.ohlcv[s.ohlcv.length - 1].time.slice(0, 10) : new Date().toISOString().slice(0, 10);
 }
 
-// 【已退出自動排程】大戶訊號不再獨立推播 — 乾淨的偵測結果由 whaleFor()
-// 寫進交易建議的進場理由，流水帳照記。保留函式供手動觸發。
-function notifyWhales() {
-  if (!tgWants('sig')) return;
-  if (!inNotifyWindow()) return;   // 假日與非交易時段不推播
-  // 「每檔一天一次」以日曆日界定：資料日翻面時重置清單會把上午發過的重發
-  const calDay = twClock().date;
-  let sent;
-  try { sent = JSON.parse(localStorage.getItem('whale-tg') || '{}'); } catch { sent = {}; }
-  if (sent.date !== calDay) sent = { date: calDay, ids: [] };
-  const clean = _whaleResults.filter(r => !r.trap.length && !sent.ids.includes(r.s.id));
-  if (!clean.length) return;
-
-  for (const r of clean.slice(0, 3)) {
-    const p = r.m ? buildEntryPlan(r.s, r.m) : null;
-    const anal = [
-      `研判：${r.m ? `${r.m.stance}（一致性 ${(r.m.agr * 100).toFixed(0)}%）` : '--'}`,
-      p?.ok ? `進場參考 ${p.lo} ~ ${p.hi}｜停損 ${p.stop}（-${p.riskPct.toFixed(1)}%）｜${p.holdOn ? '上方無壓力，續抱看待' : `目標 ${p.t1}`}` : (p?.why ? `暫不建議進場：${p.why}` : ''),
-      r.mktBad ? '⚠ 大盤目前偏空，部位宜保守' : '',
-    ].filter(Boolean).join('\n');
-    tgPush(`🐋 大戶動向：${r.s.name}(${r.s.id})\n\n${r.sig.map(t => '・' + t).join('\n')}\n\n陷阱檢查：未發現誘多/出貨跡象 ✅\n\n📋 交易分析\n${anal}\n\n⚠ 僅供參考，非投資建議`);
-    logSignal('whale', `${r.s.name}（${r.s.id}）大戶動向（已過陷阱檢查）`,
-      r.sig.join('；'), { id: r.s.id, dir: 1, dedupKey: r.s.id });
-    sent.ids.push(r.s.id);
-  }
-  localStorage.setItem('whale-tg', JSON.stringify(sent));
-}
-
 // ── 交易紀錄（結案後的檢討資料庫）───────────────────────────────────────────
 function getJournal() {
   try { return JSON.parse(localStorage.getItem('trade-journal') || '[]'); } catch { return []; }
@@ -8643,6 +8676,7 @@ function recordLtRemoval(it, s, why) {
 function ltLearnings() {
   let log = [];
   try { log = JSON.parse(localStorage.getItem('lt-removals') || '[]'); } catch {}
+  log = log.slice(-LEARN_WINDOW);   // 衰減窗
   if (log.length < 3) return { n: log.length, rules: [], insufficient: true };
   const by = {};
   for (const r of log) (by[r.cause] = by[r.cause] || []).push(r);
@@ -8652,6 +8686,7 @@ function ltLearnings() {
   const rules = Object.entries(by).map(([k, arr]) => ({
     k, n: arr.length, pct: Math.round(arr.length / log.length * 100), txt: name[k] || k, fix: fix[k] || '',
     avgRet: +(arr.reduce((a, b) => a + (b.ret ?? 0), 0) / arr.length).toFixed(1),
+    active: learnState('lt', k).on, status: learnStatusTxt('lt', k),
   })).sort((a, b) => b.n - a.n);
   return { n: log.length, rules, insufficient: false };
 }
@@ -8659,8 +8694,11 @@ function ltLearnedRules() {
   const r = { needRevAccel: false, maxExtYear: 25, ema50Margin: 1.0, minNetMargin: null };
   const L = ltLearnings();
   if (L.insufficient) return r;
+  let logAll = []; try { logAll = JSON.parse(localStorage.getItem('lt-removals') || '[]'); } catch {}
+  const win = logAll.slice(-LEARN_WINDOW);
+  const expNow = win.length ? win.reduce((a, b) => a + (b.ret ?? 0), 0) / win.length : null;   // 剔除時平均報酬（越高越好）
   for (const x of L.rules) {
-    if (x.n < 2) continue;
+    if (!learnGate('lt', x.k, x.n, x.pct / 100, expNow, logAll.length)) continue;
     if (x.k === 'rev') r.needRevAccel = true;
     if (x.k === 'yearline') r.maxExtYear = 15;
     if (x.k === 'deathcross') r.ema50Margin = 1.02;
@@ -8795,6 +8833,7 @@ function renderEntrySignals() {
       ${pillars?.length ? `<div style="font-size:0.7rem;color:var(--text3);margin-top:3px">支柱：${pillars.map(k => ({ chips: '🏦 籌碼支撐', fund: '📊 基本面過關', buzz: '🔥 題材討論度' }[k])).join('・')}</div>` : ''}
       ${q?.top?.length ? `<div style="font-size:0.7rem;color:var(--blue);margin-top:3px">進場點優勢：${q.top.map(x => x.txt).join('・')}</div>` : ''}
       ${q?.weak?.length ? `<div style="font-size:0.7rem;color:var(--yellow);margin-top:2px">弱項：${q.weak.slice(0, 2).join('・')}</div>` : ''}
+      ${q?.penalties?.length ? `<div style="font-size:0.7rem;color:var(--bear);margin-top:2px">扣分：${q.penalties.map(x => `${x.k} −${x.v}`).join('・')}</div>` : ''}
       <div style="margin-top:7px">${inH.has(s.id)
         ? '<span style="font-size:0.74rem;color:var(--bull)">✓ 已在持倉中</span>'
         : `<button class="btn-primary" style="padding:5px 14px;font-size:0.74rem" onclick="addHolding('${s.id}','${kind}')">📌 買進後記錄持倉</button>`}</div>
@@ -8842,7 +8881,7 @@ function renderEntrySignals() {
       const LL = (() => { try { return ltLearnings(); } catch { return { insufficient: true, n: 0 }; } })();
       const learnTxt = LL.insufficient
         ? `剔除學習：累積 ${LL.n}／3 筆剔除樣本後開始歸納`
-        : `剔除學習：${LL.rules.slice(0, 2).map(r => `${r.txt} ${r.n} 次${r.n >= 2 && r.fix ? r.fix : ''}`).join('；')}`;
+        : `剔除學習：${LL.rules.slice(0, 2).map(r => `${r.txt} ${r.n} 次${r.active && r.fix ? r.fix : '（未達啟用門檻）'}`).join('；')}`;
       const base = `選入更挑剔（成長＋估值＋資金流三證據、60日贏大盤、乖離年線≤${(() => { try { return ltLearnedRules().maxExtYear; } catch { return 25; } })()}%）；剔除採年線二次確認｜<span style="color:var(--blue)">${learnTxt}</span>`;
       if (!rows.length) return base;
       const avgRet = rows.reduce((a, b) => a + b.ret, 0) / rows.length;
@@ -8859,7 +8898,8 @@ function renderEntrySignals() {
       days.filter(dp => !all.some(pk => pk.s.id === dp.s.id)).map(dayCard).join(''));
 
   const hw = heatWarning();
-  const hwBanner = hwNow ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);font-size:0.76rem;color:var(--yellow);margin-bottom:10px">🛑 大盤研判 ${hwNow.norm}（偏空）— 新多單訊號暫停，僅保留 20 日跑贏大盤 ≥10pp 的極強勢股。逆風做多是實證上最大的虧損來源，空手也是部位。</div>` : '';
+  const funnel = funnelHTML();
+  const hwBanner = (funnel || '') + (hwNow ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);font-size:0.76rem;color:var(--yellow);margin-bottom:10px">🛑 大盤研判 ${hwNow.norm}（偏空）— 新多單訊號暫停，僅保留 20 日跑贏大盤 ≥10pp 的極強勢股。逆風做多是實證上最大的虧損來源，空手也是部位。</div>` : '');
   el.innerHTML = hwBanner + (hw && body ? `<div style="padding:8px 12px;border-radius:8px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);font-size:0.76rem;color:var(--bear);margin-bottom:10px">${hw}</div>` : '') + (body ||
     '<p style="font-size:0.8rem;color:var(--text3)">今日皆無符合條件的推薦 — 標準已提高（研判偏多＋綜合 ≥65＋品質 A＋風報比 ≥1.5＋大盤不逆風），寧可空手也不硬給訊號。</p>');
 }
@@ -9022,6 +9062,16 @@ function entryQuality(s, m, p) {
 }
 
 // 大盤逆風濾網狀態（供 UI 誠實說明為何今天沒訊號）
+let _entryFunnel = null;   // 最近一次進場篩選的漏斗統計
+const FUNNEL_LABELS = { stale: '資料過期', headwind: '大盤逆風', dir: '研判強度不足', plan: '無進場計畫', extended: '已追高',
+  rr: '風報比<1.5', excluded: '排除條件', range: '盤整盤位置', learned: '學習門檻', pricedIn: '利多已反映', quality: '品質 C 級',
+  pillars: '三支柱缺二', sectorCap: '族群上限' };
+function funnelHTML() {
+  const F = _entryFunnel; if (!F) return '';
+  const steps = Object.keys(FUNNEL_LABELS).filter(k => F[k]).map(k => `${FUNNEL_LABELS[k]} −${F[k]}`);
+  return `<div style="font-size:0.7rem;color:var(--text3);margin-bottom:8px;line-height:1.7">🔻 篩選漏斗：候選 ${F.total} 檔${steps.length ? ' → ' + steps.join(' → ') : ''} → <strong style="color:var(--bull)">A 級 ${F.finalA ?? 0}</strong>／觀察 B 級 ${F.watchB ?? 0}<span style="margin-left:6px">（看得出訊號少是嚴格還是壞了）</span></div>`;
+}
+
 function marketHeadwind(threshold = -15) {
   const norm = Math.round(outlookData.norm ?? 0);
   return norm <= threshold ? { norm, threshold } : null;
@@ -9034,28 +9084,31 @@ function computeEntrySignals(opts = {}) {
   // 逆風做多是實證上最大的虧損來源，過去只「警告」照樣推，現在直接停。
   // 唯一例外：20 日跑贏大盤 ≥10pp 的極強勢股（資金避風港）仍可入列。
   const AF = (() => { try { return aiLearnedFilters(); } catch { return { headwind: -15, maxExt: 5, minAgr: 0.4, learned: [] }; } })();
+  // 漏斗診斷：每道門檻各殺掉幾檔 —— 讓「一週只出一檔」有地方查是嚴格還是壞了
+  const F = _entryFunnel = { total: ready.length };
+  const die = k => { F[k] = (F[k] || 0) + 1; };
   const hw = marketHeadwind(AF.headwind);
   const perfRules = signalPerfStats();
   const mktNow = Math.round(outlookData.norm ?? 0);
   const mret = marketRet20();
   const picks = [];
   for (const s of ready) {
-    if (s._staleDays >= STALE_LIMIT) continue;       // 資料過期不推薦
+    if (s._staleDays >= STALE_LIMIT) { die('stale'); continue; }
     if (hw) {
       const closes = s.ohlcv?.map(b => b.close);
       const r20 = closes?.length >= 21 ? (s.analysis.price - closes[closes.length - 21]) / closes[closes.length - 21] * 100 : null;
-      if (mret == null || r20 == null || r20 - mret < 10) continue;
+      if (mret == null || r20 == null || r20 - mret < 10) { die('headwind'); continue; }
     }
     const m = buildManagerAnalysis(s);
-    if (!m || m.dir < 3) continue;                   // 只推研判強度足夠者
+    if (!m || m.dir < 3) { die('dir'); continue; }                   // 只推研判強度足夠者
     const p = buildEntryPlan(s, m);
-    if (!p?.ok) continue;
-    if (s.analysis.price > p.hi * 1.02) continue;    // 已明顯追高不推
+    if (!p?.ok) { die('plan'); continue; }
+    if (s.analysis.price > p.hi * 1.02) { die('extended'); continue; }
     // 硬濾網②：風報比 <1.5 且有固定目標 → 不推。小賺大賠是報酬不理想的
     // 數學根源：1:1.2 的單要 55% 勝率才打平，過去只警告仍照推。
-    if (!p.holdOn && p.rr != null && p.rr < 1.5) continue;
+    if (!p.holdOn && p.rr != null && p.rr < 1.5) { die('rr'); continue; }
     const d = scoreStockDimensions(s, marketRet20() ?? 0);
-    if (!d || d.excluded) continue;
+    if (!d || d.excluded) { die('excluded'); continue; }
     // 實績回饋（雙向）：命中「實證低勝率」情境每項 −6、「實證高勝率」情境每項 +4
     if (perfRules.length) {
       const ctxNow = {
@@ -9080,32 +9133,39 @@ function computeEntrySignals(opts = {}) {
         }
       }
     }
-    if (d.total < 65) continue;                      // 扣分後仍需通過五維度綜合門檻
+    // 五維度 d.total 不再作為門檻（與研判、進場品質三套並存＝同一份資料打三次分）；僅保留顯示
     // 盤性適配：盤整盤裡的突破多為假，只接受「貼近 EMA20 的拉回位」且排除無量突破
     if (outlookData.regime?.kind === 'range') {
       const a2 = s.analysis;
       const ext = a2.ema20 ? (a2.price / a2.ema20 - 1) * 100 : 0;
-      if (ext > 3) continue;
-      if (a2.brk?.type === 'breakout-novol' || a2.brk?.type === 'breakout-weak') continue;
+      if (ext > 3) { die('range'); continue; }
+      if (a2.brk?.type === 'breakout-novol' || a2.brk?.type === 'breakout-weak') { die('range'); continue; }
     }
     // 波段止損學習的成果：反覆失敗的情境在這裡被自動擋掉
     {
       const a2 = s.analysis;
-      if (AF.noLate && a2.trend?.maturity === 'late') continue;
-      if (AF.noHighPctile && a2.pctile?.zone === 'high') continue;
+      if (AF.noLate && a2.trend?.maturity === 'late') { die('learned'); continue; }
+      if (AF.noHighPctile && a2.pctile?.zone === 'high') { die('learned'); continue; }
       const ext = a2.ema20 ? (a2.price / a2.ema20 - 1) * 100 : 0;
-      if (ext > AF.maxExt) continue;
-      if (m.agr < AF.minAgr) continue;
-      if (AF.needVolConfirm && !['breakout-vol', 'accumulation'].includes(a2.brk?.type)) continue;
-      if (AF.minRevYoy != null && s.rev?.yoy != null && s.rev.yoy < AF.minRevYoy) continue;
-      if (AF.noSectorOut) { try { if (sectorStatsCached().find(g => g.sector === s.sector)?.rotation?.state === 'out') continue; } catch {} }
+      if (ext > AF.maxExt) { die('learned'); continue; }
+      if (m.agr < AF.minAgr) { die('learned'); continue; }
+      if (AF.needVolConfirm && !['breakout-vol', 'accumulation'].includes(a2.brk?.type)) { die('learned'); continue; }
+      if (AF.minRevYoy != null && s.rev?.yoy != null && s.rev.yoy < AF.minRevYoy) { die('learned'); continue; }
+      if (AF.noSectorOut) { let out = false; try { out = sectorStatsCached().find(g => g.sector === s.sector)?.rotation?.state === 'out'; } catch {} if (out) { die('learned'); continue; } }
     }
-    // 買前五問的兩道硬門檻：賠率不對稱不買；說不出續漲動力不買；利多已反映不追
-    if (p.scen?.asym) continue;
-    if (p.cat?.weak || p.cat?.pricedIn) continue;
-    // 進場品質門檻：研判強（該不該買）之外，還要進場點好（現在買好不好）
+    // 利多已反映：硬門檻（追在人人都知道之後，沒有救）
+    if (p.cat?.pricedIn) { die('pricedIn'); continue; }
+    // 進場品質：研判強（該不該買）之外，還要進場點好（現在買好不好）。
+    // 賠率不對稱、續漲動力薄弱改為「扣分」而非一刀切 —— 判斷性的東西用分數表達，硬門檻疊太多會訊號枯竭
     const q = entryQuality(s, m, p);
-    if (q.score < 55) continue;                      // C 級進場點寧可放掉
+    q.penalties = [];
+    if (p.scen?.asym) q.penalties.push({ k: '賠率不對稱', v: 15 });
+    if (p.cat?.weak) q.penalties.push({ k: '說不出續漲動力', v: 15 });
+    else if (p.cat?.n === 1) q.penalties.push({ k: '續漲動力單薄', v: 5 });
+    for (const x of q.penalties) q.score -= x.v;
+    q.score = Math.max(0, q.score);
+    q.grade = q.score >= 75 ? 'A' : q.score >= 60 ? 'B' : 'C';
+    if (q.score < 55) { die('quality'); continue; }   // C 級進場點寧可放掉
     // 短期波段的三根支柱（缺兩根就不是波段單，是賭）：
     //   ① 籌碼支撐：法人連買／大戶增持／外資持股上升／通過陷阱檢查的大戶訊號
     //   ② 基本面不拖後腿：營收未衰退且非本業虧損（不要求高成長，但不能爛）
@@ -9119,7 +9179,7 @@ function computeEntrySignals(opts = {}) {
     const nsStk = _newsSignals?.stocks?.[s.id]?.score ?? 0;
     const nsSec = s.sector ? (_newsSignals?.sectors?.[s.sector]?.score ?? 0) : 0;
     if (nsStk > 0 || nsSec >= 2) pillars.push('buzz');
-    if (pillars.length < 2) continue;                // 三缺二不推
+    if (pillars.length < 2) { die('pillars'); continue; }
     picks.push({ s, m, p, d, q, pillars });
   }
   // 依進場品質排序（品質同分再比五維度）
@@ -9129,8 +9189,11 @@ function computeEntrySignals(opts = {}) {
   const out = picks.filter(pk => {
     const sec = pk.s.sector || '其他';
     secCnt[sec] = (secCnt[sec] || 0) + 1;
-    return secCnt[sec] <= 2;
+    if (secCnt[sec] > 2) { die('sectorCap'); return false; }
+    return true;
   });
+  F.watchB = out.filter(pk => pk.q.grade !== 'A').length;
+  F.finalA = out.filter(pk => pk.q.grade === 'A').length;
   // 硬濾網③：分級 — 只有品質 A（≥75，黃金匯流）才是「進場訊號」；
   // B 級降為觀察名單（等回檔到更好位置），不推播、不建檔追蹤。
   // 勝率不理想時的正解是提高出手標準，不是換指標。
@@ -10069,48 +10132,6 @@ function tgMarkKeys(keys) {
   try { localStorage.setItem('tg-sent-keys', JSON.stringify(o)); } catch {}
 }
 
-// 【已退出自動排程】內容併入 08:30 盤前簡報的【數據倒數】段。
-// 保留函式供手動觸發；tg-event-sent 由盤前簡報標記，避免與併入版重複。
-function notifyEventPredictions() {
-  if (!tgWants('event')) return;
-  const today = twClock().date;   // 台北日：與各去重標記一致（UTC 日在台北午夜後會錯位）
-  if (localStorage.getItem('tg-event-sent') === today) return;
-
-  const now = new Date();
-  const soon = getUpcomingEvents().filter(e => (e.date - now) / 86400000 <= 3);
-  if (!soon.length) return;
-
-  const norm = outlookData.norm ?? 0;
-  const dir = norm >= 15 ? '📈 預測偏多（市場動能強，數據符合預期時易噴出）'
-            : norm <= -15 ? '📉 預測偏空（市場已弱，數據不佳恐加速下跌）'
-            : '➡️ 預測中性（建議數據公布前降低部位觀望）';
-  const lines = soon.map(e => {
-    const days = Math.ceil((e.date - now) / 86400000);
-    return `${days <= 0 ? '📌 今日' : `⏳ ${days} 天後`} ${e.name}（影響：${e.impact}）`;
-  }).join('\n');
-  tgPush(`🗓 重要數據公布倒數\n\n${lines}\n\nAI 事前方向判讀：\n${dir}\n（依市場多空總覽 ${norm} 分）`);
-  localStorage.setItem('tg-event-sent', today);
-}
-
-// 【已退出自動排程】內容併入 08:30 盤前簡報的「重點關注」列與 09:30 開盤後追蹤。
-function notifyDailyFocus() {
-  if (!tgWants('focus')) return;
-  const today = twClock().date;   // 台北日：與各去重標記一致（UTC 日在台北午夜後會錯位）
-  if (localStorage.getItem('tg-focus-sent') === today) return;
-
-  const all = computeFocusStocks();
-  // 內容去重：今天已被其他訊號推過的股票不再入列；今日必看濾完沒剩就不發
-  const daily = all.daily.filter(f => !tgKeySent(`sig:${f.s.id}`));
-  const weekly = all.weekly.filter(f => !tgKeySent(`sig:${f.s.id}`));
-  if (!daily.length) { localStorage.setItem('tg-focus-sent', today); return; }
-
-  const dLines = daily.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) ${f.chg1 >= 0 ? '+' : ''}${f.chg1.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
-  const wLines = weekly.map((f, i) => `${i+1}. ${f.s.name}(${f.s.id}) 20日${f.ret20 >= 0 ? '+' : ''}${f.ret20.toFixed(1)}%｜${f.reasons.join('・')}`).join('\n');
-  tgPush(`⭐ 台股雷達 每日重點關注 ${today}\n\n📅 今日必看（短線動能）\n${dLines}${weekly.length ? `\n\n🗓 本週追蹤（中期趨勢）\n${wLines}` : ''}`);
-  localStorage.setItem('tg-focus-sent', today);
-  tgMarkKeys([...daily, ...weekly].map(f => `sig:${f.s.id}`));
-}
-
 async function testTelegramNotif() {
   const { token, chatId } = tgCreds();
   if (!token || !chatId) { showToast('請先填寫 Bot Token 和 Chat ID', 'error'); return; }
@@ -10138,25 +10159,6 @@ async function sendTelegram(token, chatId, text) {
   } catch (e) {
     showToast('Telegram 連線失敗', 'error'); return false;
   }
-}
-
-// 【已退出自動排程】強勢多頭清單與簡報的推薦/關注高度重疊 — 相似訊息
-// 太多則比重複更擾人。保留函式供手動觸發。
-function autoNotifyTelegram() {
-  if (!tgWants('sig')) return;
-  const today = twClock().date;   // 台北日：與各去重標記一致（UTC 日在台北午夜後會錯位）
-  if (localStorage.getItem('tg-strong-sent') === today) return; // 每日一次，避免刷屏
-
-  const bullThresh = getThreshold('bull') + 15;
-  // 內容去重：今天已被進場訊號／簡報／重點關注推過的股票不再重推
-  const strong = allStocks.filter(s => s.analysis && verdictScore(s) >= bullThresh)
-    .filter(s => !tgKeySent(`sig:${s.id}`));
-  if (!strong.length) { localStorage.setItem('tg-strong-sent', today); return; }
-
-  const lines = strong.map(s => `${s.name}(${s.id}) 評分 ${verdictScore(s)}｜${verdictSignal(s)}`).join('\n');
-  tgPush(`📡 台股雷達 強勢多頭訊號\n${new Date().toLocaleString('zh-TW')}\n\n${lines}`);
-  localStorage.setItem('tg-strong-sent', today);
-  tgMarkKeys(strong.map(s => `sig:${s.id}`));
 }
 
 // ── 大盤 頂/底反轉可能性（儀表板）───────────────────────────────────────────
@@ -10869,8 +10871,8 @@ function classifyDayLoss(tr, s) {
 
 // 止損學習統計 → 回饋到選股（樣本足夠時提高對應條件的門檻）
 function dayLossLearnings() {
-  const done = getDayTrades().filter(t => t.status === 'loss' && t.lossCause);
-  const all = getDayTrades().filter(t => ['win', 'loss', 'flat'].includes(t.status));
+  const all = getDayTrades().filter(t => ['win', 'loss', 'flat'].includes(t.status)).slice(-LEARN_WINDOW);   // 衰減窗
+  const done = all.filter(t => t.status === 'loss' && t.lossCause);
   if (done.length < 3) return { n: done.length, total: all.length, rules: [], insufficient: true };
   const by = {};
   for (const t of done) (by[t.lossCause] = by[t.lossCause] || []).push(t);
@@ -10884,7 +10886,8 @@ function dayLossLearnings() {
                     'vwap-lost': '→ 已提高：進場價須在 VWAP 正確側',
                     'low-vol': '→ 已提高：ATR 門檻由 1.8% 拉高至 2.2%',
                     'no-chips': '→ 已提高：無法人籌碼者不列入訊號',
-                    'thin': '→ 已提高：成交金額門檻由 2 億拉高至 3 億' }[k] || '' };
+                    'thin': '→ 已提高：成交金額門檻由 2 億拉高至 3 億' }[k] || '',
+             active: learnState('day', k).on, status: learnStatusTxt('day', k) };
   }).sort((a, b) => b.n - a.n);
   return { n: done.length, total: all.length, rules, insufficient: false };
 }
@@ -10894,8 +10897,11 @@ function dayLearnedFilters() {
   const L = dayLossLearnings();
   const f = { minAtr: 1.8, minTurnover: 2e8, needChips: false, minIrs: -0.5, needVwapSide: false };
   if (L.insufficient) return f;
+  const settled = getDayTrades().filter(t => ['win', 'loss', 'flat'].includes(t.status));
+  const win = settled.slice(-LEARN_WINDOW);
+  const expNow = win.length ? win.reduce((a, b) => a + (b.retPct || 0), 0) / win.length : null;
   for (const r of L.rules) {
-    if (r.n < 2) continue;                      // 至少重複 2 次才視為模式
+    if (!learnGate('day', r.k, r.n, r.pct / 100, expNow, settled.length)) continue;
     if (r.k === 'low-vol') f.minAtr = 2.2;
     if (r.k === 'thin') f.minTurnover = 3e8;
     if (r.k === 'no-chips') f.needChips = true;
@@ -10932,13 +10938,16 @@ const DT_STRATEGIES = [
 ];
 
 // 單一策略的回測（同一引擎、不同參數；成本一律含買賣價差）
-function backtestStrategy(s, p, regimeFn) {
+function backtestStrategy(s, p, regimeFn, range = null) {
   const bars = s.ohlcv;
   if (!bars || bars.length < 40) return [];
   const closes = bars.map(b => b.close), highs = bars.map(b => b.high), lows = bars.map(b => b.low);
   const atr = btATR(highs, lows, closes);
   const trades = [];
-  for (let i = 21; i < bars.length - 1; i++) {
+  // range = { from, to }（0~1 比例）：走動式驗證用 —— 訓練段與驗證段分開
+  const i0 = Math.max(21, range ? Math.floor(bars.length * range.from) : 21);
+  const i1 = range ? Math.min(bars.length - 1, Math.floor(bars.length * range.to)) : bars.length - 1;
+  for (let i = i0; i < i1; i++) {
     const b = bars[i];
     if (p.regime && regimeFn && !regimeFn(b.time)) continue;
     const n = Math.min(20, i);
@@ -10979,7 +10988,7 @@ function backtestStrategy(s, p, regimeFn) {
 //  ・停損出場占比過高且贏單曾深回撤 → 停損放寬（被震出後才走）
 //  ・收盤虧損占比高 → 進場太弱：拉高量能與收盤位門檻
 //  ・達標率極低 → 停利太遠：下修 R；達標率很高 → 停利太近：上修 R
-function labTune(st, p, trades) {
+function labTune(st, p, trades, commit = true) {
   const n = trades.length;
   if (n < 20) return null;
   const wins = trades.filter(t => t.win), losses = trades.filter(t => !t.win);
@@ -11009,7 +11018,8 @@ function labTune(st, p, trades) {
     next.tgtR = +Math.min(3.0, p.tgtR + 0.25).toFixed(2);
     changes.push(`停利 ${p.tgtR}R→${next.tgtR}R（達標率 ${(tgtShare * 100).toFixed(0)}%，可要更多）`);
   }
-  if (!changes.length) return { changes: [], txt: '參數與失敗型態相稱，本輪不調整' };
+  if (!changes.length) return { changes: [], next, txt: '參數與失敗型態相稱，本輪不調整' };
+  if (!commit) return { changes, next, txt: changes.join('；') };
   // 寫入下一輪生效（有界由 effectiveStrategyParams 保證）
   try {
     const all = JSON.parse(localStorage.getItem('dt-strategy-tuned') || '{}');
@@ -11018,7 +11028,17 @@ function labTune(st, p, trades) {
     all[st.k] = { p: { stopPct: next.stopPct, tgtR: next.tgtR, closePos: next.closePos, volX: next.volX }, hist };
     localStorage.setItem('dt-strategy-tuned', JSON.stringify(all));
   } catch {}
-  return { changes, txt: changes.join('；') };
+  return { changes, next, txt: changes.join('；') };
+}
+// 寫入已驗證通過的調參
+function labCommitTune(st, next, changes, note) {
+  try {
+    const all = JSON.parse(localStorage.getItem('dt-strategy-tuned') || '{}');
+    const hist = (all[st.k]?.hist || []).slice(-10);
+    hist.push({ at: twClock().date, changes, note });
+    all[st.k] = { p: { stopPct: next.stopPct, tgtR: next.tgtR, closePos: next.closePos, volX: next.volX }, hist };
+    localStorage.setItem('dt-strategy-tuned', JSON.stringify(all));
+  } catch {}
 }
 
 function summarizeStrategy(trades) {
@@ -11076,27 +11096,45 @@ async function runStrategyLab() {
   let regimeFn = null;
   try { regimeFn = makeRegimeFn(await fetchTWIIOHLC(14)); } catch {}
 
+  // 走動式驗證：前 70% 為訓練段（調參用）、後 30% 為驗證段（排名用）。
+  // 同一份資料只調一次 —— 反覆在同一份資料上調參＝曲線擬合，只會越來越會解釋過去。
+  const lastBar = ready.map(s => s.ohlcv[s.ohlcv.length - 1]?.time).filter(Boolean).sort().pop();
+  const prev0 = getStrategyRank();
+  const sameData = prev0?.lastBar === lastBar;
+  const TRAIN = { from: 0, to: 0.7 }, TEST = { from: 0.7, to: 1 };
   const results = [];
   for (let k = 0; k < DT_STRATEGIES.length; k++) {
     const st = DT_STRATEGIES[k];
     const eff = effectiveStrategyParams(st);
-    const trades = [];
+    const train = [], test = [];
     for (const s of ready) {
-      try { trades.push(...backtestStrategy(s, eff, regimeFn)); } catch {}
+      try { train.push(...backtestStrategy(s, eff, regimeFn, TRAIN)); test.push(...backtestStrategy(s, eff, regimeFn, TEST)); } catch {}
     }
-    const tune = labTune(st, eff, trades);          // 實驗室也要學：從自己的回測結果調參
-    results.push({ ...st, p: eff, ...summarizeStrategy(trades), tune });
+    let tune = null;
+    if (!sameData) {
+      const cand = labTune(st, eff, train, false);      // 只用訓練段算候選參數
+      if (cand?.changes?.length) {
+        const testCand = [];
+        for (const s of ready) { try { testCand.push(...backtestStrategy(s, { ...eff, ...cand.next }, regimeFn, TEST)); } catch {} }
+        const before = summarizeStrategy(test), after = summarizeStrategy(testCand);
+        if (after.n >= 10 && after.avgNet > before.avgNet) {
+          labCommitTune(st, cand.next, cand.changes, `樣本外期望值 ${before.avgNet}%→${after.avgNet}%`);
+          tune = { changes: cand.changes, txt: `${cand.txt}（樣本外驗證通過：${before.avgNet}%→${after.avgNet}%，下輪生效）`, adopted: true };
+        } else tune = { changes: [], txt: `候選調整未通過樣本外驗證（${before.avgNet}%→${after.avgNet ?? '--'}%），不採用`, adopted: false };
+      } else tune = { changes: [], txt: cand?.txt || '訓練段樣本不足，不調整', adopted: false };
+    } else tune = { changes: [], txt: '資料未更新（同一份資料只調一次），沿用上次參數', adopted: false };
+    results.push({ ...st, p: eff, ...summarizeStrategy(test), inSample: summarizeStrategy(train), tune });
     el.innerHTML = `<div class="adv-loading">實驗進行中... ${k + 1}/${DT_STRATEGIES.length}（${st.name}）</div>`;
     await new Promise(r => setTimeout(r, 0));
   }
-  // 排名：樣本 ≥15 筆才有資格上榜（避免少樣本僥倖奪冠）
+  // 排名：以「驗證段」成績排名，樣本 ≥15 筆才有資格上榜
   const eligible = results.filter(r => r.n >= 15).sort((a, b) => b.score - a.score);
   const top = eligible.slice(0, 3).map(r => ({ k: r.k, name: r.name, score: r.score, winRate: r.winRate, avgNet: r.avgNet, n: r.n }));
   const prev = getStrategyRank();
   const changed = !prev || JSON.stringify(prev.top?.map(x => x.k)) !== JSON.stringify(top.map(x => x.k));
   try {
     localStorage.setItem('dt-strategy-rank', JSON.stringify({
-      at: twClock().date, universe: ready.length, all: results, top,
+      at: twClock().date, universe: ready.length, all: results, top, lastBar, sameData,
       prevTop: prev?.top?.map(x => x.name) || null, changed,
     }));
   } catch {}
@@ -11122,10 +11160,10 @@ function renderStrategyLab() {
       ${r.changed && r.prevTop ? `<div style="font-size:0.72rem;color:var(--yellow);margin-top:4px">🔄 本次已更換（原：${r.prevTop.join('、')}）</div>` : ''}
     </div>
     <div class="tbl-scroll"><table class="data-table" style="font-size:0.76rem">
-      <thead><tr><th>策略</th><th>樣本</th><th>勝率</th><th>期望值/筆</th><th>獲利因子</th><th>最大回撤</th><th>綜合分</th></tr></thead>
+      <thead><tr><th>策略</th><th>驗證段樣本</th><th>勝率</th><th>期望值/筆（樣本外）</th><th>獲利因子</th><th>最大回撤</th><th>綜合分</th></tr></thead>
       <tbody>${rows.map(x => `
         <tr style="${isTop(x.k) ? 'background:rgba(34,197,94,0.06)' : ''}">
-          <td><strong>${isTop(x.k) ? '🏆 ' : ''}${x.name}</strong><br><span style="font-size:0.68rem;color:var(--text3)">${x.desc}</span></td>
+          <td><strong>${isTop(x.k) ? '🏆 ' : ''}${x.name}</strong><br><span style="font-size:0.68rem;color:var(--text3)">${x.desc}${x.inSample?.n ? `｜訓練段 ${x.inSample.n} 筆 ${x.inSample.avgNet > 0 ? '+' : ''}${x.inSample.avgNet}%` : ''}</span></td>
           <td style="font-family:var(--mono)">${x.n || 0}</td>
           <td style="font-family:var(--mono)">${x.n ? x.winRate + '%' : '--'}</td>
           <td style="font-family:var(--mono);color:${x.avgNet > 0 ? 'var(--bull)' : 'var(--bear)'}">${x.n ? (x.avgNet > 0 ? '+' : '') + x.avgNet + '%' : '--'}</td>
@@ -11137,7 +11175,8 @@ function renderStrategyLab() {
     </table></div>
     <div style="font-size:0.7rem;color:var(--text3);margin-top:8px;line-height:1.7">
       ${r.at} 實驗｜掃描池 ${r.universe} 檔｜報酬皆已扣除全成本（手續費＋交易稅＋買賣價差）<br>
-      上榜門檻為樣本 ≥15 筆；綜合分＝期望值×樣本折扣，避免少樣本僥倖奪冠。每次執行都會重新排名，表現變差的策略會被換掉。<br>
+      走動式驗證：前 70% 資料調參、後 30% 驗證，排名與上榜只看驗證段（樣本外）；調參只有在樣本外期望值改善時才採用，且同一份資料只調一次${r.sameData ? '（本次資料未更新，未重新調參）' : ''}。<br>
+      上榜門檻為驗證段樣本 ≥15 筆；綜合分＝期望值×樣本折扣，避免少樣本僥倖奪冠。<br>
       <span style="color:var(--yellow)">誠實界限：回測用日 K 近似日內（隔日開盤進場、觸價出場、收盤平倉），無免費分鐘級歷史資料 — 實際日內走勢會有差異，排名用於相對比較而非絕對報酬預期。</span>
     </div>`;
 }
@@ -11259,7 +11298,7 @@ function renderDayLog() {
         ? `<div style="font-size:0.75rem;color:var(--text3);margin-top:4px">已結算 ${L.total} 筆、止損 ${L.n} 筆 — 需累積 3 筆止損才開始歸納原因。系統會誠實等樣本，不憑空給結論。</div>`
         : `<div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.8">
             共 ${L.n} 筆止損（總結算 ${L.total} 筆）：<br>
-            ${L.rules.map(r => `・<strong>${r.txt.split(' —')[0]}</strong>　${r.n} 次（${r.pct}%）<span style="color:var(--bull)">${r.fix}</span>`).join('<br>')}
+            ${L.rules.map(r => `・<strong>${r.txt.split(' —')[0]}</strong>　${r.n} 次（${r.pct}%）${r.active ? `<span style="color:var(--bull)">${r.fix}</span>` : ''}<br><span style="font-size:0.7rem;color:var(--text3)">　${r.status}</span>`).join('<br>')}
            </div>`}
     </div>`;
 
