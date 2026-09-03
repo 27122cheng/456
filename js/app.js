@@ -254,7 +254,14 @@ async function runScan() {
     } catch {}
   }).catch(() => {});
   // 使用者於目錄頁啟用的額外資料集，之後自動補上優先序清單（不重複、有預算）
-  loadEnabledDatasets().catch(() => {}).then(() => loadAutoDatasets().catch(e => console.warn('自動資料集載入失敗:', e)));
+  loadEnabledDatasets().catch(() => {})
+    .then(() => loadAutoDatasets().catch(e => console.warn('自動資料集載入失敗:', e)))
+    .then(() => {
+      // 資料集是掃描後才到位：不讓研判快取失效，個股頁與排名會一直用「資料到位前」的研判
+      let n = 0;
+      for (const s of allStocks) if (s._oapi && Object.keys(s._oapi).length) { delete s._verdict; n++; }
+      if (n) { try { renderLiveTick(); } catch {} }
+    });
   // FinMind 啟用的資料集（每檔一請求，故只取重點標的）
   (async () => {
     const prio = [currentStockId, ...getHoldings().map(h => h.id),
@@ -2780,6 +2787,19 @@ function buildEntryPlan(s, m) {
   // 大戶偵測結果（已通過陷阱檢查者）直接寫進進場理由 — 不再獨立推播
   const wh = whaleFor(s.id);
   if (wh) support.chips.push(`🐋 大戶動向：${wh.sig.slice(0, 2).join('；')}（已通過誘多/出貨陷阱檢查）`);
+  // 官方額外資料集（借券／董監質押／庫藏股／營益分析／減資…）：
+  // 多方訊號進「依據」、空方訊號進「資料面警示」—— 進場前兩邊都要看得到
+  const dataWarns = [];
+  if (s._oapi) {
+    for (const [path, row] of Object.entries(s._oapi)) {
+      for (const [k, v] of Object.entries(row)) {
+        const sig = oapiFieldSignal(path, k, v, s);
+        if (!sig || sig.w <= 0 || sig.dir === 0) continue;
+        if (sig.dir > 0) (/營業利益率|純益率/.test(sig.label) ? support.fund : support.chips).push(`📚 ${sig.txt}`);
+        else dataWarns.push(sig.txt);
+      }
+    }
+  }
   // 大戶籌碼
   const streak = instStreak(s.id);
   if (s.foreign > 1000) support.chips.push(`外資買超 ${s.foreign.toLocaleString()} 張`);
@@ -2994,7 +3014,7 @@ function buildEntryPlan(s, m) {
 
   return {
     ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn, sizing, lessonWarns,
-    scale, costPct, scen, cat,
+    scale, costPct, scen, cat, dataWarns,
     netReward1: t1 ? +((t1 - lo) / lo * 100 - costPct).toFixed(2) : null,
     conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
@@ -3078,6 +3098,7 @@ function entryPlanHtml(s, m) {
       ${(() => { const hw = heatWarning(); return hw ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">${hw}</div>` : ''; })()}
       ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
       ${(p.lessonWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">🧠 教訓提醒：${w}</div>`).join('')}
+      ${(p.dataWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">📚 官方資料警示：${w}</div>`).join('')}
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
         📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險 ${p.sizing.riskPctUsed}%${p.sizing.kellyBased ? '（依 ≥30 筆實績的半凱利，非固定值）' : '（固定上限，累積 30 筆實績後改依半凱利）'} 計算，
         可買 <strong style="color:var(--blue)">${p.sizing.shares} 張</strong>（約 ${(p.sizing.posValue/10000).toFixed(1)} 萬，佔 ${p.sizing.posPct}% 資金）；
@@ -8699,6 +8720,16 @@ function computeDayTradePicks() {
     ];
     if (irs) why.push(`${irs.txt} — ${(pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak) ? '與大盤同向且明顯領先，選邊正確' : '方向一致但領先幅度普通'}`);
     else why.push('日內相對強度：尚無今日 5 分 K（開盤後累積中，屆時會自動納入選邊判斷）');
+    if (s._oapi) {
+      for (const [path, row] of Object.entries(s._oapi)) {
+        for (const [k, v] of Object.entries(row)) {
+          const sig = oapiFieldSignal(path, k, v, s);
+          if (!sig || sig.w <= 0 || sig.dir === 0) continue;
+          const same = (long && sig.dir > 0) || (!long && sig.dir < 0);
+          why.push(`${same ? '📚' : '⚠ 📚'} 官方資料：${sig.txt}${same ? '' : '（與本單方向相反，部位宜縮）'}`);
+        }
+      }
+    }
     if (newsScore !== 0) why.push(`新聞面：近 7 日${newsScore > 0 ? '偏多' : '偏空'}（${_newsSignals.stocks[s.id].items?.[0] || ''}）`);
     if (ld?.toUp != null) why.push(`距漲停 ${ld.toUp}%／距跌停 ${ld.toDown}%`);
     if (dFin != null && dFin > 0 && volZ > 0 && dFin >= volZ * 0.08) why.push(`⚠ 融資大增 ${dFin.toLocaleString()} 張，散戶追價籌碼偏髒`);
@@ -9313,7 +9344,8 @@ function notifyEntrySignals() {
       `　1R ${(p.lo * 2 - p.stop).toFixed(2)} 先減半、停損上移成本\n` +
       `　依據：${sup.join('・') || '技術面轉強'}` +
       (p.scen ? `\n　情境：樂觀 +${p.scen.optimistic}%／中性 +${p.scen.neutral}%／悲觀 ${p.scen.pessimistic}%${p.scen.asym ? '（⚠ 不對稱）' : ''}` : '') +
-      (p.cat ? `\n　續漲動力：${p.cat.n ? p.cat.links.slice(0, 2).map(l => l.txt.split('：')[0]).join('＋') : '❌ 說不出來，僅氣氛'}${p.cat.pricedIn ? '（⚠ 利多可能已反映）' : ''}` : '');
+      (p.cat ? `\n　續漲動力：${p.cat.n ? p.cat.links.slice(0, 2).map(l => l.txt.split('：')[0]).join('＋') : '❌ 說不出來，僅氣氛'}${p.cat.pricedIn ? '（⚠ 利多可能已反映）' : ''}` : '') +
+      (p.dataWarns?.length ? `\n　📚 官方資料警示：${p.dataWarns.slice(0, 2).join('；')}` : '');
   }).join('\n\n');
 
   // 當沖參考獨立列出（極高風險，僅日線資料篩選）
