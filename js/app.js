@@ -719,8 +719,9 @@ function marketRegime() {
   // ② 國際連動（25%）— 保留但降權：同步指標
   const intlPts = (outlookData.factors || []).reduce((n, f) => n + scoreFactor(f).pts, 0);
   const intlMax = OUTLOOK_SYMBOLS.reduce((n, c) => n + Math.abs(c.weight) * (c.type === 'vix' ? 2 : 1), 0) || 1;
+  const intlMult = (() => { try { return marketLearnedRules().intlMult; } catch { return 1; } })();
   if (outlookData.factors?.length)
-    add('國際連動', intlPts / intlMax * 2, 0.25,
+    add('國際連動', intlPts / intlMax * 2, 0.25 * intlMult,
         `費半/美股/VIX 綜合（${intlPts >= 0 ? '+' : ''}${intlPts.toFixed(1)}）`);
 
   // ③ 市場寬度與其動能（20%）— 寬度「正在改善/惡化」比絕對值更有預測力
@@ -2139,6 +2140,42 @@ function revenueMomentum(stockId) {
 // 持有期、長線出場價、關鍵風險。s._inst / s._oi / s._mtf 到齊時自動升級。
 // 證據家族上限：任何單一家族最多貢獻這麼多方向分，避免同質證據堆疊
 const FAMILY_CAP = { trend: 3.0, momentum: 2.5, volume: 2.5, chips: 3.0, fund: 2.5, context: 2.0, news: 0.8, risk: 3.0 };
+const FAMILY_NAME = { trend: '技術：趨勢', momentum: '技術：動能', volume: '量能', chips: '籌碼', fund: '基本面', context: '環境', news: '新聞', risk: '風險' };
+
+// ── 證據家族的「看錯學習」──────────────────────────────────────────────────
+// 每筆系統發出的交易在建檔時存下各家族的貢獻方向；結算後比對結果，
+// 就知道「這次是技術面看錯、還是籌碼面看錯」。累積後長期看錯的家族自動降權。
+function famSnapshot(m) {
+  const o = {};
+  for (const [f, v] of Object.entries(m?.fams || {})) if (Math.abs(v.contrib) >= 0.5) o[f] = +v.contrib.toFixed(2);
+  return Object.keys(o).length ? o : null;
+}
+// outcomeSign：多單獲利 +1／虧損 -1；空單獲利 -1（空方證據對）／虧損 +1
+function famHits(snap, outcomeSign) {
+  if (!snap || !outcomeSign) return null;
+  const h = {};
+  for (const [f, c] of Object.entries(snap)) h[f] = Math.sign(c) === outcomeSign;
+  return h;
+}
+// 全部系統交易（波段＋當沖＋長期剔除）最近 60 筆的家族命中率
+function familyAccuracy() {
+  const rows = [];
+  for (const t of getAiSignals()) if (t.status !== 'open' && t.famHits) rows.push(t.famHits);
+  for (const t of getDayTrades()) if (['win', 'loss'].includes(t.status) && t.famHits) rows.push(t.famHits);
+  try { for (const r of JSON.parse(localStorage.getItem('lt-removals') || '[]')) if (r.famHits) rows.push(r.famHits); } catch {}
+  const win = rows.slice(-60);
+  const acc = {};
+  for (const h of win) for (const [f, ok] of Object.entries(h)) { const o = acc[f] = acc[f] || { n: 0, hit: 0 }; o.n++; if (ok) o.hit++; }
+  for (const f of Object.keys(acc)) acc[f].pct = Math.round(acc[f].hit / acc[f].n * 100);
+  return acc;
+}
+// 家族上限校正倍數（樣本 ≥15 才調；0.6~1.25）：長期看錯的家族說話小聲一點
+function familyCapAdj() {
+  const acc = familyAccuracy();
+  const adj = {};
+  for (const [f, a] of Object.entries(acc)) if (a.n >= 15) adj[f] = +Math.max(0.6, Math.min(1.25, 0.6 + (a.pct / 100) * 1.3)).toFixed(2);
+  return adj;
+}
 function evidenceFamily(e) {
   if (e.kind === 'chip') return 'chips';
   if (e.kind === 'fund') return 'fund';
@@ -2583,6 +2620,7 @@ function buildManagerAnalysis(s) {
   // 改為：每項證據歸入家族，家族貢獻設上限；方向＝家族貢獻相加；
   // 一致性改在「家族之間」算 —— 七項趨勢證據同向只算一票。
   const fams = {};
+  const famAdj = (() => { try { return familyCapAdj(); } catch { return {}; } })();
   for (const e of ev) {
     const f = evidenceFamily(e); e.fam = f;
     const o = fams[f] = fams[f] || { raw: 0, w: 0, n: 0 };
@@ -2590,7 +2628,7 @@ function buildManagerAnalysis(s) {
   }
   let dir = 0, absSum = 0;
   for (const [f, o] of Object.entries(fams)) {
-    const cap = FAMILY_CAP[f] ?? 2.0;
+    const cap = (FAMILY_CAP[f] ?? 2.0) * (famAdj[f] ?? 1);
     o.contrib = +Math.max(-cap, Math.min(cap, o.raw)).toFixed(2);
     dir += o.contrib; absSum += Math.abs(o.contrib);
   }
@@ -2625,6 +2663,7 @@ function buildManagerAnalysis(s) {
 
   // 信心度：一致性 × 證據充分度 —— 充分度看「有幾個家族發聲」，不看證據件數
   //（同一家族堆 20 件證據不等於充分，五個家族各一件才是）
+  for (const [f, mult] of Object.entries(famAdj)) if (mult < 0.9 && fams[f]) notes.push(`🎓 家族校正：${FAMILY_NAME[f] || f}近 60 筆命中率偏低，貢獻上限 ×${mult}`);
   const famCount = Object.keys(fams).filter(f => f !== 'risk').length;
   const coverage = Math.min(1, famCount / 5);
   const conf = Math.round(agr * coverage * 100);
@@ -5834,6 +5873,7 @@ function recordAiSignals() {
         trend: s.analysis.trend?.phase ?? null,
         maturity: s.analysis.trend?.maturity ?? null,
         revYoy: s.rev?.yoy ?? null,
+        fams: famSnapshot(m),
         brk: s.analysis.brk?.type ?? null,
       },
     });
@@ -5997,11 +6037,13 @@ function updateAiSignals() {
         Object.assign(t, { status: 'loss', exitDate: b.time, exitPrice: +stopAdj.toFixed(2),
           retPct: +((stopAdj + cum - t.entry) / t.entry * 100).toFixed(2), exitReason: '跌破停損' });
         Object.assign(t, classifySwingLoss(t, s));   // 止損學習：這次為什麼賠
+        t.famHits = famHits(t.ctx?.fams, -1);
         changed = true; break;
       }
       if (!t.holdOn && t1Adj != null && b.high >= t1Adj) {
         Object.assign(t, { status: 'win', exitDate: b.time, exitPrice: +t1Adj.toFixed(2),
           retPct: +((t1Adj + cum - t.entry) / t.entry * 100).toFixed(2), exitReason: '達目標停利' });
+        t.famHits = famHits(t.ctx?.fams, 1);
         changed = true; break;
       }
       if (seen >= 20) {
@@ -6009,6 +6051,7 @@ function updateAiSignals() {
         Object.assign(t, { status: ret >= 0 ? 'win' : 'loss', exitDate: b.time,
           exitPrice: b.close, retPct: ret, exitReason: '20 日到期結算' });
         if (ret < 0) Object.assign(t, classifySwingLoss(t, s));
+        t.famHits = famHits(t.ctx?.fams, ret >= 0 ? 1 : -1);
         changed = true; break;
       }
     }
@@ -8792,7 +8835,8 @@ function recordLtRemoval(it, s, why) {
   try {
     const log = JSON.parse(localStorage.getItem('lt-removals') || '[]');
     log.push({ id: it.id, name: it.name, addedAt: it.addedAt, removedAt: twClock().date, cause, why, ret,
-               held: tradingDaysBetween(it.addedAt, twClock().date) });
+               held: tradingDaysBetween(it.addedAt, twClock().date),
+               famHits: famHits(it.fams, ret != null ? (ret >= 0 ? 1 : -1) : null) });
     localStorage.setItem('lt-removals', JSON.stringify(log.slice(-200)));
   } catch {}
 }
@@ -8873,7 +8917,7 @@ function updateLongTermList() {
         if (!why) continue;
         const twNow0 = _twiiSeries?.length ? _twiiSeries[_twiiSeries.length - 1].close : null;
         out.push({ id: pk.s.id, name: pk.s.name, addedAt: twClock().date,
-                   basePrice: +pk.s.analysis.price.toFixed(2),
+                   basePrice: +pk.s.analysis.price.toFixed(2), fams: famSnapshot(pk.m),
                    twiiBase: twNow0 ? +twNow0.toFixed(0) : null,   // 同日大盤基準 → 之後算 alpha
                    why: why.slice(0, 4) });
         changed = true;
@@ -9520,7 +9564,41 @@ function renderExpectancy() {
     })()}`;
 }
 
+// ── 系統學習總覽：所有會影響判斷的元件，各自的「看錯學習」狀態一次看完 ──
+function renderLearningOverview() {
+  const el = document.getElementById('learning-overview-body');
+  if (!el) return;
+  const row = (icon, name, body) => `<div style="padding:8px 11px;border-radius:8px;background:rgba(255,255,255,0.02);margin-bottom:6px">
+    <div style="font-size:0.78rem;font-weight:700;color:var(--text2)">${icon} ${name}</div>
+    <div style="font-size:0.73rem;color:var(--text3);line-height:1.7;margin-top:2px">${body}</div></div>`;
+  const rulesTxt = L => L.insufficient ? `樣本累積中（止損 ${L.n} 筆，需 3 筆起）`
+    : L.rules.map(r => `${r.txt.split(' —')[0]} ${r.n} 次${r.active ? '（已加嚴）' : ''}`).join('・');
+  let day, swing, lt, fam, mkt, lab;
+  try { day = rulesTxt(dayLossLearnings()); } catch { day = '—'; }
+  try { swing = rulesTxt(aiLossLearnings()); } catch { swing = '—'; }
+  try { const L = ltLearnings(); lt = L.insufficient ? `樣本累積中（剔除 ${L.n} 筆，需 3 筆起）` : L.rules.map(r => `${r.txt} ${r.n} 次${r.active ? '（已加嚴）' : ''}`).join('・'); } catch { lt = '—'; }
+  try {
+    const acc = familyAccuracy(), adj = familyCapAdj();
+    const parts = Object.entries(acc).map(([f, a]) => `${FAMILY_NAME[f] || f} ${a.pct}%（${a.n}）${adj[f] ? ` ×${adj[f]}` : ''}`);
+    fam = parts.length ? parts.join('・') + '<br><span style="font-size:0.68rem">樣本 ≥15 的家族才調整貢獻上限（0.6~1.25）；命中率低的家族自動降權</span>' : '尚無已結算交易的家族快照';
+  } catch { fam = '—'; }
+  try { const L = marketMissLearnings(); const acc = componentAccuracy();
+    const comp = Object.entries(acc).map(([k, a]) => `${k} ${a.pct?.toFixed(0) ?? '--'}%（${a.n}）`).join('・');
+    mkt = (L.insufficient ? `誤判原因：累積中（${L.n}/3）` : `誤判原因：${L.rules.map(r => `${r.txt.split(' —')[0]} ${r.n} 次${r.active ? '（已加嚴）' : ''}`).join('・')}`) + (comp ? `<br>成分命中率：${comp}` : '');
+  } catch { mkt = '—'; }
+  try { const r = getStrategyRank(); lab = r ? `現行前三：${r.top.map(x => x.name).join('、') || '無達標策略'}｜${r.at} 實驗（走動式驗證，${r.sameData ? '資料未更新未調參' : '已對訓練段調參並以驗證段把關'}）` : '尚未執行實驗'; } catch { lab = '—'; }
+  el.innerHTML =
+    row('⚡', '當沖止損學習（系統訊號）', day) +
+    row('📈', '波段止損學習（系統訊號）', swing) +
+    row('🏛', '長期剔除學習', lt) +
+    row('🧬', '證據家族看錯校正（技術／量能／籌碼／基本面／環境）', fam) +
+    row('🌐', '大盤看法看錯學習', mkt) +
+    row('🧪', '策略實驗室', lab) +
+    `<div style="font-size:0.68rem;color:var(--text3);margin-top:4px">所有學習皆來自系統自己發出的交易與預測，不需使用者手動結案；每條加嚴規則都受安全閥保護（≥5 次且占 ≥30% 才啟用、20 筆後期望值未改善自動回退）。</div>`;
+}
+
 function renderJournal() {
+  renderLearningOverview();
   renderExpectancy();
   renderJournalStats();
   renderEquityChart();
@@ -9755,8 +9833,17 @@ function recordPredictions() {
     date: today,
     // 只有「分數夠強 且 成分方向一致」才算方向預測；分歧時記為中性（不計分）
     // — 過去無論信心度多低都硬給方向，是命中率偏低的主因之一
+    // 記錄當時 5 日內的重大事件與各成分方向 → 誤判時能回答「為什麼看錯」
+    evts: (() => { try { return imminentEvents(5).map(e => e.name).slice(0, 4); } catch { return []; } })(),
     market: twii ? { norm, conf, kind: outlookData.regime?.kind ?? null,
-                     dir: (conf == null || conf >= 0.35) ? (norm >= 15 ? 1 : norm <= -15 ? -1 : 0) : 0,
+                     dir: (() => {
+                       const MR = (() => { try { return marketLearnedRules(); } catch { return { minConf: 0.35 }; } })();
+                       if (conf != null && conf < MR.minConf) return 0;
+                       if (MR.noTransition && outlookData.regime?.kind === 'transition') return 0;
+                       if (MR.noEvent) { try { if (imminentEvents(5).some(e => /FOMC|結算|央行|CPI|非農/.test(e.name))) return 0; } catch {} }
+                       if (MR.neutralOnDiv) { const c = outlookData.regime?.comps || []; const t = c.find(x => x.k === '大盤技術結構'), b = c.find(x => x.k === '市場寬度'); if (t && b && Math.sign(t.score) * Math.sign(b.score) < 0) return 0; }
+                       return norm >= 15 ? 1 : norm <= -15 ? -1 : 0;
+                     })(),
                      twii } : null,
     breadth: ready.length ? +(bullN / ready.length).toFixed(3) : null,
     // 各成分當下方向快照 → 結算後可回推「哪個成分真的準」，供權重自我校正
@@ -9790,6 +9877,7 @@ function resolvePredictions() {
       if (p.market.dir !== 0) {
         // 漲跌幅小於 0.5% 視為持平，不算命中也不算失誤
         p.market.hit = Math.abs(chg) < 0.5 ? null : (chg > 0) === (p.market.dir > 0);
+        if (p.market.hit === false) Object.assign(p.market, classifyMarketMiss(p, chg));   // 看錯要能說出為什麼
       } else {
         p.market.hit = null;
       }
@@ -9816,6 +9904,60 @@ function resolvePredictions() {
     changed = true;
   }
   if (changed) savePredLog(log);
+}
+
+// ── 大盤看法的看錯學習 ──────────────────────────────────────────────────
+const MARKET_MISS_RULES = [
+  { k: 'event',        txt: '事件衝擊 — 預測窗口內有重大事件（FOMC/結算/財報等），方向被事件改寫',
+    hit: p => (p.evts || []).some(n => /FOMC|結算|央行|CPI|非農|法說|營收/.test(n)) },
+  { k: 'low-conf',     txt: '低信心仍給方向 — 成分分歧（信心 <50%）時的方向預測本來就接近擲硬幣',
+    hit: p => p.market.conf != null && p.market.conf < 0.5 },
+  { k: 'regime-shift', txt: '盤性轉換 — 預測時的盤性與結算時不同（趨勢↔盤整），舊邏輯失效',
+    hit: p => p.market.kind && outlookData.regime?.kind && p.market.kind !== outlookData.regime.kind },
+  { k: 'breadth-div',  txt: '寬度背離被忽略 — 預測時技術結構與市場寬度方向相反',
+    hit: p => p.comps && p.comps['大盤技術結構'] != null && p.comps['市場寬度'] != null && Math.sign(p.comps['大盤技術結構']) * Math.sign(p.comps['市場寬度']) < 0 },
+  { k: 'intl-reverse', txt: '國際連動反向 — 預測方向跟著國際指數，但台股走自己的',
+    hit: (p, chg) => p.comps && p.comps['國際連動'] != null && Math.sign(p.comps['國際連動']) !== Math.sign(chg) && Math.abs(p.comps['國際連動']) >= 0.3 },
+];
+function classifyMarketMiss(p, chg) {
+  for (const r of MARKET_MISS_RULES) { let h = false; try { h = r.hit(p, chg); } catch {} if (h) return { missCause: r.k, missCauseTxt: r.txt }; }
+  return { missCause: 'other', missCauseTxt: '無單一主因 — 屬正常機率內的誤判' };
+}
+function marketMissLearnings() {
+  const done = getPredLog().filter(p => p.resolved && p.market && (p.market.hit === true || p.market.hit === false)).slice(-LEARN_WINDOW);
+  const miss = done.filter(p => p.market.hit === false && p.market.missCause);
+  if (miss.length < 3) return { n: miss.length, total: done.length, rules: [], insufficient: true };
+  const by = {};
+  for (const p of miss) (by[p.market.missCause] = by[p.market.missCause] || []).push(p);
+  const fix = { 'low-conf': '→ 已加嚴：方向預測的信心門檻由 35% 提高到 50%',
+                'regime-shift': '→ 已加嚴：盤性「轉換中」時不給方向預測',
+                'event': '→ 已加嚴：5 日內有重大事件時不給方向預測',
+                'breadth-div': '→ 已加嚴：技術結構與寬度相反時降為中性',
+                'intl-reverse': '→ 已調整：國際連動成分權重再降 20%' };
+  const rules = Object.entries(by).map(([k, arr]) => ({
+    k, n: arr.length, pct: Math.round(arr.length / miss.length * 100),
+    txt: MARKET_MISS_RULES.find(r => r.k === k)?.txt || '其他', fix: fix[k] || '',
+    active: learnState('mkt', k).on, status: learnStatusTxt('mkt', k),
+  })).sort((a, b) => b.n - a.n);
+  return { n: miss.length, total: done.length, rules, insufficient: false };
+}
+// 學到的大盤預測門檻（透過安全閥啟用/回退；期望值＝近期命中率）
+function marketLearnedRules() {
+  const r = { minConf: 0.35, noTransition: false, noEvent: false, neutralOnDiv: false, intlMult: 1 };
+  const L = marketMissLearnings();
+  if (L.insufficient) return r;
+  const done = getPredLog().filter(p => p.resolved && p.market && (p.market.hit === true || p.market.hit === false));
+  const win = done.slice(-LEARN_WINDOW);
+  const hitRate = win.length ? win.filter(p => p.market.hit).length / win.length : null;
+  for (const x of L.rules) {
+    if (!learnGate('mkt', x.k, x.n, x.pct / 100, hitRate, done.length)) continue;
+    if (x.k === 'low-conf') r.minConf = 0.5;
+    if (x.k === 'regime-shift') r.noTransition = true;
+    if (x.k === 'event') r.noEvent = true;
+    if (x.k === 'breadth-div') r.neutralOnDiv = true;
+    if (x.k === 'intl-reverse') r.intlMult = 0.8;
+  }
+  return r;
 }
 
 function computePredAccuracy() {
@@ -9868,6 +10010,11 @@ function renderPredAccuracy() {
       🎯 高信心預測（成分一致性 ≥60%）命中率 <strong style="color:${col(a.marketHiConf.pct)}">${a.marketHiConf.pct.toFixed(0)}%</strong>（${a.marketHiConf.n} 次）
       ${a.market.pct != null && a.marketHiConf.pct > a.market.pct ? `— 高於整體 ${a.market.pct.toFixed(0)}%，信心度閘門有效：低信心時觀望才是對的` : ''}
     </div>` : ''}
+    ${(() => { const L = marketMissLearnings(); return `<div style="margin-top:8px;padding:8px 11px;border-radius:7px;background:rgba(0,212,255,0.05);border-left:3px solid var(--blue);font-size:0.75rem;color:var(--text2);line-height:1.8">
+      <div style="font-weight:700;color:var(--blue)">🎓 大盤看錯學習</div>
+      ${L.insufficient ? `已驗證 ${L.total} 次、誤判 ${L.n} 次 — 需累積 3 次誤判才開始歸納原因`
+        : L.rules.map(r => `・<strong>${r.txt.split(' —')[0]}</strong>　${r.n} 次（${r.pct}%）${r.active ? `<span style="color:var(--bull)">${r.fix}</span>` : ''}<br><span style="font-size:0.7rem;color:var(--text3)">　${r.status}</span>`).join('<br>')}
+    </div>`; })()}
     <div style="margin-top:10px;font-size:0.78rem;color:var(--text3);line-height:1.7">
       ${a.pending > 0 ? `目前有 <strong style="color:var(--blue)">${a.pending}</strong> 筆預測驗證中（滿 ${PRED_HOLD_DAYS} 天自動結算）。` : ''}
       ${enough
@@ -10906,10 +11053,16 @@ function recordDayTradeSignals() {
         chips: d.hasChips,
       },
       why: d.why.slice(0, 4),
+      fams: famSnapshot(d.m),
     });
     changed = true;
   }
   if (changed) saveDayTrades(list);
+}
+function dayFamOutcome(tr) {   // 多單獲利 +1／虧損 -1；空單相反
+  if (!['win', 'loss'].includes(tr.status)) return 0;
+  const w = tr.status === 'win' ? 1 : -1;
+  return tr.side === 'short' ? -w : w;
 }
 
 // 盤中結算：觸及止盈／止損／收盤前平倉
@@ -10936,6 +11089,7 @@ function settleDayTrades() {
       tr.status = 'loss'; tr.exit = tr.stop; tr.exitReason = '觸及止損';
       tr.r = -1; tr.retPct = +(((long ? tr.stop - tr.entry : tr.entry - tr.stop) / tr.entry * 100) - tr.cost).toFixed(2);
       Object.assign(tr, classifyDayLoss(tr, s));   // 止損學習：分類失敗原因
+      tr.famHits = famHits(tr.fams, dayFamOutcome(tr));
       logSignal('exit', `${tr.name}（${tr.id}）當沖止損`, `${tr.lossCauseTxt}｜淨 ${tr.retPct}%`,
         { id: tr.id, dir: -1, dedupKey: `dtstop-${tr.id}` });
       changed = true;
@@ -10943,6 +11097,7 @@ function settleDayTrades() {
       tr.status = 'win'; tr.exit = tr.target; tr.exitReason = '觸及止盈';
       tr.r = +(Math.abs(tr.target - tr.entry) / risk).toFixed(2);
       tr.retPct = +((Math.abs(tr.target - tr.entry) / tr.entry * 100) - tr.cost).toFixed(2);
+      tr.famHits = famHits(tr.fams, dayFamOutcome(tr));
       changed = true;
     } else if (mins >= 13 * 60 + 25) {             // 收盤前一律平倉
       tr.status = px === tr.entry ? 'flat' : ((long ? px > tr.entry : px < tr.entry) ? 'win' : 'loss');
@@ -10950,6 +11105,7 @@ function settleDayTrades() {
       tr.r = +(((long ? px - tr.entry : tr.entry - px)) / risk).toFixed(2);
       tr.retPct = +((((long ? px - tr.entry : tr.entry - px)) / tr.entry * 100) - tr.cost).toFixed(2);
       if (tr.status === 'loss') Object.assign(tr, classifyDayLoss(tr, s));
+      tr.famHits = famHits(tr.fams, dayFamOutcome(tr));
       changed = true;
     }
   }
