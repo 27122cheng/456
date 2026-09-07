@@ -2138,6 +2138,92 @@ function revenueMomentum(stockId) {
 // 綜合技術、趨勢強度、動能、量能、法人籌碼、融資融券 O.I、多週期、波動、
 // 相對位置，輸出一位資深操盤手的完整決策：方向、當沖適配、進出場點位、
 // 持有期、長線出場價、關鍵風險。s._inst / s._oi / s._mtf 到齊時自動升級。
+// ── 主力誘多／洗盤判別 ─────────────────────────────────────────────────────
+// 「看起來要突破，實際可能是在出貨。」誘多與洗盤表面都是漲勢中的震盪，
+// 差別在：位置（階段高點 vs 上升途中）、量價（放量不漲 vs 回檔縮量）、
+// 籌碼（邊拉邊賣 vs 法人續抱）、後續（跌破關鍵位 vs 回踩守住）。
+// 這裡把六個訊號各自命名計分，給出 trap／caution／washout／none 的結論。
+function trapAnalysis(s) {
+  const a = s?.analysis, bars = s?.ohlcv;
+  if (!a || !bars || bars.length < 30) return null;
+  const n = bars.length, last = bars[n - 1];
+  const vols = bars.map(b => b.volume);
+  const avgV = vols.slice(-21, -1).reduce((x, y) => x + y, 0) / 20 || 1;
+  const trap = [], wash = [];
+  const T = (k, w, txt) => trap.push({ k, w, txt }), W = (k, w, txt) => wash.push({ k, w, txt });
+
+  // ① 位置：階段高點／前高壓力位 vs 上升途中
+  const hi60 = Math.max(...bars.slice(Math.max(0, n - 61), n - 1).map(b => b.high));
+  const nearHigh = last.close >= hi60 * 0.97;
+  const trendUp = !!(a.trend?.phase && /up/.test(a.trend.phase));
+  if (a.pctile?.zone === 'high' || nearHigh)
+    T('pos', 2, `位置偏高：${a.pctile?.zone === 'high' ? '長期高位階' : ''}${a.pctile?.zone === 'high' && nearHigh ? '＋' : ''}${nearHigh ? '貼近前高／壓力位 ' + hi60.toFixed(2) : ''}`);
+  else if (trendUp && a.pctile?.zone !== 'high') W('pos', 1.5, '位置在上升途中（非階段高點）');
+
+  // ② 量價：近 3 根放量不漲／衝高回落 vs 近 5 日回檔縮量
+  let noGain = 0, upperTail = 0;
+  for (let i = n - 3; i < n; i++) {
+    const b = bars[i], prev = bars[i - 1];
+    const volR = b.volume / avgV, ret = (b.close - prev.close) / prev.close * 100;
+    const rng = b.high - b.low, tail = rng > 0 ? (b.high - Math.max(b.open, b.close)) / rng : 0;
+    if (volR >= 1.5 && ret < 0.5) noGain++;
+    if (volR >= 1.5 && tail >= 0.4) upperTail++;
+  }
+  if (noGain >= 1) T('vol', 2, `放量不漲：近 3 日有 ${noGain} 天量放大 1.5 倍以上但漲幅不到 0.5%`);
+  if (upperTail >= 1) T('tail', 2, `衝高回落：近 3 日有 ${upperTail} 天放量收長上影線（邊拉邊出的痕跡）`);
+  const pull = [];
+  for (let i = n - 5; i < n; i++) if (bars[i].close < bars[i - 1].close) pull.push(bars[i]);
+  if (pull.length) {
+    const pv = pull.reduce((x, b) => x + b.volume, 0) / pull.length;
+    const depth = (Math.min(...pull.map(b => b.low)) / hi60 - 1) * 100;
+    if (pv < avgV * 0.8 && depth > -8 && trendUp) W('vol', 2, `回檔縮量：近 5 日回檔日均量僅均量 ${(pv / avgV * 100).toFixed(0)}%（洗盤特徵，籌碼安定）`);
+    else if (pv >= avgV * 1.3) T('pullvol', 1, `回檔放量：回檔日量為均量 ${(pv / avgV * 100).toFixed(0)}%，跌時有人急著出`);
+  }
+
+  // ③ 假突破：盤中站上前高、收盤站不穩
+  if (a.falseBreak?.type === 'upthrust') T('fake', 2.5, `假突破（Upthrust）：${a.falseBreak.txt}`);
+  else {
+    let fake = false;
+    // 站不穩＝盤中越過前高、收盤既跌回前高之下又收黑；健康上漲股天天創高但收盤略低於前高不算
+    for (let i = n - 3; i < n; i++) { const hiPrev = Math.max(...bars.slice(Math.max(0, i - 60), i).map(b => b.high)); if (bars[i].high > hiPrev && bars[i].close < hiPrev && bars[i].close <= bars[i].open) fake = true; }
+    if (fake) T('fake', 2, '盤中突破前高但收盤站不穩 — 第二天容易走弱');
+  }
+
+  // ④ 情緒過熱：連漲後再大漲／利多滿天飛＋融資追價
+  let streak = 0;
+  for (let i = n - 1; i > 0 && bars[i].close > bars[i - 1].close; i--) streak++;
+  const lastRet = (last.close - bars[n - 2].close) / bars[n - 2].close * 100;
+  if (streak >= 4 && lastRet >= 3) T('heat', 1.5, `連漲 ${streak} 天後再大漲 ${lastRet.toFixed(1)}% — 情緒過熱，先別急著追`);
+  const buzz = (_newsSignals?.stocks?.[s.id]?.score ?? 0) + (s.sector ? (_newsSignals?.sectors?.[s.sector]?.score ?? 0) : 0);
+  const dFin = s._oi?.dFin, volZ = last.volume / 1000;
+  if (buzz >= 2 && dFin > 0 && volZ > 0 && dFin >= volZ * 0.05) T('heat2', 1.5, `利多滿天飛＋融資大增 ${dFin.toLocaleString()} 張 — 跟風盤多，主力更容易借機派發`);
+
+  // ⑤ 籌碼：邊拉邊賣（價漲但外資賣／大戶減）vs 法人續抱
+  const c5 = bars[n - 6]?.close;
+  const r5 = c5 ? (last.close - c5) / c5 * 100 : 0;
+  const tdDown = s._tdccTrend?.dir < 0 && Math.abs(s._tdccTrend.dBig ?? 0) >= 0.2;
+  if (r5 >= 3 && ((s.foreign ?? 0) < 0 || tdDown))
+    T('sell', 2, `邊拉邊賣：5 日漲 ${r5.toFixed(1)}% 但${(s.foreign ?? 0) < 0 ? `外資賣超 ${Math.abs(s.foreign).toLocaleString()} 張` : ''}${(s.foreign ?? 0) < 0 && tdDown ? '、' : ''}${tdDown ? '千張大戶減持' : ''}`);
+  // 洗盤回檔本來就是負報酬 —— 判「法人續抱」不看 5 日報酬，只看回檔中法人與大戶是否仍在買
+  else if ((s.foreign ?? 0) > 0 && s._tdccTrend?.dir > 0) W('hold', 1.5, '回檔中外資與大戶仍同步持有／增持，非派發');
+
+  // ⑥ 後續：回踩守住 EMA20／訂單塊（洗盤）
+  const low5 = Math.min(...bars.slice(-5).map(b => b.low));
+  const sup = Math.max(a.ema20 || 0, a.ob?.support?.top || 0);
+  if (trendUp && sup > 0 && low5 >= sup * 0.99) W('support', 1.5, `回踩守住 ${a.ob?.support?.top && a.ob.support.top >= (a.ema20 || 0) ? '多方訂單塊' : 'EMA20'} ${sup.toFixed(2)}（企穩後仍可能續漲）`);
+
+  const trapScore = +trap.reduce((x, y) => x + y.w, 0).toFixed(1);
+  const washScore = +wash.reduce((x, y) => x + y.w, 0).toFixed(1);
+  const verdict = trapScore >= 5 && trapScore > washScore * 1.3 ? 'trap'
+    : washScore >= 3 && washScore > trapScore ? 'washout'
+    : trapScore >= 3 ? 'caution' : 'none';
+  const txt = { trap: `🪤 誘多疑慮（${trapScore} 分）— 高點放量卻不漲動，看起來要突破、實際可能在出貨`,
+                caution: `⚠ 誘多警訊（${trapScore} 分）— 尚未確認，等能否站穩關鍵位再考慮`,
+                washout: `🧹 洗盤特徵（${washScore} 分）— 上升途中縮量回檔、支撐守住，較像清理浮籌`,
+                none: '無明顯誘多／洗盤特徵' }[verdict];
+  return { trapScore, washScore, verdict, trap, wash, txt };
+}
+
 // 證據家族上限：任何單一家族最多貢獻這麼多方向分，避免同質證據堆疊
 const FAMILY_CAP = { trend: 3.0, momentum: 2.5, volume: 2.5, chips: 3.0, fund: 2.5, context: 2.0, news: 0.8, risk: 3.0 };
 const FAMILY_NAME = { trend: '技術：趨勢', momentum: '技術：動能', volume: '量能', chips: '籌碼', fund: '基本面', context: '環境', news: '新聞', risk: '風險' };
@@ -2490,6 +2576,14 @@ function buildManagerAnalysis(s) {
     if (a.gaps.recent.type === 'up' && volR >= 1.5) add(0.8, 1, `帶量向上跳空缺口（${a.gaps.recent.bottom}~${a.gaps.recent.top}）未回補 — 突破缺口特徵`);
     else if (a.gaps.recent.type === 'down' && volR >= 1.5) add(0.8, -1, `帶量向下跳空缺口未回補 — 逃逸缺口特徵，趨勢轉弱`);
   }
+  // 主力誘多／洗盤：看起來要突破實際在出貨 → 強空方證據；上升途中縮量回檔 → 溫和多方
+  const tp = trapAnalysis(s);
+  if (tp) {
+    if (tp.verdict === 'trap') add(2.2, -1, `${tp.txt}：${tp.trap.slice(0, 2).map(x => x.txt.split('：')[0]).join('、')}`);
+    else if (tp.verdict === 'caution') add(0.9, -1, `${tp.txt}：${tp.trap.slice(0, 2).map(x => x.txt.split('：')[0]).join('、')}`);
+    else if (tp.verdict === 'washout') add(0.6, 1, `${tp.txt}`);
+  }
+
   // Order Block：未被回補的大單建倉痕跡，比均線更貼近「哪個價位真的有掛單」
   // 只有貼近現價（5% 內）才計權重 — 太遠的 OB 這筆交易碰不到
   if (a.ob) {
@@ -2985,6 +3079,7 @@ function buildEntryPlan(s, m) {
 
   // ── 續漲動力：接下來靠什麼漲？說不出來就是買氣氛 ──
   const cat = catalystChain(s, m);
+  const trap = trapAnalysis(s);
 
   // 部位規模：預設單筆風險 2%；有 ≥30 筆實績時改用半凱利（上限 2%、下限 0.5%）
   // — 凱利對參數誤差極敏感，永遠只用半凱利且封頂，這不是保守是常識
@@ -3053,7 +3148,7 @@ function buildEntryPlan(s, m) {
 
   return {
     ok: true, lo, hi, stop, t1, t2, riskPct, holdOn, targetNote, trail, rrWarn, sizing, lessonWarns,
-    scale, costPct, scen, cat, dataWarns,
+    scale, costPct, scen, cat, dataWarns, trap,
     netReward1: t1 ? +((t1 - lo) / lo * 100 - costPct).toFixed(2) : null,
     conf: m.conf, agr: m.agr,
     rewardPct1: t1 ? (t1 - lo) / lo * 100 : null,
@@ -3138,6 +3233,7 @@ function entryPlanHtml(s, m) {
       ${p.rrWarn ? `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">⚠ ${p.rrWarn}</div>` : ''}
       ${(p.lessonWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(239,68,68,0.07);border-left:3px solid var(--bear);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--bear)">🧠 教訓提醒：${w}</div>`).join('')}
       ${(p.dataWarns || []).map(w => `<div style="margin-top:8px;padding:7px 11px;background:rgba(245,158,11,0.08);border-left:3px solid var(--yellow);border-radius:0 6px 6px 0;font-size:0.75rem;color:var(--yellow)">📚 官方資料警示：${w}</div>`).join('')}
+      ${p.trap && p.trap.verdict !== 'none' ? `<div style="margin-top:8px;padding:7px 11px;background:${p.trap.verdict === 'washout' ? 'rgba(34,197,94,0.07)' : 'rgba(239,68,68,0.07)'};border-left:3px solid ${p.trap.verdict === 'washout' ? 'var(--bull)' : 'var(--bear)'};border-radius:0 6px 6px 0;font-size:0.75rem;color:${p.trap.verdict === 'washout' ? 'var(--bull)' : 'var(--bear)'};line-height:1.7">${p.trap.txt}${(p.trap.verdict === 'washout' ? p.trap.wash : p.trap.trap).slice(0, 3).map(x => `<br>・${x.txt}`).join('')}${p.trap.verdict !== 'washout' ? '<br><span style="font-size:0.7rem">應對：先別急著追；看能否真正站穩關鍵位，而不是盤中一時衝高；提前設好止盈止損與倉位</span>' : ''}</div>` : ''}
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
         📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險 ${p.sizing.riskPctUsed}%${p.sizing.kellyBased ? '（依 ≥30 筆實績的半凱利，非固定值）' : '（固定上限，累積 30 筆實績後改依半凱利）'} 計算，
         可買 <strong style="color:var(--blue)">${p.sizing.shares} 張</strong>（約 ${(p.sizing.posValue/10000).toFixed(1)} 萬，佔 ${p.sizing.posPct}% 資金）；
@@ -3447,6 +3543,18 @@ function renderPatterns(s) {
       `5 日約 68% 機率落在 <span style="font-family:var(--mono)">${d5.lo} ~ ${d5.hi}</span>` +
       `<br><span style="font-size:0.72rem;color:var(--text3)">依 14 日 ATR ${atr14.toFixed(2)}（${(atr14 / a.price * 100).toFixed(1)}%）√t 縮放 — 目標價超出 5 日區間代表需要超額行情才到得了；停損窄於 1 日區間易被日常波動掃出</span>`,
       'var(--blue)'));
+  }
+
+  // 主力誘多／洗盤判別（核心卡，不進進階）
+  const tpP = trapAnalysis(s);
+  if (tpP && (tpP.verdict !== 'none' || tpP.trap.length || tpP.wash.length)) {
+    const c = tpP.verdict === 'trap' ? 'var(--bear)' : tpP.verdict === 'caution' ? 'var(--yellow)' : tpP.verdict === 'washout' ? 'var(--bull)' : 'var(--text2)';
+    parts.push(card('🪤 主力誘多／洗盤判別',
+      `<strong style="color:${c}">${tpP.txt}</strong>` +
+      (tpP.trap.length ? `<br><span style="color:var(--bear)">誘多訊號（${tpP.trapScore}）</span>：${tpP.trap.map(x => x.txt).join('；')}` : '') +
+      (tpP.wash.length ? `<br><span style="color:var(--bull)">洗盤訊號（${tpP.washScore}）</span>：${tpP.wash.map(x => x.txt).join('；')}` : '') +
+      `<br><span style="font-size:0.72rem;color:var(--text3)">快速判斷：先看位置 → 再看量價 → 觀察能否站穩 → 再做判斷。高點放量卻不漲動更像誘多；上升途中縮量回檔更像洗盤</span>`,
+      c));
   }
 
   // 盤中限定：開盤區間突破（ORB）— 有今日分鐘 K 才顯示
@@ -7396,6 +7504,7 @@ async function detectWhales() {
     // ── 陷阱判斷（誘多 / 拉高出貨跡象） ──
     const m = buildManagerAnalysis(s);
     const trap = [];
+    { const tpW = trapAnalysis(s); if (tpW?.verdict === 'trap') trap.push(tpW.txt.split(' —')[0] + '：' + tpW.trap.slice(0, 2).map(x => x.txt.split('：')[0]).join('、')); }
     const range = last.high - last.low;
     if (range > 0 && avg20 > 0 && last.volume >= avg20 * 2 && (last.high - Math.max(last.open, last.close)) / range >= 0.45)
       trap.push('爆量收長上影線 — 高檔邊拉邊出，疑似出貨');
@@ -8352,6 +8461,17 @@ function checkHoldingExit(h) {
     }
   }
 
+  // 誘多 vs 洗盤：同樣是漲勢中的震盪，出貨要減碼、洗盤可續抱 —— 這是回落時最該分清的事
+  const tpH = trapAnalysis(s);
+  if (tpH && h.kind !== 'day') {
+    if (tpH.verdict === 'trap') {
+      if (level === 'hold') level = 'watch';
+      reasons.push(`🪤 ${tpH.txt.split(' —')[0]}：${tpH.trap.slice(0, 2).map(x => x.txt.split('：')[0]).join('、')} — 跌破關鍵位置別猶豫，先減碼`);
+    } else if (tpH.verdict === 'washout' && retPct < 0) {
+      reasons.push(`🧹 ${tpH.txt.split(' —')[0]}：${tpH.wash.slice(0, 2).map(x => x.txt.split('：')[0]).join('、')} — 較像清理浮籌，不是出貨，可續抱`);
+    }
+  }
+
   // 買進理由還在不在？跌多少不是加碼/止損的依據，論點是否失效才是。
   const tc = thesisCheck(h, s, m);
   if (tc) {
@@ -8751,6 +8871,8 @@ function computeDayTradePicks() {
         !(ld?.toDown != null && ld.toDown <= 1.5)) {
       cands.push({ side: 'short', base: -chg + atrPct + (net < 0 ? Math.min(-chipRatio * 100, 30) : -5) });
     }
+    const tpD = trapAnalysis(s);
+    if (tpD?.verdict === 'trap') { const i0 = cands.findIndex(c => c.side === 'long'); if (i0 >= 0) cands.splice(i0, 1); }   // 誘多不做多
     if (!cands.length) continue;
     // 大盤中性時要求更強證據（雙邊都能做 → 標準拉高）
     const pick = cands.sort((x, y) => y.base - x.base)[0];
@@ -8791,6 +8913,7 @@ function computeDayTradePicks() {
       `大盤：研判 ${mktNorm >= 0 ? '+' : ''}${mktNorm}（信心 ${(mktConf * 100).toFixed(0)}%）${mktSide === 0 ? ' — 方向不明，已提高選股標準' : `，本單為${long ? '順勢做多' : '順勢做空'}`}`,
     ];
     if (irs) why.push(`${irs.txt} — ${(pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak) ? '與大盤同向且明顯領先，選邊正確' : '方向一致但領先幅度普通'}`);
+    if (tpD && tpD.verdict !== 'none') why.push(`${tpD.txt.split(' —')[0]}${tpD.verdict === 'caution' && long ? ' — 做多部位減半、突破站穩再加' : ''}`);
     else why.push('日內相對強度：尚無今日 5 分 K（開盤後累積中，屆時會自動納入選邊判斷）');
     if (s._oapi) {
       for (const [path, row] of Object.entries(s._oapi)) {
@@ -9264,7 +9387,7 @@ function entryQuality(s, m, p) {
 // 大盤逆風濾網狀態（供 UI 誠實說明為何今天沒訊號）
 let _entryFunnel = null;   // 最近一次進場篩選的漏斗統計
 const FUNNEL_LABELS = { stale: '資料過期', headwind: '大盤逆風', dir: '研判強度不足', plan: '無進場計畫', extended: '已追高',
-  rr: '風報比<1.5', excluded: '排除條件', range: '盤整盤位置', learned: '學習門檻', pricedIn: '利多已反映', quality: '品質 C 級',
+  rr: '風報比<1.5', excluded: '排除條件', range: '盤整盤位置', learned: '學習門檻', pricedIn: '利多已反映', trap: '主力誘多', quality: '品質 C 級',
   pillars: '三支柱缺二', sectorCap: '族群上限' };
 function funnelHTML() {
   const F = _entryFunnel; if (!F) return '';
@@ -9377,12 +9500,15 @@ function computeEntrySignals(opts = {}) {
     }
     // 利多已反映：硬門檻（追在人人都知道之後，沒有救）
     if (p.cat?.pricedIn) { die('pricedIn'); continue; }
+    // 主力誘多：硬門檻 —— 「識別不了時，少追高、慢一步，往往比搶一秒更重要」
+    if (p.trap?.verdict === 'trap') { die('trap'); continue; }
     // 進場品質：研判強（該不該買）之外，還要進場點好（現在買好不好）。
     // 賠率不對稱、續漲動力薄弱改為「扣分」而非一刀切 —— 判斷性的東西用分數表達，硬門檻疊太多會訊號枯竭
     const q = entryQuality(s, m, p);
     q.penalties = [];
     if (p.scen?.asym) q.penalties.push({ k: '賠率不對稱', v: 15 });
     if (p.cat?.weak) q.penalties.push({ k: '說不出續漲動力', v: 15 });
+    if (p.trap?.verdict === 'caution') q.penalties.push({ k: '誘多警訊', v: 10 });
     else if (p.cat?.n === 1) q.penalties.push({ k: '續漲動力單薄', v: 5 });
     for (const x of q.penalties) q.score -= x.v;
     q.score = Math.max(0, q.score);
@@ -9444,7 +9570,8 @@ function notifyEntrySignals() {
       `　依據：${sup.join('・') || '技術面轉強'}` +
       (p.scen ? `\n　情境：樂觀 +${p.scen.optimistic}%／中性 +${p.scen.neutral}%／悲觀 ${p.scen.pessimistic}%${p.scen.asym ? '（⚠ 不對稱）' : ''}` : '') +
       (p.cat ? `\n　續漲動力：${p.cat.n ? p.cat.links.slice(0, 2).map(l => l.txt.split('：')[0]).join('＋') : '❌ 說不出來，僅氣氛'}${p.cat.pricedIn ? '（⚠ 利多可能已反映）' : ''}` : '') +
-      (p.dataWarns?.length ? `\n　📚 官方資料警示：${p.dataWarns.slice(0, 2).join('；')}` : '');
+      (p.dataWarns?.length ? `\n　📚 官方資料警示：${p.dataWarns.slice(0, 2).join('；')}` : '') +
+      (p.trap && p.trap.verdict !== 'none' ? `\n　${p.trap.txt.split(' —')[0]}` : '');
   }).join('\n\n');
 
   // 當沖參考獨立列出（極高風險，僅日線資料篩選）
