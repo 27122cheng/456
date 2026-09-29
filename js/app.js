@@ -386,30 +386,9 @@ async function runScan() {
     }
   }
 
-  // 資料過期重抓：有資料但停在數個交易日前者，清當月快取後強制重抓
-  const stale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
-  if (stale.length) {
-    setScanProgress(99, `重抓 ${stale.length} 檔過期資料...`);
-    for (const s of stale.slice(0, 30)) {
-      try {
-        clearCurrentMonthCache(s.id);
-        const ohlcv = await fetchStockOHLCV(s.id, currentTF, currentTF === '1d' ? '6mo' : '2y');
-        if (ohlcv.length >= 20) {
-          s.ohlcv = ohlcv;
-          s.analysis = calculateScore(ohlcv);
-          s.reversal = detectReversal(ohlcv, s.analysis);
-          delete s._verdict;
-        }
-      } catch {}
-    }
-    const stillStale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
-    stillStale.forEach(s => { s._staleDays = dataAgeDays(s); });
-    allStocks.filter(s => !isStaleData(s)).forEach(s => { delete s._staleDays; });
-    if (stillStale.length) {
-      showToast(`⚠ ${stillStale.length} 檔資料仍停留在 ${String(stillStale[0].ohlcv[stillStale[0].ohlcv.length-1].time).slice(5)} 前後`
-        + `（${stillStale.slice(0, 4).map(x => x.name).join('、')}${stillStale.length > 4 ? '…' : ''}）—— 這些股票已停止提供評分與建議`, 'error');
-    }
-  }
+  // 資料過期重抓：有資料但停在數個交易日前者，清「最後一根 K 之後」的快取後全部重抓
+  // （先前只抓前 30 檔、只清當月快取 → 停在上個月底的股票永遠補不上）
+  await refetchStaleStocks({ progress: true });
 
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
@@ -3390,6 +3369,12 @@ async function openStock(stockId) {
     return;
   }
 
+  // 資料過期 → 進頁面就自動重抓（每檔 10 分鐘內只自動試一次），不必等使用者按「重抓」
+  if (isStaleData(s) && !(s._autoRetryAt && Date.now() - s._autoRetryAt < 10 * 60 * 1000)) {
+    try { await retryStock(stockId, { silent: true }); } catch {}
+    if (currentStockId !== stockId) return;
+  }
+
   s._mtf = null; s._oi = null;
   renderStockDetail(s);
   renderPatterns(s);
@@ -3757,8 +3742,10 @@ function quoteStampHTML(s) {
     const md = barDate.slice(5).replace('-', '/');
     const age = dataAgeDays(s);
     if (age >= STALE_LIMIT) {
+      const diag = (typeof ohlcvFailReason !== 'undefined' && ohlcvFailReason[s.id]) || null;
       return `<span style="color:var(--bear);font-weight:700">⚠ 資料停留在 ${md}（落後 ${age} 個交易日）— 已停止提供評分與建議</span>`
         + ` <button class="btn-ghost" style="padding:0 6px;font-size:0.6rem" onclick="retryStock('${s.id}')">重抓</button>`
+        + `<br><span style="color:var(--text3);font-size:0.62rem">系統每 10 分鐘自動重抓${diag ? `｜來源狀態：${diag}` : ''}</span>`
         + (_liveFail ? `<br><span style="color:var(--text3);font-size:0.62rem">${_liveFail}</span>` : '');
     }
     const why = _liveFail ? `<br><span style="color:var(--text3);font-size:0.62rem">${_liveFail}</span>` : '';
@@ -5051,14 +5038,16 @@ function renderLiveTick() {
   } catch (e) { console.warn('即時重繪失敗:', e); }
 }
 
-// 單檔重抓歷史資料（資料過期時使用）
-async function retryStock(id) {
+// 單檔重抓歷史資料（資料過期時使用；opts.silent＝背景自動重抓，不彈提示）
+async function retryStock(id, opts = {}) {
   const s = allStocks.find(x => x.id === id);
-  if (!s) return;
-  showToast(`重新抓取 ${s.name} 的歷史資料...`, 'info');
+  if (!s) return false;
+  if (!opts.silent) showToast(`重新抓取 ${s.name} 的歷史資料...`, 'info');
+  s._autoRetryAt = Date.now();
   try {
-    clearCurrentMonthCache(id);
-    try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
+    const last = s.ohlcv?.length ? s.ohlcv[s.ohlcv.length - 1].time : null;
+    clearCacheSince(id, last);
+    if (!opts.silent) { try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {} }
     const ohlcv = await fetchStockOHLCV(id, currentTF, currentTF === '1d' ? '6mo' : '2y');
     if (ohlcv.length >= 20) {
       s.ohlcv = ohlcv;
@@ -5066,11 +5055,59 @@ async function retryStock(id) {
       s.reversal = detectReversal(ohlcv, s.analysis);
       delete s._verdict;
       const age = dataAgeDays(s);
-      if (age >= STALE_LIMIT) { s._staleDays = age; showToast(`仍只取得到 ${String(ohlcv[ohlcv.length-1].time).slice(5)} 的資料（落後 ${age} 個交易日）`, 'error'); }
-      else { delete s._staleDays; showToast(`已更新至 ${String(ohlcv[ohlcv.length-1].time).slice(5)}`, 'success'); }
-      renderStockDetail(s);
-    } else showToast('仍無法取得歷史資料，稍後自動重試', 'error');
-  } catch (e) { showToast(`重抓失敗：${e?.message || e}`, 'error'); }
+      const fresh = !(age >= STALE_LIMIT);
+      if (fresh) delete s._staleDays; else s._staleDays = age;
+      if (!opts.silent) {
+        if (fresh) showToast(`已更新至 ${String(ohlcv[ohlcv.length-1].time).slice(5)}`, 'success');
+        else {
+          const why = ohlcvFailReason[id] ? `。${ohlcvFailReason[id]}` : '';
+          showToast(`仍只取得到 ${String(ohlcv[ohlcv.length-1].time).slice(5)} 的資料（落後 ${age} 個交易日）${why}`, 'error');
+        }
+      }
+      if (currentStockId === id) renderStockDetail(s);
+      return fresh;
+    }
+    if (!opts.silent) showToast(`仍無法取得歷史資料${ohlcvFailReason[id] ? `：${ohlcvFailReason[id]}` : ''}，系統會持續自動重試`, 'error');
+  } catch (e) { if (!opts.silent) showToast(`重抓失敗：${e?.message || e}`, 'error'); }
+  return false;
+}
+
+// ── 過期資料自動重抓 ───────────────────────────────────────────────────────
+// 使用者不該需要按「重抓」：掃描結束、開個股頁、以及每 10 分鐘背景各跑一次。
+// 官方來源有節流佇列把關（見 api.js），這裡只管「該補的全部排進去」。
+let _staleRefetchBusy = false;
+async function refetchStaleStocks(opts = {}) {
+  if (_staleRefetchBusy) return;
+  const stale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
+  if (!stale.length) { allStocks.forEach(s => { delete s._staleDays; }); return; }
+  _staleRefetchBusy = true;
+  try {
+    // 節流暫停中：先等它結束再開火，否則整批都是白打
+    const th = (() => { try { return histThrottleStatus(); } catch { return { paused: false }; } })();
+    if (th.paused && opts.progress) setScanProgress(99, `官方來源限流中，${th.secondsLeft}s 後重抓 ${stale.length} 檔過期資料...`);
+    let done = 0, fixed = 0;
+    const q = [...stale];
+    const worker = async () => {
+      while (q.length) {
+        const s = q.shift();
+        try { if (await retryStock(s.id, { silent: true })) fixed++; } catch {}
+        done++;
+        if (opts.progress) setScanProgress(99, `重抓過期資料 ${done}/${stale.length}（已補齊 ${fixed}）...`);
+      }
+    };
+    await Promise.all(Array.from({ length: 3 }, worker));
+    const stillStale = allStocks.filter(s => s.ohlcv?.length && isStaleData(s));
+    stillStale.forEach(s => { s._staleDays = dataAgeDays(s); });
+    allStocks.filter(s => !isStaleData(s)).forEach(s => { delete s._staleDays; });
+    if (fixed) { try { renderDashboard(); renderFocusStocks(); if (currentPage === 'ranking') renderRanking(); } catch {} }
+    if (stillStale.length && !opts.silent) {
+      const why = ohlcvFailReason[stillStale[0].id];
+      showToast(`⚠ ${stillStale.length} 檔資料仍停留在 ${String(stillStale[0].ohlcv[stillStale[0].ohlcv.length-1].time).slice(5)} 前後`
+        + `（${stillStale.slice(0, 4).map(x => x.name).join('、')}${stillStale.length > 4 ? '…' : ''}）—— 已停止評分與建議，每 10 分鐘自動重試${why ? `。${why}` : ''}`, 'error');
+    } else if (fixed && !opts.silent) {
+      showToast(`已自動補齊 ${fixed} 檔過期資料`, 'success');
+    }
+  } finally { _staleRefetchBusy = false; }
 }
 
 // 手動重試即時報價：清掉熔斷器與報價快取後強制重抓，並把結果直接顯示出來
@@ -11277,6 +11314,8 @@ async function scheduledTick() {
 function startNotificationScheduler() {
   scheduledTick();
   setInterval(scheduledTick, 60 * 1000);
+  // 過期資料背景自動重抓：每 10 分鐘一次（掃描中不重疊）
+  setInterval(() => { if (!scanning) refetchStaleStocks({ silent: true }).catch(() => {}); }, 10 * 60 * 1000);
 }
 
 // ── 策略歷史回測 ────────────────────────────────────────────────────────────
