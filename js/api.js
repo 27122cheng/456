@@ -104,24 +104,75 @@ async function rawFetch(url, timeout) {
   catch { clearTimeout(timer); return null; }
 }
 
-async function proxyFetch(url, timeout = 5000) {
+// 帶狀態的版本：回 { data, status }。status 是最後一個代理拿到的上游狀態碼
+// （429＝被限流），讓歷史日 K 的節流佇列知道該「退避」而不是繼續撞牆。
+async function proxyFetchEx(url, timeout = 5000) {
   const enc = encodeURIComponent(url);
+  let status = null;
   for (const p of proxyOrder()) {
     const res = await rawFetch(p.wrap(enc), timeout);
     if (!res) { _proxyMark(p, false); continue; }   // 連不上 = 代理本身有問題
     // 上游拒絕（Yahoo 對雲端 IP 常回 429/403）不能算在代理頭上，
     // 否則自家代理會被熔斷，連帶讓證交所等正常來源也被跳過
     if (!res.ok) {
+      status = res.status;
       if (res.status !== 429 && res.status !== 403 && res.status !== 404) _proxyMark(p, false);
       continue;
     }
     try {
       const data = await p.json(res);
-      if (data) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return data; }
+      if (data) { _proxyMark(p, true); localStorage.setItem('proxy-pref', p.name); return { data, status: 200 }; }
     } catch {}
     _proxyMark(p, false);
   }
-  return null;
+  return { data: null, status };
+}
+async function proxyFetch(url, timeout = 5000) { return (await proxyFetchEx(url, timeout)).data; }
+
+// ── 官方歷史日 K 節流佇列 ─────────────────────────────────────────────────
+// 證交所／櫃買的月線端點對同一 IP 有速率限制。Yahoo 掛掉時掃描 100 檔 × 14 個月
+// 同時開火＝一千多個請求瞬間打過去 → 被擋（429）→ 只有先到的舊月份成功，
+// 最近的月份全失敗 → 「資料停在上個月底」。這就是實際發生過的 07/31 事故。
+// 對策：全域最多 3 個並行、請求間隔 150ms、遇 429 全體暫停（20s 起、最長 2 分鐘）後重試一次。
+const _histQ = { running: 0, max: 3, waiters: [], pausedUntil: 0, lastAt: 0, gapMs: 150, backoff: 0, hits429: 0, basePause: 20000 };
+const _sleep = ms => new Promise(r => setTimeout(r, ms));
+function histThrottleStatus() {
+  const left = _histQ.pausedUntil - Date.now();
+  return { paused: left > 0, secondsLeft: Math.max(0, Math.ceil(left / 1000)), hits429: _histQ.hits429, queued: _histQ.waiters.length, running: _histQ.running };
+}
+async function _histAcquire() {
+  if (_histQ.running < _histQ.max) { _histQ.running++; return; }
+  await new Promise(r => _histQ.waiters.push(r));
+  _histQ.running++;
+}
+function _histRelease() {
+  _histQ.running--;
+  const w = _histQ.waiters.shift();
+  if (w) w();
+}
+async function throttledProxyFetch(url, timeout = 7000) {
+  await _histAcquire();
+  try {
+    let retried = false;
+    while (true) {
+      const wait = _histQ.pausedUntil - Date.now();
+      if (wait > 0) await _sleep(wait);
+      const gap = _histQ.lastAt + _histQ.gapMs - Date.now();
+      if (gap > 0) await _sleep(gap);
+      _histQ.lastAt = Date.now();
+      const r = await proxyFetchEx(url, timeout);
+      if (r.data) { if (_histQ.backoff > 0 && Date.now() > _histQ.pausedUntil) _histQ.backoff = Math.max(0, _histQ.backoff - 1); return r.data; }
+      if (r.status === 429 && !retried) {
+        _histQ.hits429++;
+        const pause = Math.min(120000, _histQ.basePause * Math.pow(2, _histQ.backoff));
+        _histQ.backoff = Math.min(3, _histQ.backoff + 1);
+        _histQ.pausedUntil = Math.max(_histQ.pausedUntil, Date.now() + pause);
+        retried = true;
+        continue;
+      }
+      return null;
+    }
+  } finally { _histRelease(); }
 }
 
 // 取回純文字（RSS / XML 用）
@@ -369,16 +420,32 @@ function rocToISO(d) {
   return `${+m[1] + 1911}-${m[2]}-${m[3]}`;
 }
 
+// 月快取的「完整性」：在該月尚未結束時抓到的資料（例如 9/28 抓的九月）只到當天；
+// 進入十月後它已是「過去月份」、7 天快取還沒過期 → 9/29、9/30 永遠補不上。
+// 所以快取記錄 complete 旗標：月份已結束才算完整；不完整的舊月份一律重抓。
+function monthCacheGet(key, isCurrent) {
+  const v = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  if (!v) return null;
+  if (Array.isArray(v)) return isCurrent ? v : null;            // 舊格式：無法確認完整 → 過去月份重抓
+  if (v.empty) return isCurrent ? null : [];                     // 過去月份查無資料（新上市／下市）→ 記住，別每輪都打
+  if (!v.bars?.length) return null;
+  if (!isCurrent && !v.complete) return null;
+  return v.bars;
+}
+function monthCacheSet(key, bars, isCurrent) { cacheSet(key, { bars, complete: !isCurrent }); }
+function monthCacheSetEmpty(key, isCurrent) { if (!isCurrent) cacheSet(key, { empty: true, complete: true }); }
+
 async function fetchTWSEMonth(stockId, year, month) {
   const ym = `${year}${String(month).padStart(2, '0')}`;
   const key = `cache:sd:${stockId}:${ym}`;
-  const now = new Date();
+  const now = twNow();
   const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
-  const cached = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  const cached = monthCacheGet(key, isCurrent);
   if (cached) return cached;
 
   const url = `https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?date=${ym}01&stockNo=${stockId}&response=json`;
-  const j = await proxyFetch(url, 7000).catch(() => null);
+  const j = await throttledProxyFetch(url, 7000).catch(() => null);
+  if (j && !j.data?.length) monthCacheSetEmpty(key, isCurrent);   // 官方明確回「無資料」才記負快取；被擋／逾時不記
   if (!j?.data?.length) return null;
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
   // 欄位：日期,成交股數,成交金額,開盤價,最高價,最低價,收盤價,漲跌價差,成交筆數
@@ -393,27 +460,32 @@ async function fetchTWSEMonth(stockId, year, month) {
     return bar;
   }).filter(Boolean);
   if (!bars.length) return null;
-  cacheSet(key, bars);
+  monthCacheSet(key, bars, isCurrent);
   return bars;
 }
 
-// 清掉當月日線快取，強制重抓 —— 當月資料失敗時，過去月份仍有 7 天快取，
-// 會造成「資料停在上個月底」卻不會被重試（實際發生過：停在 07/31）
-function clearCurrentMonthCache(stockId) {
-  const now = new Date();
-  const ym = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}`;
+// 清掉「最後一根 K 之後」所有月份的日線快取（含當月），強制重抓 ——
+// 先前只清當月：資料停在 07/31、現在是 9 月，八月的快取永遠不會被重試。
+function clearCacheSince(stockId, sinceISO) {
+  const now = twNow();
+  const start = sinceISO ? new Date(`${String(sinceISO).slice(0, 7)}-01T00:00:00`) : new Date(now.getFullYear(), now.getMonth(), 1);
   try {
-    localStorage.removeItem(`cache:sd:${stockId}:${ym}`);
-    localStorage.removeItem(`cache:td:${stockId}:${ym}`);
-    Object.keys(localStorage).filter(k => k.startsWith(`cache:ohlcv:${stockId}`)).forEach(k => localStorage.removeItem(k));
+    for (let d = new Date(start.getFullYear(), start.getMonth(), 1); d <= now; d.setMonth(d.getMonth() + 1)) {
+      const ym = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}`;
+      localStorage.removeItem(`cache:sd:${stockId}:${ym}`);
+      localStorage.removeItem(`cache:td:${stockId}:${ym}`);
+    }
+    Object.keys(localStorage).filter(k => k.startsWith(`cache:ohlcv:${stockId}`) || k.startsWith(`cache:fmh:${stockId}`)).forEach(k => localStorage.removeItem(k));
   } catch {}
 }
+function clearCurrentMonthCache(stockId) { clearCacheSince(stockId, null); }
 
-// 抓最近 N 個月併成連續日線（預設 7 個月 ≈ 140 根，足夠 EMA50/RSI/MACD/ADX）
+// 抓最近 N 個月併成連續日線（預設 14 個月，足夠 EMA200／年線）。
+// 由新到舊排隊：節流時最近的月份先拿到 —— 舊月份缺了只影響長均線，新月份缺了整檔失效。
 async function fetchTWSEHistory(stockId, months = 14) {
-  const now = new Date();
+  const now = twNow();
   const reqs = [];
-  for (let i = months - 1; i >= 0; i--) {
+  for (let i = 0; i < months; i++) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     reqs.push(fetchTWSEMonth(stockId, d.getFullYear(), d.getMonth() + 1));
   }
@@ -436,15 +508,16 @@ async function fetchTWSEHistory(stockId, months = 14) {
 async function fetchTPExMonth(stockId, year, month) {
   const ym = `${year}${String(month).padStart(2, '0')}`;
   const key = `cache:td:${stockId}:${ym}`;
-  const now = new Date();
+  const now = twNow();
   const isCurrent = year === now.getFullYear() && month === now.getMonth() + 1;
-  const cached = cacheGet(key, isCurrent ? 30 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000);
+  const cached = monthCacheGet(key, isCurrent);
   if (cached) return cached;
 
   const url = `https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=${stockId}&date=${year}/${String(month).padStart(2, '0')}/01&response=json`;
-  const j = await proxyFetch(url, 7000).catch(() => null);
+  const j = await throttledProxyFetch(url, 7000).catch(() => null);
   // 新版 RWD 回 tables[0].data；舊版回 aaData — 兩種都接
   const rows = j?.tables?.[0]?.data || j?.aaData || j?.data || null;
+  if (j && !rows?.length) monthCacheSetEmpty(key, isCurrent);
   if (!rows?.length) return null;
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
   const bars = rows.map(r => {
@@ -458,14 +531,14 @@ async function fetchTPExMonth(stockId, year, month) {
     return bar;
   }).filter(Boolean);
   if (!bars.length) return null;
-  cacheSet(key, bars);
+  monthCacheSet(key, bars, isCurrent);
   return bars;
 }
 
 async function fetchTPExHistory(stockId, months = 14) {
-  const now = new Date();
+  const now = twNow();
   const reqs = [];
-  for (let i = months - 1; i >= 0; i--) {
+  for (let i = 0; i < months; i++) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
     reqs.push(fetchTPExMonth(stockId, d.getFullYear(), d.getMonth() + 1));
   }
@@ -592,6 +665,52 @@ let _dayAllResolved = null;
 const _ohlcvInflight = new Map(); // 同一檔同時被多處請求時只發一次
 const ohlcvFailReason = {};       // 掃描失敗原因（stockId → 說明文字），供 UI 呈現
 
+// 台北今天（YYYY-MM-DD）與「落後幾個交易日」— api.js 自帶，不依賴 app.js
+function twTodayISO() { const d = twNow(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function tradingDaysAgo(iso) {
+  if (!iso) return null;
+  let n = 0; const d = new Date(`${String(iso).slice(0, 10)}T00:00:00Z`), end = new Date(`${twTodayISO()}T00:00:00Z`);
+  if (!(d < end)) return 0;
+  while (d < end) { d.setUTCDate(d.getUTCDate() + 1); const w = d.getUTCDay(); if (w !== 0 && w !== 6) n++; }
+  return n;
+}
+// 落後 ≥3 個交易日即視為過期（與 app.js 的 STALE_LIMIT 同一標準）
+function barsStale(bars, limit = 3) {
+  if (!bars?.length) return true;
+  const n = tradingDaysAgo(bars[bars.length - 1].time);
+  return n != null && n >= limit;
+}
+// 合併兩段日線：同日以後者（官方／較新來源）為準，最後依日期排序
+function mergeBars(a, b) {
+  const map = new Map();
+  for (const x of a || []) if (x?.time) map.set(String(x.time).slice(0, 10), x);
+  for (const x of b || []) if (x?.time) map.set(String(x.time).slice(0, 10), { ...(map.get(String(x.time).slice(0, 10)) || {}), ...x });
+  return [...map.values()].sort((x, y) => String(x.time).localeCompare(String(y.time)));
+}
+
+// FinMind 歷史日 K（TaiwanStockPrice）：只在設定 token 時啟用；補「最後一根 K 之後」的區段即可
+async function fetchFinMindHistory(stockId, sinceISO) {
+  const token = finmindToken();
+  if (!token) return [];
+  const start = sinceISO ? String(sinceISO).slice(0, 10) : (() => { const d = twNow(); d.setMonth(d.getMonth() - 14); return d.toISOString().slice(0, 10); })();
+  const key = `cache:fmh:${stockId}:${start}`;
+  const cached = cacheGet(key, 30 * 60 * 1000);
+  if (cached) return cached;
+  const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${encodeURIComponent(stockId)}&start_date=${start}&token=${encodeURIComponent(token)}`;
+  let j = null;
+  try { const res = await fetchWithTimeout(url, 9000); if (res) j = await res.json(); } catch {}
+  const rows = Array.isArray(j?.data) ? j.data : null;
+  if (!rows?.length) return [];
+  const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
+  const bars = rows.map(r => {
+    const close = num(r.close); const time = String(r.date || '').slice(0, 10);
+    if (!time || close == null) return null;
+    return { time, open: num(r.open) ?? close, high: num(r.max) ?? close, low: num(r.min) ?? close, close, volume: num(r.Trading_Volume) ?? 0 };
+  }).filter(Boolean);
+  if (bars.length) cacheSet(key, bars);
+  return bars;
+}
+
 async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {}) {
   const ikey = `${stockId}:${interval}:${range}${opts.force ? ':f' : ''}`;
   if (_ohlcvInflight.has(ikey)) return _ohlcvInflight.get(ikey);
@@ -611,31 +730,48 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {
         ohlcv = two;
       }
     }
-    // Yahoo 全掛時改用官方日線，確保技術分析不中斷：
-    // 上市走證交所 STOCK_DAY、上櫃走櫃買中心 tradingStock（先前只有上市備援 →
-    // Yahoo 被限流時上櫃自選股整檔掃不出來）。市場別確認一次後記住，下次直接走對的來源。
-    if (!ohlcv.length && interval === '1d') {
+    // Yahoo 全掛或「只給得出舊資料」時改用官方日線，確保技術分析不中斷：
+    // 上市走證交所 STOCK_DAY、上櫃走櫃買中心 tradingStock。市場別確認一次後記住。
+    // 先前只在 Yahoo「完全沒資料」時才走官方 → Yahoo 的 72 小時陳舊快取一直頂著，
+    // 官方來源永遠沒機會補上最新月份。現在：Yahoo 資料落後 ≥3 個交易日也走官方，並把兩邊合併。
+    const diag = { yahoo: ohlcv.length ? (barsStale(ohlcv) ? 'stale' : 'ok') : (srcDead('yahoo') ? 'dead' : 'empty') };
+    if (interval === '1d' && (!ohlcv.length || barsStale(ohlcv))) {
       const mkt = localStorage.getItem(`mkt:${stockId}`);
       const tpexFirst = mkt === 'tpex' || knownSuffix === 'TWO';
       const trySrc = tpexFirst
         ? [['tpex', fetchTPExHistory], ['twse', fetchTWSEHistory]]
         : [['twse', fetchTWSEHistory], ['tpex', fetchTPExHistory]];
       for (const [name, fn] of trySrc) {
-        ohlcv = await fn(stockId).catch(() => []);
-        if (ohlcv.length) {
+        const off = await fn(stockId).catch(() => []);
+        diag[name] = off.length ? (barsStale(off) ? 'stale' : 'ok') : 'empty';
+        if (off.length) {
           localStorage.setItem(`mkt:${stockId}`, name);
           if (name === 'tpex') localStorage.setItem(suffixKey, 'TWO');
+          ohlcv = mergeBars(ohlcv, off);
           break;
         }
+        // 已知市場別且官方回空 → 另一個市場不必再試（省下一半節流額度）
+        if (mkt && mkt === name) break;
       }
     }
-    // 記錄失敗原因，供掃描結果與個股頁說明「為什麼掃不出來」
-    if (!ohlcv.length && interval === '1d') {
-      ohlcvFailReason[stockId] = srcDead('yahoo')
-        ? 'Yahoo 行情被限流，且上市（證交所）與上櫃（櫃買中心）官方歷史日 K 均查無此代號 — 可能是興櫃、新上市未滿月或已下市股票，暫無日 K 可分析'
-        : 'Yahoo 與上市/上櫃官方歷史日 K 均查無此代號 — 請確認代號是否正確（興櫃與已下市股票無官方日 K）';
-    } else if (ohlcv.length) {
-      delete ohlcvFailReason[stockId];
+    // 官方也補不齊（被限流／節流暫停中）→ FinMind（走使用者自己的 token 與瀏覽器 IP，不受代理限流影響）
+    if (interval === '1d' && (!ohlcv.length || barsStale(ohlcv)) && finmindToken()) {
+      const since = ohlcv.length ? ohlcv[ohlcv.length - 1].time : null;
+      const fm = await fetchFinMindHistory(stockId, since).catch(() => []);
+      diag.finmind = fm.length ? (barsStale(fm) ? 'stale' : 'ok') : 'empty';
+      if (fm.length) ohlcv = mergeBars(ohlcv, fm);
+    }
+    // 記錄失敗／過期原因，供掃描結果與個股頁說明「為什麼掃不出來、卡在哪個來源」
+    if (interval === '1d') {
+      const th = histThrottleStatus();
+      const srcTxt = Object.entries(diag).map(([k, v]) => `${{ yahoo: 'Yahoo', twse: '證交所', tpex: '櫃買', finmind: 'FinMind' }[k] || k} ${{ ok: '正常', stale: '僅舊資料', dead: '限流中', empty: '無資料' }[v] || v}`).join('、');
+      if (!ohlcv.length) {
+        ohlcvFailReason[stockId] = `${srcTxt}${th.paused ? `；官方來源被限流，節流暫停中（${th.secondsLeft}s 後重試）` : ''} — 可能是興櫃、新上市未滿月、已下市或代號有誤`;
+      } else if (barsStale(ohlcv)) {
+        ohlcvFailReason[stockId] = `${srcTxt}${th.paused ? `；官方來源被限流，節流暫停中（${th.secondsLeft}s 後自動重試）` : '；系統會自動重試'}${!finmindToken() ? '。設定頁填入 FinMind token 可多一條不受代理限流的備援' : ''}`;
+      } else {
+        delete ohlcvFailReason[stockId];
+      }
     }
     // 日線：若官方當日行情「已就緒」才刷新最後一根 K 棒；尚未就緒就直接回傳，
     // 絕不等待（過去每檔都 await 全市場行情 → 整站卡死的主因）
