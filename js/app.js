@@ -3203,33 +3203,13 @@ function entryPlanHtml(s, m) {
         <span style="font-size:0.82rem;font-weight:700;color:var(--blue)">🎯 AI 進場建議（做多）</span>
         <span style="font-size:0.68rem;color:var(--text3)">綜合技術・基本面・籌碼・量價分析後生成</span>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-        <div style="padding:8px 10px;background:rgba(255,255,255,0.02);border-radius:7px">
-          <div style="font-size:0.68rem;color:var(--text3)">進場範圍</div>
-          <div style="font-family:var(--mono);font-weight:700;color:var(--blue);font-size:0.95rem">${p.lo} ~ ${p.hi}</div>
-        </div>
-        <div style="padding:8px 10px;background:rgba(239,68,68,0.06);border-radius:7px">
-          <div style="font-size:0.68rem;color:var(--text3)">離場（停損）</div>
-          <div style="font-family:var(--mono);font-weight:700;color:var(--bear);font-size:0.95rem">${p.stop}
-            <span style="font-size:0.68rem;font-weight:400">（-${p.riskPct.toFixed(1)}%）</span></div>
-        </div>
-        ${p.holdOn ? `
-        <div style="padding:8px 10px;background:rgba(34,197,94,0.06);border-radius:7px;grid-column:1/-1">
-          <div style="font-size:0.68rem;color:var(--text3)">出場目標</div>
-          <div style="font-weight:700;color:var(--bull);font-size:0.88rem">上方無壓力 — 持續持倉</div>
-          <div style="font-size:0.7rem;color:var(--text3);margin-top:2px">移動停利參考 <span style="font-family:var(--mono);color:var(--yellow)">${p.trail}</span>（隨股價墊高）</div>
-        </div>` : `
-        <div style="padding:8px 10px;background:rgba(34,197,94,0.06);border-radius:7px">
-          <div style="font-size:0.68rem;color:var(--text3)">出場目標一</div>
-          <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t1}
-            <span style="font-size:0.68rem;font-weight:400">（+${p.rewardPct1.toFixed(1)}%）</span></div>
-        </div>
-        <div style="padding:8px 10px;background:rgba(34,197,94,0.04);border-radius:7px">
-          <div style="font-size:0.68rem;color:var(--text3)">出場目標二</div>
-          <div style="font-family:var(--mono);font-weight:700;color:var(--bull);font-size:0.95rem">${p.t2}
-            <span style="font-size:0.68rem;font-weight:400">（+${p.rewardPct2.toFixed(1)}%）</span></div>
-        </div>`}
+      <div class="sig-levels">
+        <div class="sig-lv stop"><div class="l">停損（跌破就走）</div><div class="v">${p.stop}</div><div class="p">−${p.riskPct.toFixed(1)}%</div></div>
+        <div class="sig-lv entry"><div class="l">掛買區（不追價）</div><div class="v">${p.lo}~${p.hi}</div><div class="p" style="color:var(--text3)">${p.note.includes('回踩') ? '現價偏高，等回踩' : p.note.includes('低於') ? '現價在區下緣' : '現價在區內'}</div></div>
+        <div class="sig-lv tgt"><div class="l">${p.holdOn ? '目標（上方無壓力）' : '目標一 / 目標二'}</div><div class="v">${p.holdOn ? '續抱' : `${p.t1} / ${p.t2}`}</div><div class="p">${p.holdOn ? `移動停利 ${p.trail}` : `+${p.rewardPct1.toFixed(1)}% / +${p.rewardPct2.toFixed(1)}%`}</div></div>
       </div>
+      ${ladderHTML(p.stop, p.lo, p.hi, p.holdOn ? null : p.t1, p.holdOn)}
+      <div style="margin-top:6px;font-size:0.74rem;color:var(--blue)">紀律：+1R（${(p.lo * 2 - p.stop).toFixed(2)}）先減半、停損上移至成本；${p.holdOn ? '其後以移動停利追蹤' : `觸及 ${p.t1} 再減碼，剩餘看 ${p.t2}`}</div>
       <div style="margin-top:9px;display:flex;gap:14px;flex-wrap:wrap;font-size:0.75rem;color:var(--text3)">
         ${p.rr ? `<span>風險報酬比 <strong style="color:${rrColor}">1 : ${p.rr.toFixed(1)}</strong></span>` : ''}
         <span>訊號一致性 <strong style="color:${p.agr >= 0.6 ? 'var(--bull)' : p.agr >= 0.4 ? 'var(--yellow)' : 'var(--bear)'}">${(p.agr * 100).toFixed(0)}%</strong></span>
@@ -8684,28 +8664,71 @@ function holdingsHTML() {
   const rows = holdings.map(h => checkHoldingExit(h) ||
     ({ h, price: null, retPct: null, level: 'hold', reasons: ['尚未取得分析資料，等待下輪掃描'], pending: true }));
 
-  const badge = { exit: { t: '🔴 建議出場', c: 'var(--bear)' }, watch: { t: '🟡 留意', c: 'var(--yellow)' }, hold: { t: '🟢 續抱', c: 'var(--bull)' } };
-  return portfolioHeatHTML() + rows.map(r => `
-    <div style="padding:10px 12px;border-radius:9px;background:${badge[r.level].c}0d;border-left:3px solid ${badge[r.level].c};margin-bottom:8px;cursor:pointer" onclick="showHoldingView('${r.h.id}')" title="點擊查看 AI 對此持倉的看法">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <strong style="font-size:0.86rem">${r.h.name} <span style="color:var(--text3);font-size:0.74rem">${r.h.id}</span></strong>
-        <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.07);color:var(--text2)">${r.h.kind === 'day' ? '當沖單' : '長線單'}</span>
-        <span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:${r.h.src === 'manual' ? 'rgba(245,158,11,0.14)' : 'rgba(0,212,255,0.12)'};color:${r.h.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${r.h.src === 'manual' ? '自行購入' : 'AI 建議'}</span>
-        <span style="font-size:0.7rem;font-weight:700;color:${badge[r.level].c}">${r.pending ? '⏳ 待掃描' : badge[r.level].t}</span>
-        ${r.health ? `<span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.06);color:${r.health.tone === 'good' ? 'var(--bull)' : r.health.tone === 'ok' ? 'var(--yellow)' : 'var(--bear)'}" title="持倉健康度（方向/R 進度/量能/資金效率）">${r.health.stage.icon} ${r.health.stage.txt}・${r.health.rNow >= 0 ? '+' : ''}${r.health.rNow}R・健康 ${r.health.score}</span>` : ''}
-        ${r.thesis ? `<span style="font-size:0.64rem;padding:1px 7px;border-radius:8px;background:rgba(255,255,255,0.06);color:${r.thesis.verdict === 'intact' ? 'var(--bull)' : r.thesis.verdict === 'weak' ? 'var(--yellow)' : 'var(--bear)'}" title="買進理由檢查：${r.thesis.items.map(x => `${x.label}${x.ok ? '✓' : '✗'}`).join(' ')}">🧭 理由 ${r.thesis.intact.length}/${r.thesis.items.length} 成立</span>` : ''}
-        <span style="margin-left:auto;font-family:var(--mono);font-weight:700;color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</span>
+  return portfolioHeatHTML() + rows.map(holdingCardHTML).join('');
+}
+
+// 持倉價位尺：停損 ─ 成本 ─ 目標，加上「現價」標記；一眼看出離停損多遠、離目標多遠
+function holdLadderHTML(stop, entry, tgt, price) {
+  if (!(stop > 0) || !(entry > 0) || !(price > 0)) return '';
+  const top = Math.max(tgt || entry * 1.1, price * 1.01, entry * 1.02);
+  const bottom = Math.min(stop, price * 0.99);
+  const span = top - bottom; if (!(span > 0)) return '';
+  const pct = v => Math.max(0, Math.min(100, (v - bottom) / span * 100));
+  const w = (a, b2) => `${Math.max(0, pct(b2) - pct(a)).toFixed(1)}%`;
+  return `<div class="sig-ladder pos">
+    <div class="sig-mark" style="left:${pct(price).toFixed(1)}%">現價 ${price.toFixed(2)}</div>
+    <div class="sig-bar"><i style="width:${w(bottom, stop)}"></i><i class="risk" style="width:${w(stop, entry)}"></i><i class="rew" style="width:${w(entry, top)}"></i></div>
+    <div class="sig-bar-txt"><span>停損 ${stop}</span><span>成本 ${entry}</span><span>${tgt ? `目標 ${tgt}` : '續抱・移動停利'}</span></div>
+  </div>`;
+}
+
+function holdingCardHTML(r) {
+  const badge = { exit: { t: '🔴 建議出場', c: 'var(--bear)', k: 'exit' }, watch: { t: '🟡 留意', c: 'var(--yellow)', k: 'watch' }, hold: { t: '🟢 續抱', c: 'var(--bull)', k: 'hold' } };
+  const bd = badge[r.level] || badge.hold;
+  const h = r.h;
+  const div = (() => { try { const s = allStocks.find(x => x.id === h.id); return s ? exDivAdjust(s.ohlcv, h.addedAt) : 0; } catch { return 0; } })();
+  const stopAdj = h.stop != null ? +(h.stop - div).toFixed(2) : null;
+  const distStop = r.price && stopAdj ? (r.price - stopAdj) / r.price * 100 : null;
+  const distTgt = r.price && h.t1 ? ((h.t1 - div) - r.price) / r.price * 100 : null;
+  // 下一步：出場→第一條理由；留意→第一條理由；續抱→健康度建議或「停損不動」
+  const next = r.pending ? '等待下輪掃描取得分析資料'
+    : r.level === 'exit' ? `依紀律出場 — ${r.reasons[0]}`
+    : r.level === 'watch' ? `${r.reasons[0]}`
+    : (r.health?.actions?.[0] || `續抱；停損 ${stopAdj} 不動${distStop != null ? `（距停損 ${distStop.toFixed(1)}%）` : ''}`);
+  const rest = r.reasons.slice(r.level === 'hold' && !r.health?.actions?.[0] ? 0 : 1);
+  const chips = [
+    `<span class="sig-tag">${h.kind === 'day' ? '當沖單' : '長線單'}</span>`,
+    `<span class="sig-tag" style="color:${h.src === 'manual' ? 'var(--yellow)' : 'var(--blue)'}">${h.src === 'manual' ? '自行購入' : 'AI 建議'}</span>`,
+    r.health ? `<span class="sig-tag" title="持倉健康度" style="color:${r.health.tone === 'good' ? 'var(--bull)' : r.health.tone === 'ok' ? 'var(--yellow)' : 'var(--bear)'}">${r.health.stage.icon} ${r.health.stage.txt.split('（')[0]}・${r.health.rNow >= 0 ? '+' : ''}${r.health.rNow}R</span>` : '',
+    r.thesis ? `<span class="sig-tag" title="${r.thesis.items.map(x => `${x.label}${x.ok ? '✓' : '✗'}`).join(' ')}" style="color:${r.thesis.verdict === 'intact' ? 'var(--bull)' : r.thesis.verdict === 'weak' ? 'var(--yellow)' : 'var(--bear)'}">🧭 理由 ${r.thesis.intact.length}/${r.thesis.items.length}</span>` : '',
+  ].filter(Boolean).join('');
+  return `
+    <div class="sig-card" style="border-color:${bd.c}55;background:linear-gradient(180deg, ${bd.c}12, rgba(255,255,255,0.02));cursor:pointer" onclick="showHoldingView('${h.id}')" title="點擊查看 AI 對此持倉的看法">
+      <div class="sig-head">
+        <div class="sig-grade" style="color:${bd.c};border-color:${bd.c};background:${bd.c}1f"><b>${r.pending ? '⏳' : bd.t.slice(0, 2)}</b><small>${r.pending ? '待掃' : bd.t.slice(3, 5)}</small></div>
+        <div>
+          <div class="sig-name">${h.name}<small>${h.id}</small></div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:3px">${chips}</div>
+        </div>
+        <div class="sig-ret">
+          <div class="r" style="color:${(r.retPct ?? 0) >= 0 ? 'var(--bull)' : 'var(--bear)'}">${r.retPct == null ? '--' : `${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%`}</div>
+          <div class="s">${h.qty > 0 ? `${h.qty} 張` : `<button class="btn-ghost" style="padding:0 7px;font-size:0.62rem" onclick="event.stopPropagation();setHoldingQty('${h.id}')">填張數</button>`}${div > 0 ? `・含息 ${div}` : ''}</div>
+        </div>
       </div>
-      <div style="font-size:0.72rem;color:var(--text3);margin-top:3px;font-family:var(--mono)">
-        成本 ${r.h.entry}｜現價 ${r.price != null ? r.price.toFixed(2) : '--'}｜停損 ${r.h.stop}${r.h.t1 ? `｜目標 ${r.h.t1}` : '｜無壓力續抱'}${r.h.qty > 0 ? `｜${r.h.qty} 張` : ` <button class="btn-ghost" style="padding:0 7px;font-size:0.64rem" onclick="event.stopPropagation();setHoldingQty('${r.h.id}')">填張數</button>`}
+      <div class="sig-levels">
+        <div class="sig-lv stop"><div class="l">停損（跌破就走）</div><div class="v">${stopAdj ?? '--'}</div><div class="p">${distStop != null ? `距 ${distStop.toFixed(1)}%` : ''}</div></div>
+        <div class="sig-lv entry"><div class="l">成本 → 現價</div><div class="v">${h.entry} → ${r.price != null ? r.price.toFixed(2) : '--'}</div><div class="p" style="color:var(--text3)">${h.addedAt ? `${h.addedAt.slice(5)} 進場` : ''}</div></div>
+        <div class="sig-lv tgt"><div class="l">${h.t1 ? '目標（先減半）' : '目標'}</div><div class="v">${h.t1 ? +(h.t1 - div).toFixed(2) : '續抱'}</div><div class="p">${distTgt != null ? `還差 ${distTgt.toFixed(1)}%` : (r.trail ? `移動停利 ${r.trail}` : '')}</div></div>
       </div>
-      <div style="font-size:0.75rem;color:var(--text2);margin-top:4px;line-height:1.6">${r.reasons.join('；')}</div>
-      <div style="margin-top:7px;display:flex;gap:8px">
-        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem" onclick="event.stopPropagation();closeHolding('${r.h.id}')">💰 已賣出</button>
-        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem" onclick="event.stopPropagation();showHoldingView('${r.h.id}')">🔍 AI 看法</button>
-        <button class="btn-ghost" style="padding:4px 12px;font-size:0.72rem;color:var(--text3)" onclick="event.stopPropagation();removeHolding('${r.h.id}')">移除（不記錄）</button>
+      ${r.price != null ? holdLadderHTML(stopAdj, h.entry, h.t1 ? +(h.t1 - div).toFixed(2) : null, r.price) : ''}
+      <div class="hold-next ${bd.k}">${r.level === 'exit' ? '🚪 ' : r.level === 'watch' ? '👀 ' : '✅ '}<b>下一步</b>：${next}</div>
+      ${rest.length ? `<details class="sig-details" onclick="event.stopPropagation()"><summary>其餘 ${rest.length} 項觀察</summary><div class="dl">${rest.map(x => `・${x}`).join('<br>')}</div></details>` : ''}
+      <div class="sig-foot">
+        <button class="btn-ghost" style="padding:5px 12px;font-size:0.72rem" onclick="event.stopPropagation();closeHolding('${h.id}')">💰 已賣出</button>
+        <button class="btn-ghost" style="padding:5px 12px;font-size:0.72rem" onclick="event.stopPropagation();showHoldingView('${h.id}')">🔍 AI 看法</button>
+        <button class="btn-ghost" style="padding:5px 12px;font-size:0.72rem;color:var(--text3)" onclick="event.stopPropagation();removeHolding('${h.id}')">移除（不記錄）</button>
       </div>
-    </div>`).join('');
+    </div>`;
 }
 
 function renderHoldings() {
