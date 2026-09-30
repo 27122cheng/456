@@ -920,3 +920,14 @@ input, select { font-family: var(--font); }
 .sig-sec .n { font-size:0.66rem; font-weight:700; padding:1px 8px; border-radius:9px; background:rgba(255,255,255,0.08); color:var(--text2); }
 .sig-sec-note { font-size:0.66rem; color:var(--text3); margin-bottom:8px; }
 @media (max-width: 480px) { .sig-lv .v { font-size:0.9rem; } .sig-strip .st { min-width:70px; padding:8px 9px; } }
+/* 持倉卡：現價標記 */
+.sig-ladder.pos { position:relative; padding-top:14px; }
+.sig-mark { position:absolute; top:0; transform:translateX(-50%); font-size:0.6rem; font-family:var(--mono); color:var(--text1); white-space:nowrap; line-height:1; }
+.sig-mark::after { content:''; display:block; width:2px; height:9px; background:var(--text1); margin:1px auto 0; }
+.hold-next { margin-top:8px; padding:7px 10px; border-radius:8px; font-size:0.78rem; line-height:1.5; color:var(--text1); background:rgba(255,255,255,0.04); border-left:3px solid var(--text3); }
+.hold-next.exit { border-left-color:var(--bear); background:rgba(239,68,68,0.08); }
+.hold-next.watch { border-left-color:var(--yellow); background:rgba(245,158,11,0.08); }
+.hold-next.hold { border-left-color:var(--bull); background:rgba(34,197,94,0.06); }
+.sig-ret { margin-left:auto; text-align:right; }
+.sig-ret .r { font-family:var(--mono); font-weight:900; font-size:1.15rem; line-height:1; }
+.sig-ret .s { font-size:0.62rem; color:var(--text3); margin-top:2px; }
