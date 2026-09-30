@@ -866,3 +866,57 @@ input, select { font-family: var(--font); }
   .page-title { font-size: 1.2rem; }
   .coin-price { font-size: 1.4rem; }
 }
+
+/* ── 推薦交易：直觀訊號卡 ──────────────────────────────── */
+.sig-strip { display:flex; gap:8px; flex-wrap:wrap; align-items:stretch; margin-bottom:12px; }
+.sig-strip .st { flex:1; min-width:86px; padding:9px 11px; border-radius:9px; background:rgba(255,255,255,0.03); border:1px solid var(--border); }
+.sig-strip .st-l { font-size:0.66rem; color:var(--text3); }
+.sig-strip .st-v { font-family:var(--mono); font-weight:800; font-size:1.05rem; margin-top:2px; }
+.sig-strip .st-s { font-size:0.64rem; color:var(--text3); margin-top:1px; }
+.sig-card { padding:12px 13px 10px; border-radius:11px; margin-bottom:10px; border:1px solid var(--border); background:rgba(255,255,255,0.025); position:relative; }
+.sig-card.k-swing { border-color:rgba(34,197,94,0.28); background:linear-gradient(180deg, rgba(34,197,94,0.07), rgba(255,255,255,0.02)); }
+.sig-card.k-watch { border-color:rgba(245,158,11,0.25); background:linear-gradient(180deg, rgba(245,158,11,0.06), rgba(255,255,255,0.02)); }
+.sig-card.k-day   { border-color:rgba(0,212,255,0.25); background:linear-gradient(180deg, rgba(0,212,255,0.06), rgba(255,255,255,0.02)); }
+.sig-card.k-short { border-color:rgba(239,68,68,0.28); background:linear-gradient(180deg, rgba(239,68,68,0.07), rgba(255,255,255,0.02)); }
+.sig-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+.sig-grade { width:42px; height:42px; border-radius:50%; display:flex; flex-direction:column; align-items:center; justify-content:center; font-family:var(--mono); font-weight:900; line-height:1; flex:none; border:2px solid; }
+.sig-grade b { font-size:1.05rem; }
+.sig-grade small { font-size:0.6rem; font-weight:700; opacity:0.9; }
+.sig-grade.g-A { color:var(--bull); border-color:var(--bull); background:rgba(34,197,94,0.12); }
+.sig-grade.g-B { color:var(--yellow); border-color:var(--yellow); background:rgba(245,158,11,0.12); }
+.sig-grade.g-D { color:var(--blue); border-color:var(--blue); background:rgba(0,212,255,0.12); }
+.sig-grade.g-S { color:var(--bear); border-color:var(--bear); background:rgba(239,68,68,0.12); }
+.sig-name { font-size:0.98rem; font-weight:800; cursor:pointer; }
+.sig-name small { font-size:0.72rem; color:var(--text3); font-weight:500; margin-left:4px; }
+.sig-tag { font-size:0.64rem; padding:2px 8px; border-radius:9px; font-weight:700; background:rgba(255,255,255,0.07); color:var(--text2); }
+.sig-act { margin-left:auto; font-size:0.78rem; font-weight:800; }
+.sig-reason { margin-top:7px; font-size:0.8rem; color:var(--text1); line-height:1.55; }
+.sig-levels { display:grid; grid-template-columns:1fr 1fr 1fr; gap:6px; margin-top:9px; }
+.sig-lv { padding:7px 8px; border-radius:8px; background:rgba(0,0,0,0.18); text-align:center; }
+.sig-lv .l { font-size:0.62rem; color:var(--text3); }
+.sig-lv .v { font-family:var(--mono); font-weight:800; font-size:0.98rem; margin-top:1px; }
+.sig-lv .p { font-size:0.64rem; font-family:var(--mono); margin-top:1px; }
+.sig-lv.stop .v { color:var(--bear); }  .sig-lv.stop .p { color:var(--bear); }
+.sig-lv.entry .v { color:var(--blue); }
+.sig-lv.tgt .v { color:var(--bull); }   .sig-lv.tgt .p { color:var(--bull); }
+.sig-ladder { margin-top:8px; }
+.sig-bar { display:flex; height:9px; border-radius:6px; overflow:hidden; background:rgba(255,255,255,0.06); }
+.sig-bar i { display:block; height:100%; }
+.sig-bar .risk { background:var(--bear); opacity:0.85; }
+.sig-bar .zone { background:var(--blue); opacity:0.9; }
+.sig-bar .rew  { background:var(--bull); opacity:0.85; }
+.sig-bar-txt { display:flex; justify-content:space-between; font-size:0.64rem; color:var(--text3); margin-top:3px; font-family:var(--mono); }
+.sig-meta { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; font-size:0.7rem; color:var(--text2); }
+.sig-meta span b { color:var(--text1); }
+.sig-warn { margin-top:6px; font-size:0.7rem; color:var(--yellow); }
+.sig-up { margin-top:6px; font-size:0.7rem; color:var(--yellow); padding:6px 9px; border-radius:7px; background:rgba(245,158,11,0.08); }
+.sig-details { margin-top:8px; font-size:0.72rem; color:var(--text3); }
+.sig-details summary { cursor:pointer; color:var(--text3); font-size:0.7rem; list-style:none; user-select:none; }
+.sig-details summary::before { content:'▸ '; }
+.sig-details[open] summary::before { content:'▾ '; }
+.sig-details .dl { margin-top:5px; line-height:1.7; color:var(--text2); }
+.sig-foot { margin-top:9px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.sig-sec { font-size:0.86rem; font-weight:800; color:var(--text1); margin:14px 0 2px; display:flex; align-items:center; gap:8px; }
+.sig-sec .n { font-size:0.66rem; font-weight:700; padding:1px 8px; border-radius:9px; background:rgba(255,255,255,0.08); color:var(--text2); }
+.sig-sec-note { font-size:0.66rem; color:var(--text3); margin-bottom:8px; }
+@media (max-width: 480px) { .sig-lv .v { font-size:0.9rem; } .sig-strip .st { min-width:70px; padding:8px 9px; } }
