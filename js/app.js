@@ -389,6 +389,12 @@ async function runScan() {
   // 資料過期重抓：有資料但停在數個交易日前者，清「最後一根 K 之後」的快取後全部重抓
   // （先前只抓前 30 檔、只清當月快取 → 停在上個月底的股票永遠補不上）
   await refetchStaleStocks({ progress: true });
+  // 波段改法實驗室：每 7 天用最新日 K 自動重跑一次（背景，不擋掃描收尾），讓「有效／無效」判定跟著市況更新
+  try {
+    const last = JSON.parse(localStorage.getItem('swing-lab-result') || 'null');
+    const age = last?.at ? tradingDaysBetween(last.at, twClock().date) : 99;
+    if (age >= 5 && allStocks.filter(s => s.ohlcv?.length >= 80).length >= 20) setTimeout(() => { runSwingLab().catch(() => {}); }, 4000);
+  } catch {}
 
   setScanProgress(100, '掃描完成');
   setTimeout(() => showScanBar(false), 1500);
@@ -4649,7 +4655,7 @@ function navigateTo(page, opts = {}) {
   if (page === 'ranking') renderRanking();
   if (page === 'dashboard') renderDashboard();
   if (page === 'holdings') renderHoldings();
-  if (page === 'journal') { renderJournal(); renderAiSignals(); renderAiLossLearning(); renderPredAccuracy(); renderBacktest(); }
+  if (page === 'journal') { renderJournal(); renderAiSignals(); renderAiLossLearning(); renderPredAccuracy(); renderBacktest(); renderSwingLab(); }
   if (page === 'daytrade') renderDayTradePage();
 
   // Apply filter from opts
@@ -6036,7 +6042,7 @@ function recordAiSignals() {
   const list = getAiSignals();
   const today = new Date().toISOString().slice(0, 10);
   let added = 0;
-  for (const { s, m, p, q } of picks) {
+  for (const { s, m, p, q, pillars } of picks) {
     // 同檔已有追蹤中訊號、或今天已建檔 → 不重複
     if (list.some(x => x.id === s.id && (x.status === 'open' || x.status === 'pending' || x.date === today))) continue;
     list.push({
@@ -6053,6 +6059,8 @@ function recordAiSignals() {
         atrPct: p.atr && p.lo ? +(p.atr / p.lo * 100).toFixed(2) : null,
         strict: !!_entryFunnel?.strict, qScore: q?.score ?? null,
         regime: outlookData.regime?.kind ?? null,
+        instDays: (() => { try { const st = instStreak(s.id); return st?.dir > 0 ? st.days : 0; } catch { return null; } })(),
+        whale: !!whaleFor(s.id), buzz: !!(pillars || []).includes('buzz'), fundOk: !!(pillars || []).includes('fund'),
         fresh: q?.prof?.fresh ?? null, gapFreq: q?.prof?.gapFreq ?? null, secRS: q?.prof?.secRS ?? null, reach: q?.reach ?? null,
         agr: +m.agr.toFixed(2), pctile: s.analysis.pctile?.zone ?? null,
         mktNorm: Math.round(outlookData.norm ?? 0),
@@ -6461,11 +6469,34 @@ function backtestStock(s, opts = {}) {
   const trailEMA = opts.longTerm ? e50 : e20;
   // 長期組連 3 收破才出場（減少均線附近洗刷出場 → 贏單抱得住，獲利因子提升）
   const trailN = opts.longTerm ? 3 : 2;
-  const timeStop = opts.longTerm ? 120 : 40;
+  const timeStop = opts.timeStop ?? (opts.longTerm ? 120 : 40);
   const adxMin = opts.adxMin ?? 20;
+  const rsiLo = opts.rsiLo ?? 50;
   const trades = [];
   let pos = null;
   const startI = opts.longTerm ? 100 : 60;
+  // ── 改法實驗用的序列（一次算好）：突破後天數、滾動跳空頻率、相對大盤 20 日報酬 ──
+  const sinceBrk = new Array(bars.length).fill(null);
+  if (opts.fresh != null) {
+    let last = null;
+    for (let i = 21; i < bars.length; i++) {
+      const hiPrev = Math.max(...highs.slice(i - 20, i));
+      const hiPrev2 = Math.max(...highs.slice(i - 21, i - 1));
+      if (closes[i] > hiPrev && !(closes[i - 1] > hiPrev2)) last = i;
+      sinceBrk[i] = last == null ? null : i - last;
+    }
+  }
+  const gapFreq = new Array(bars.length).fill(null);
+  if (opts.gapMax != null) {
+    let g = 0, c = 0; const q = [];
+    for (let i = 1; i < bars.length; i++) {
+      const isGap = closes[i - 1] > 0 && Math.abs(bars[i].open / closes[i - 1] - 1) >= 0.03 ? 1 : 0;
+      q.push(isGap); g += isGap; c++;
+      if (q.length > 120) { g -= q.shift(); c--; }
+      if (c >= 30) gapFreq[i] = g / c;
+    }
+  }
+  let confirmPending = null;   // confirmDay：訊號日索引，等隔日確認
   for (let i = startI; i < bars.length; i++) {
     const b = bars[i];
     if (pos) {
@@ -6511,8 +6542,36 @@ function backtestStock(s, opts = {}) {
     }
     if (i + 1 >= bars.length) break;
     const c = closes[i];
+    // confirmDay：昨天出訊號，今天收盤要高於訊號日收盤才算確認，明日開盤進場
+    if (opts.confirmDay && confirmPending != null) {
+      const sIdx = confirmPending; confirmPending = null;
+      if (!(c > closes[sIdx])) continue;
+      if (opts.regimeFn && !opts.regimeFn(b.time)) continue;
+      const entry = bars[i + 1].open;
+      const a = atr[i] || entry * 0.02;
+      let stop = Math.min(Math.min(...lows.slice(i - 4, i + 1)) * 0.99, entry - a);
+      const maxRisk = Math.min(entry * 0.08, a * (opts.stopATR ?? 3));
+      if (entry - stop > maxRisk) stop = entry - maxRisk;
+      if (stop >= entry) continue;
+      const risk = entry - stop;
+      let t1 = opts.targetR ? entry + risk * opts.targetR : (opts.resistTarget ? btFindResistance(highs, i, entry) : entry + risk * 2);
+      if (t1 != null && opts.resistTarget && !opts.targetR) { if (opts.frontRun) t1 = +(t1 * 0.995).toFixed(2); if (t1 - entry < risk) continue; }
+      pos = { i: i + 1, entry, stop, risk, t1, cum: 0, below: 0, scaled: false, realized: 0 };
+      continue;
+    }
     if (opts.regimeFn && !opts.regimeFn(b.time)) continue;      // 大盤濾網
     if (!(c > e20[i] && e20[i] > e50[i])) continue;
+    if (opts.settled) {                                           // 結構站穩：近 5 日 ≥3 日收在 EMA20 之上
+      let above = 0; for (let k = i - 4; k <= i; k++) if (closes[k] > e20[k]) above++;
+      if (above < 3) continue;
+    }
+    if (opts.weekly && !(e50[i] > e50[i - 5] && c > e50[i])) continue;   // 週線代理：50 日 EMA 上升且價在其上
+    if (opts.fresh != null && !(sinceBrk[i] != null && sinceBrk[i] <= opts.fresh)) continue;
+    if (opts.gapMax != null && gapFreq[i] != null && gapFreq[i] >= opts.gapMax) continue;
+    if (opts.rsMarket && opts.twiiRet20) {                        // 相對大盤：20 日報酬需不輸大盤
+      const mr = opts.twiiRet20(b.time);
+      if (mr != null && i >= 20 && (c - closes[i - 20]) / closes[i - 20] * 100 < mr) continue;
+    }
     if (opts.longTerm && !(e100 && c > e100[i] && e50[i] > e100[i])) continue; // 長期結構
     if (opts.extMax && c > e20[i] * opts.extMax) continue;       // 乖離過大不追
     if (opts.pullback && Math.min(lows[i], lows[i - 1], lows[i - 2]) > e20[i] * 1.015) continue; // 近 3 根未回踩 EMA20 → 半空中不追
@@ -6523,18 +6582,21 @@ function backtestStock(s, opts = {}) {
       if (avgV > 0 && vols[i] < avgV * 0.8) continue;
     }
     if (!(macd[i] > sig[i])) continue;
-    if (!(rsi[i] != null && rsi[i] >= 50 && rsi[i] < rsiMax)) continue;
+    if (!(rsi[i] != null && rsi[i] >= rsiLo && rsi[i] < rsiMax)) continue;
     if (!(adx[i] != null && adx[i] >= adxMin)) continue;
+    if (opts.confirmDay) { confirmPending = i; continue; }     // 等隔日確認再進場
     const entry = bars[i + 1].open;
     const a = atr[i] || entry * 0.02;
     let stop = Math.min(Math.min(...lows.slice(i - 4, i + 1)) * 0.99, entry - a);
-    const maxRisk = Math.min(entry * 0.08, a * 3);
+    const maxRisk = Math.min(entry * 0.08, a * (opts.stopATR ?? 3));
     if (entry - stop > maxRisk) stop = entry - maxRisk;
     if (stop >= entry) continue;
     const risk = entry - stop;
     let t1;
     if (opts.longTerm) {
       t1 = null;                                        // 長期：不設固定停利，跟著趨勢走
+    } else if (opts.targetR) {
+      t1 = entry + risk * opts.targetR;                 // 固定 R 倍數目標（實驗用）
     } else if (opts.resistTarget) {
       t1 = btFindResistance(highs, i, entry);           // 最近的真實壓力區
       if (t1 != null && opts.frontRun) t1 = +(t1 * 0.995).toFixed(2); // 掛壓力前緣，提高成交率
@@ -6799,6 +6861,119 @@ function renderBacktest() {
       ${r.worst?.length ? `最不適合：${r.worst.map(x => `${x.name}（均 ${x.avgR > 0 ? '+' : ''}${x.avgR}R）`).join('、')}<br>` : ''}
       <span style="color:var(--text3);font-size:0.7rem">${r.at} 回測｜${r.universe} 檔｜僅回測技術核心（次日開盤進場、除息已還原）；實盤另有籌碼/基本面/大盤過濾，結果會不同</span>
     </div>${btn}`;
+}
+
+// ── 波段改法實驗室：每個「提高勝率的辦法」都用真實日 K 驗證，不憑感覺採用 ────
+// 基準＝實盤現行技術核心（SWING 設定）。每個改法只改一件事，走動式：以時間 70/30 切開，
+// 只看最後 30%（驗證段）的成績決定有沒有用 —— 全段好看但驗證段變差的改法，是過擬合。
+// 判定：驗證段 n≥15，勝率 ≥基準+3pp 且平均 R ≥基準+0.10 → ✅ 有效；平均 R ≤基準−0.10 → ❌ 更差；其餘 ➖。
+const SWING_VARIANTS = [
+  { k: 'pullbackRSI', name: '拉回進場（RSI 45~60）', why: '不在 RSI 60+ 追突破，等回到均線附近、動能剛轉強時買 — 進場價更低、停損更近', opts: { rsiLo: 45, rsiMax: 60, pullback: true } },
+  { k: 'fresh5',      name: '只追剛突破（≤5 天）',    why: '突破後 5 天內跟進續航力最好；老化突破失敗率高', opts: { fresh: 5 } },
+  { k: 'gap8',        name: '排除常跳空（≥8%）',      why: '常跳空的股票停損會被跳過，真實虧損大於計畫', opts: { gapMax: 0.08 } },
+  { k: 'settled',     name: '結構站穩（5 日 3 日在 EMA20 上）', why: '碰到均線就買的訊號隔天常消失；站穩再買', opts: { settled: true } },
+  { k: 'weekly',      name: '週線同向（50 日 EMA 上升）', why: '大級別向下時日線多單是逆勢', opts: { weekly: true } },
+  { k: 'rsMarket',    name: '不輸大盤（20 日相對強弱 ≥0）', why: '資金在的股票才會續漲', opts: { rsMarket: true } },
+  { k: 'confirmDay',  name: '隔日確認再進場',          why: '訊號日隔天收盤要再創高才進，濾掉一日行情', opts: { confirmDay: true } },
+  { k: 'adx25',       name: 'ADX ≥25（趨勢更明確）',     why: '弱趨勢裡的訊號多半盤整到時間停損', opts: { adxMin: 25 } },
+  { k: 'stop2',       name: '停損上限 2×ATR',           why: '停損更近：單筆賠得少、但更容易被掃出 — 用數據決定', opts: { stopATR: 2 } },
+  { k: 'target15',    name: '固定 1.5R 停利',           why: '目標近 → 勝率高，但賠率降低 — 看期望值而非勝率', opts: { targetR: 1.5 } },
+  { k: 'time20',      name: '時間停損 20 日',           why: '20 天沒走就不會走；資金效率', opts: { timeStop: 20 } },
+  { k: 'noVol',       name: '取消量能確認',             why: '回踩日本來量縮；量能門檻可能濾掉好的拉回單', opts: { volConfirm: false } },
+];
+// 驗證段切點：所有股票日期聯集的 70% 分位
+function btSplitDate(stocks) {
+  const dates = [...new Set(stocks.flatMap(s => (s.ohlcv || []).map(b => b.time)))].sort();
+  return dates.length ? dates[Math.floor(dates.length * 0.7)] : null;
+}
+function btTwiiRet20Fn(twiiBars) {
+  if (!twiiBars || twiiBars.length < 25) return null;
+  const dates = twiiBars.map(b => b.time), closes = twiiBars.map(b => b.close);
+  return (date) => {
+    let lo = 0, hi = dates.length - 1, idx = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (dates[mid] <= date) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (idx < 20) return null;
+    return (closes[idx] - closes[idx - 20]) / closes[idx - 20] * 100;
+  };
+}
+function labVerdict(v, base) {
+  if (!v || !base || (v.trades || 0) < 15 || (base.trades || 0) < 15) return { k: 'na', t: '樣本不足' };
+  if (v.avgR >= base.avgR + 0.10 && v.winRate >= base.winRate + 3) return { k: 'good', t: '✅ 有效' };
+  if (v.avgR <= base.avgR - 0.10) return { k: 'bad', t: '❌ 更差' };
+  return { k: 'flat', t: '➖ 無明顯差異' };
+}
+async function runSwingLab() {
+  const el = document.getElementById('swing-lab-body');
+  const ready = allStocks.filter(s => s.ohlcv?.length >= 80);
+  if (ready.length < 5) { if (el) el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">歷史資料尚未就緒，請等掃描完成後再執行。</p>'; return null; }
+  if (el) el.innerHTML = '<div class="adv-loading">實驗中（每個改法都跑全池 14 個月）...</div>';
+  let regimeFn = null, twiiRet20 = null;
+  try { const tw = await fetchTWIIOHLC(14); regimeFn = makeRegimeFn(tw); twiiRet20 = btTwiiRet20Fn(tw); } catch {}
+  const BASE = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true, pullback: true, volConfirm: true, frontRun: true, adxMin: 22, twiiRet20 };
+  const split = btSplitDate(ready);
+  const run = (opts) => {
+    const all = [];
+    for (const s of ready) { try { all.push(...backtestStock(s, opts)); } catch {} }
+    const val = split ? all.filter(t => t.entryTime >= split) : all;
+    const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null }; };
+    return { all: sum(all), val: sum(val) };
+  };
+  const base = run(BASE);
+  const rows = [];
+  for (let i = 0; i < SWING_VARIANTS.length; i++) {
+    const v = SWING_VARIANTS[i];
+    const r = run({ ...BASE, ...v.opts });
+    rows.push({ k: v.k, name: v.name, why: v.why, all: r.all, val: r.val, verdict: labVerdict(r.val, base.val) });
+    if (el) { el.innerHTML = `<div class="adv-loading">實驗中... ${i + 1}/${SWING_VARIANTS.length}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
+  }
+  // 組合：把所有「有效」的改法疊在一起再驗一次（疊加不一定更好 —— 條件太多會訊號枯竭）
+  const good = rows.filter(r => r.verdict.k === 'good');
+  let combo = null;
+  if (good.length >= 2) {
+    const opts = Object.assign({}, BASE, ...good.map(r => SWING_VARIANTS.find(v => v.k === r.k).opts));
+    const r = run(opts);
+    combo = { ks: good.map(r => r.k), all: r.all, val: r.val, verdict: labVerdict(r.val, base.val) };
+  }
+  const result = { at: twClock().date, universe: ready.length, split, hasRegime: !!regimeFn, base, rows, combo };
+  try { localStorage.setItem('swing-lab-result', JSON.stringify(result)); } catch {}
+  renderSwingLab();
+  return result;
+}
+// 採用：使用者按下後，有效的改法變成實盤進場的硬門檻（可隨時取消）；每週自動重跑實驗更新判定
+function swingLabAdopted() { try { return JSON.parse(localStorage.getItem('swing-lab-adopt') || '{}'); } catch { return {}; } }
+function swingLabAdoptGood() {
+  let r = null; try { r = JSON.parse(localStorage.getItem('swing-lab-result') || 'null'); } catch {}
+  if (!r) return;
+  const adopt = {};
+  for (const row of r.rows) if (row.verdict.k === 'good') adopt[row.k] = true;
+  localStorage.setItem('swing-lab-adopt', JSON.stringify(adopt));
+  showToast(Object.keys(adopt).length ? `已採用 ${Object.keys(adopt).length} 項有效改法，下次掃描生效` : '目前沒有驗證有效的改法可採用', Object.keys(adopt).length ? 'success' : 'info');
+  renderSwingLab();
+  try { renderEntrySignals(); } catch {}
+}
+function swingLabClear() { localStorage.removeItem('swing-lab-adopt'); showToast('已取消採用，回到基準規則', 'info'); renderSwingLab(); try { renderEntrySignals(); } catch {} }
+function renderSwingLab() {
+  const el = document.getElementById('swing-lab-body');
+  if (!el) return;
+  let r = null; try { r = JSON.parse(localStorage.getItem('swing-lab-result') || 'null'); } catch {}
+  const adopt = swingLabAdopted();
+  const btn = `<button class="btn-primary" style="padding:6px 16px;font-size:0.76rem" onclick="runSwingLab()">▶ ${r ? '重新' : ''}執行實驗</button>`;
+  if (!r) { el.innerHTML = `<p style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">把 12 個「提高勝率的辦法」各自套回全池真實日 K，用最後 30% 時段的成績判定有沒有用。</p>${btn}`; return; }
+  const cell = (x, base) => x.trades
+    ? `<td style="text-align:right;font-family:var(--mono)">${x.trades}</td><td style="text-align:right;font-family:var(--mono);color:${base && x.winRate >= base.winRate + 3 ? 'var(--bull)' : base && x.winRate <= base.winRate - 3 ? 'var(--bear)' : 'var(--text1)'}">${x.winRate}%</td><td style="text-align:right;font-family:var(--mono);color:${x.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${x.avgR > 0 ? '+' : ''}${x.avgR}</td><td style="text-align:right;font-family:var(--mono)">${x.pf ?? '∞'}</td>`
+    : '<td colspan="4" style="color:var(--text3);text-align:center">無交易</td>';
+  const vc = { good: 'var(--bull)', bad: 'var(--bear)', flat: 'var(--text3)', na: 'var(--text3)' };
+  const rows = [...r.rows].sort((a, b) => ({ good: 0, flat: 1, na: 2, bad: 3 }[a.verdict.k] - { good: 0, flat: 1, na: 2, bad: 3 }[b.verdict.k]) || (b.val.avgR - a.val.avgR));
+  el.innerHTML = `
+    <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">${r.at}｜${r.universe} 檔｜驗證段＝${r.split} 之後${r.hasRegime ? '' : '｜⚠ 本輪無大盤資料，大盤濾網未生效'}｜基準＝實盤現行技術核心</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem;color:var(--text2)">
+      <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">改法</td><td colspan="4" style="text-align:center;padding:4px 6px">驗證段（最後 30%）：筆數／勝率／平均R／獲利因子</td><td colspan="4" style="text-align:center;padding:4px 6px">全段</td><td style="padding:4px 6px">判定</td></tr>
+      <tr style="font-weight:700;border-bottom:1px solid var(--border)"><td style="padding:5px 6px">基準（現行）</td>${cell(r.base.val)}${cell(r.base.all)}<td style="padding:5px 6px;color:var(--text3)">—</td></tr>
+      ${rows.map(x => `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)"><td style="padding:5px 6px"><b>${x.name}</b>${adopt[x.k] ? ' <span style="color:var(--bull);font-size:0.64rem">（已採用）</span>' : ''}<br><span style="color:var(--text3);font-size:0.66rem">${x.why}</span></td>${cell(x.val, r.base.val)}${cell(x.all, r.base.all)}<td style="padding:5px 6px;color:${vc[x.verdict.k]};font-weight:700;white-space:nowrap">${x.verdict.t}</td></tr>`).join('')}
+      ${r.combo ? `<tr style="border-top:1px solid var(--border);font-weight:700"><td style="padding:5px 6px">疊加全部有效改法<br><span style="color:var(--text3);font-size:0.66rem;font-weight:400">${r.combo.ks.join('＋')}</span></td>${cell(r.combo.val, r.base.val)}${cell(r.combo.all, r.base.all)}<td style="padding:5px 6px;color:${vc[r.combo.verdict.k]}">${r.combo.verdict.t}</td></tr>` : ''}
+    </table></div>
+    <div style="font-size:0.68rem;color:var(--text3);margin:6px 0 8px;line-height:1.6">判定只看驗證段（避免過擬合）：n≥15、勝率 ≥基準+3pp 且平均 R ≥基準+0.10 才算有效。勝率高但平均 R 變差的改法（如固定 1.5R）會被判「更差」— 系統看的是期望值，不是勝率。只回測技術核心；籌碼／基本面／新聞的歷史快照無免費資料，它們的有效性由「AI 訊號成績單」的情境分組統計驗證。</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">${btn}<button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem" onclick="swingLabAdoptGood()">✅ 採用所有有效改法</button>${Object.keys(adopt).length ? `<button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem;color:var(--text3)" onclick="swingLabClear()">取消採用（${Object.keys(adopt).length} 項）</button>` : ''}</div>`;
 }
 
 // ── 週一開盤前情勢簡報 ──────────────────────────────────────────────────────
@@ -9730,7 +9905,7 @@ function entryQuality(s, m, p) {
 let _entryFunnel = null;   // 最近一次進場篩選的漏斗統計
 const FUNNEL_LABELS = { stale: '資料過期', headwind: '大盤逆風', dir: '研判強度不足', plan: '無進場計畫', extended: '已追高',
   heat: '組合風險已滿', rr: '風報比不足', illiquid: '流動性不足', weekly: '週線逆勢', fresh: '結構未站穩', event: '事件視窗', excluded: '排除條件', range: '盤整盤位置', learned: '學習門檻', pricedIn: '利多已反映', trap: '主力誘多', quality: '品質 C 級',
-  pillars: '三支柱缺二', sectorCap: '族群上限', exposure: '族群曝險已滿' };
+  pillars: '三支柱缺二', sectorCap: '族群上限', exposure: '族群曝險已滿', lab: '實驗室改法' };
 function funnelHTML() {
   const F = _entryFunnel; if (!F) return '';
   const steps = Object.keys(FUNNEL_LABELS).filter(k => F[k]).map(k => `${FUNNEL_LABELS[k]} −${F[k]}`);
@@ -9870,8 +10045,9 @@ function entryEnv() {
   let heat = null; try { heat = portfolioHeat(); } catch {}
   let cooldown = null; try { cooldown = systemCooldown(); } catch {}
   let cutAdj = 0; try { cutAdj = qualityCutAdj().adj; } catch {}
+  let adopt = {}; try { adopt = swingLabAdopted(); } catch {}
   return { AF, hw: marketHeadwind(AF.headwind), perfRules: signalPerfStats(), mktNow, mret: marketRet20(),
-           strict, aCut: Math.min(85, (strict ? 80 : 75) + cutAdj), cutAdj, rrMin: strict ? 2 : 1.5, heat, heatOver: !!heat?.over, cooldown };
+           strict, aCut: Math.min(85, (strict ? 80 : 75) + cutAdj), cutAdj, rrMin: strict ? 2 : 1.5, heat, heatOver: !!heat?.over, cooldown, adopt };
 }
 
 // ── 單檔進場評估：每道門檻都留下 ✓/✗ 與說明 ─────────────────────────────
@@ -9955,6 +10131,18 @@ function evalEntry(s, env) {
   if (AF.minRevYoy != null && s.rev?.yoy != null && s.rev.yoy < AF.minRevYoy) return fail('learned', `學習門檻：月營收年增 ${s.rev.yoy.toFixed(1)}% < ${AF.minRevYoy}%`);
   if (AF.noSectorOut) { let out = false; try { out = sectorStatsCached().find(g => g.sector === s.sector)?.rotation?.state === 'out'; } catch {} if (out) return fail('learned', '學習門檻：族群資金流出中不進場'); }
   if (AF.maxFresh != null) { const fr = setupProfile(s).fresh; if (fr != null && fr > AF.maxFresh) return fail('learned', `學習門檻：突破後已 ${fr} 天，超過 ${AF.maxFresh} 天不追`); }
+  // 實驗室採用的改法：真實日 K 驗證有效後由使用者採用，成為硬門檻
+  const AD = env.adopt || {};
+  if (Object.keys(AD).length) {
+    const prof = setupProfile(s);
+    if (AD.pullbackRSI && !(a.rsi != null && a.rsi >= 45 && a.rsi <= 60 && ext <= 3)) return fail('lab', `實驗室改法：拉回進場需 RSI 45~60 且乖離 ≤3%（現 RSI ${a.rsi?.toFixed(0) ?? '--'}、乖離 ${ext.toFixed(1)}%）`);
+    if (AD.fresh5 && !(prof.fresh != null && prof.fresh <= 5)) return fail('lab', `實驗室改法：只追突破後 ≤5 天（${prof.fresh == null ? '近 15 日無突破' : `已 ${prof.fresh} 天`}）`);
+    if (AD.gap8 && prof.gapFreq != null && prof.gapFreq >= 0.08) return fail('lab', `實驗室改法：跳空頻率 ${(prof.gapFreq * 100).toFixed(0)}% ≥8% 不進場`);
+    if (AD.rsMarket && mret != null && r20 != null && r20 < mret) return fail('lab', `實驗室改法：20 日報酬落後大盤 ${(mret - r20).toFixed(1)}pp 不進場`);
+    if (AD.adx25 && !(a.adx >= 25)) return fail('lab', `實驗室改法：ADX ${a.adx?.toFixed(0) ?? '--'} < 25`);
+    if (AD.weekly && !(p.wk?.dir > 0)) return fail('lab', `實驗室改法：週線需偏多（${p.wk?.txt || '—'}）`);
+  }
+  ok('lab', Object.keys(AD).length ? `通過 ${Object.keys(AD).length} 項實驗室採用改法` : '未採用實驗室改法');
   ok('learned', `乖離 ${ext.toFixed(1)}%、一致性 ${(m.agr * 100).toFixed(0)}%${AF.learned.length ? `，通過 ${AF.learned.length} 條學習門檻` : ''}`);
   // 利多已反映：追在人人都知道之後，沒有救
   if (p.cat?.pricedIn) return fail('pricedIn', p.cat.pricedInTxt || '利多已反映');
@@ -10185,6 +10373,13 @@ function expectancyBySituation() {
     if (t.ctx.maturity) add(`階段：${{ early: '初段', mid: '主升段', late: '末段' }[t.ctx.maturity] || t.ctx.maturity}`, r);
     if (t.ctx.pctile) add(`位階：${{ high: '高檔', mid: '中檔', low: '低檔' }[t.ctx.pctile] || t.ctx.pctile}`, r);
     if (t.ctx.mktNorm != null) add(`大盤：${t.ctx.mktNorm >= 15 ? '偏多' : t.ctx.mktNorm <= -15 ? '偏空' : '中性'}`, r);
+    // 籌碼／基本面／題材：這三個維度無法回測（沒有歷史快照），只能靠實盤訊號分組驗證「到底有沒有用」
+    if (t.ctx.instDays != null) add(`籌碼：法人${t.ctx.instDays >= 3 ? '連買 ≥3 日' : t.ctx.instDays >= 1 ? '買超 1~2 日' : '未買超'}`, r);
+    if (t.ctx.whale != null) add(`籌碼：大戶訊號${t.ctx.whale ? '有' : '無'}`, r);
+    if (t.ctx.revYoy != null) add(`基本面：營收年增${t.ctx.revYoy >= 10 ? ' ≥10%' : t.ctx.revYoy >= 0 ? ' 0~10%' : '為負'}`, r);
+    if (t.ctx.buzz != null) add(`題材：新聞討論度${t.ctx.buzz ? '有' : '無'}`, r);
+    if (t.ctx.regime) add(`盤性：${{ trend: '趨勢', range: '盤整', transition: '轉換中' }[t.ctx.regime] || t.ctx.regime}`, r);
+    if (t.ctx.fresh != null) add(`型態：突破後${t.ctx.fresh <= 5 ? ' ≤5 天' : ' >5 天'}`, r);
   }
   return Object.entries(groups)
     .filter(([, rs]) => rs.length >= 5)
@@ -10251,7 +10446,7 @@ function renderExpectancy() {
         <span style="font-family:var(--mono);color:${x.exp > 0.2 ? 'var(--bull)' : x.exp < 0 ? 'var(--bear)' : 'var(--yellow)'}">${x.exp > 0 ? '+' : ''}${x.exp}R <span style="color:var(--text3)">（n=${x.n}）</span></span></div>`;
       return `<div style="margin-top:12px">
         <div style="font-size:0.72rem;color:var(--text3);margin-bottom:5px">📂 情境分組期望值 — 系統在哪種環境有優勢、哪種環境該收手</div>
-        ${sit.slice(0, 8).map(row).join('')}
+        ${sit.slice(0, 14).map(row).join('')}
       </div>`;
     })()}`;
 }
