@@ -933,6 +933,7 @@ function renderMarketOutlook() {
   let predict = `綜合 ${rows.length} 項因子，市場評分 <strong>${norm > 0 ? '+' : ''}${norm}</strong>（區間 -100 ~ +100）${confTxt}`;
   if (reg.kindTxt) predict += `<br><span style="color:${reg.kind === 'trend' ? 'var(--bull)' : reg.kind === 'range' ? 'var(--yellow)' : 'var(--text3)'}">盤性：${reg.kindTxt}</span>`;
   if (reg.vol?.txt) predict += `<br><span style="color:${reg.vol.level === 'high' ? 'var(--bear)' : 'var(--text3)'}">${reg.vol.txt}</span>`;
+  try { const cm = {}; for (const c of reg.comps || []) cm[c.k] = c.score; const mp = marketDirProbability(cm, reg.kind); if (mp.prob != null) predict += `<br><span style="color:${mp.abstain ? 'var(--yellow)' : mp.pct >= 58 ? 'var(--bull)' : 'var(--bear)'}">🎲 ${mp.txt}</span>`; else predict += `<br><span style="color:var(--text3)">🎲 方向機率模型：${mp.txt}</span>`; } catch {}
   predict += coverage >= 85
     ? '。'
     : `，<span style="color:var(--yellow)">資料完整度 ${coverage}%（部分來源未回應，評分僅供參考）</span>。`;
@@ -2974,7 +2975,8 @@ function buildEntryPlan(s, m, opts = {}) {
   if (stop >= lo) stop = +(lo - atr).toFixed(2);
   // 上限保護：突破創新高時結構支撐可能離得很遠，
   // 停損距離超過 8% 或 3×ATR 就改用較近者，避免單筆風險過大
-  const maxRisk = Math.min(lo * 0.08, atr * 3);
+  const tuned = opts.tuned || null;
+  const maxRisk = Math.min(lo * 0.08, atr * (tuned?.stopATR ?? 3));
   let stopCapped = false;
   if (lo - stop > maxRisk) { stop = +(lo - maxRisk).toFixed(2); stopCapped = true; }
   // 實證停損收緊：贏單 MAE90×1.3（＋至少 1.2×ATR 底線）明顯窄於結構停損時，
@@ -3202,6 +3204,13 @@ function buildEntryPlan(s, m, opts = {}) {
         ? '現價已低於進場區下緣，留意支撐是否失守'
         : '現價位於進場區內，可分批布局',
   };
+  if (tuned?.targetR != null && mode !== 'meanrev' && mode !== 'trail') {
+    // 調參採用的固定 R 目標：驗證段證明「拿到就走」比等壓力區更划算時才會出現
+    const tg = +(lo + r * tuned.targetR).toFixed(2);
+    plan = { ...plan, t1: tg, t2: +(tg * 1.03).toFixed(2), holdOn: false, rr: tuned.targetR, rewardPct1: (tg - lo) / lo * 100, rewardPct2: (tg * 1.03 - lo) / lo * 100, rrWarn: null,
+      targetNote: `調參目標：固定 ${tuned.targetR}R（${tg}）— 實驗室驗證段顯示在此池「拿到就走」的期望值優於等壓力區`,
+      scale: { ...scale, x1: `觸及 ${tg}（${tuned.targetR}R）全出`, x2: null }, netReward1: +((tg - lo) / lo * 100 - costPct).toFixed(2) };
+  }
   if (mode === 'meanrev') {
     const low2 = Math.min(...lows.slice(-2));
     let st2 = +(low2 * 0.98).toFixed(2);
@@ -3243,8 +3252,8 @@ function entryGateHtml(s) {
 }
 
 function entryPlanHtml(s, m) {
-  let modeNow = 'breakout'; try { modeNow = currentSwingStrategy().k || 'breakout'; } catch {}
-  const p = buildEntryPlan(s, m, { mode: modeNow });
+  let modeNow = 'breakout', tunedNow = null; try { const cs = currentSwingStrategy(); modeNow = cs.k || 'breakout'; tunedNow = cs.tuned || null; } catch {}
+  const p = buildEntryPlan(s, m, { mode: modeNow, tuned: tunedNow });
   if (!p) return '';
   if (!p.ok) {
     return `<div style="margin-top:14px;padding:12px 14px;border-radius:10px;background:rgba(148,163,184,0.06);border:1px solid var(--border)">
@@ -6998,13 +7007,74 @@ function edgeGateOn() { return localStorage.getItem('edge-gate') !== 'false'; }
 function currentSwingStrategy() {
   const lab = swingLabResult();
   const kind = outlookData.regime?.kind;
-  if (!lab?.champion) return { k: 'breakout', name: '突破追蹤', src: 'default', kind, stats: null, noEdge: false };
+  if (!lab?.champion) return { k: 'breakout', name: '突破追蹤', src: 'default', kind, stats: null, noEdge: false, tuned: currentTunedParams('breakout') };
   const k = (kind && lab.champion[kind]) || lab.champion.overall || null;
   if (!k) return { k: null, name: null, src: 'lab', kind, stats: null, noEdge: edgeGateOn() };
   const st = lab.strategies?.find(x => x.k === k);
   const stats = (kind && st?.byKind?.[kind]?.trades >= 12) ? st.byKind[kind] : st?.val || null;
-  return { k, name: SWING_STRATEGIES.find(x => x.k === k)?.name || k, src: kind && lab.champion[kind] ? 'kind' : 'overall', kind, stats, noEdge: false };
+  return { k, name: SWING_STRATEGIES.find(x => x.k === k)?.name || k, src: kind && lab.champion[kind] ? 'kind' : 'overall', kind, stats, noEdge: false, tuned: currentTunedParams(k) };
 }
+
+// 權益曲線最大回撤（R）：依出場日排序累加
+function btMaxDD(trades) {
+  const t = [...(trades || [])].sort((a, b) => String(a.exitTime).localeCompare(String(b.exitTime)));
+  let eq = 0, peak = 0, dd = 0;
+  for (const x of t) { eq += x.r; peak = Math.max(peak, eq); dd = Math.min(dd, eq - peak); }
+  return +dd.toFixed(2);
+}
+// 贏單 MAE p90／MFE p50（R）：止損該多遠、止盈該多遠的實證距離
+function btMaeMfe(trades) {
+  const wins = (trades || []).filter(t => t.r > 0);
+  const mae = wins.map(t => t.maeR).filter(v => v != null).map(v => Math.abs(Math.min(0, v))).sort((a, b) => a - b);
+  const mfe = (trades || []).map(t => t.mfeR).filter(v => v != null && v > 0).sort((a, b) => a - b);
+  const q = (arr, p) => arr.length ? +arr[Math.min(arr.length - 1, Math.floor(arr.length * p))].toFixed(2) : null;
+  return { n: wins.length, mae90: q(mae, 0.9), mfe50: q(mfe, 0.5), mfe30: q(mfe, 0.3) };
+}
+// ── 目標導向調參：在「期望值為正、回撤受控」的前提下，找這個池子勝率最高能到多少 ──
+// 訓練段（前 70%）挑參數、驗證段（後 30%）打分。目標勝率是使用者的期望，能不能達到由資料回答，
+// 不會為了湊勝率去犧牲期望值 —— 勝率 80% 但賠率 1:0.4 的系統長期照樣賠錢。
+const TUNE_TARGET = { winRate: 80, maxDD: -4 };   // 目標勝率 80%；訓練段權益回撤不得深於 −4R
+const TUNE_GRID = {
+  breakout: { rsiMax: [60, 65, 70], stopATR: [1.5, 2, 3], targetR: [1.2, 1.5, 2, null], adxMin: [20, 25], decayStop: [false, true] },
+  pullback: { rsiMax: [55, 60], stopATR: [1.5, 2, 3], targetR: [1.2, 1.5, 2, null], adxMin: [20, 25], decayStop: [false, true] },
+  meanrev:  { timeStop: [6, 10, 15] },
+  trail:    { stopATR: [2, 3] },
+};
+function gridCombos(grid) {
+  const keys = Object.keys(grid);
+  let out = [{}];
+  for (const k of keys) out = out.flatMap(o => grid[k].map(v => ({ ...o, [k]: v })));
+  return out;
+}
+function tuneStrategy(st, ready, split, BASE, objective = 'winrate') {
+  const grid = TUNE_GRID[st.k]; if (!grid) return null;
+  const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null, maxDD: btMaxDD(tr) }; };
+  let best = null; const tried = [];
+  for (const params of gridCombos(grid)) {
+    const opts = { ...BASE, ...st.opts, ...params };
+    if (params.targetR != null) opts.resistTarget = false;
+    const all = [];
+    for (const s of ready) { try { all.push(...backtestStock(s, opts)); } catch {} }
+    const train = sum(all.filter(t => !split || t.entryTime < split)), val = sum(all.filter(t => split && t.entryTime >= split));
+    const ok = train.trades >= 25 && train.avgR >= 0.1 && train.maxDD >= TUNE_TARGET.maxDD;
+    const score = objective === 'winrate' ? train.winRate + train.avgR * 10 : train.avgR * 100 + train.winRate * 0.1;
+    tried.push({ params, train, val, ok });
+    if (ok && (!best || score > best.score)) best = { params, train, val, score };
+  }
+  const mm = best ? btMaeMfe(ready.flatMap(s => { try { return backtestStock(s, { ...BASE, ...st.opts, ...best.params, resistTarget: best.params.targetR == null }); } catch { return []; } })) : null;
+  return { k: st.k, name: st.name, best, tried: tried.length, feasible: tried.filter(t => t.ok).length, maeMfe: mm };
+}
+function tunedLive() { try { return JSON.parse(localStorage.getItem('swing-tuned-live') || '{}'); } catch { return {}; } }
+function currentTunedParams(k) { const t = tunedLive(); return k && t[k] ? t[k] : null; }
+function swingTuneAdopt() {
+  const r = swingLabResult(); if (!r?.tuned) return;
+  const live = {};
+  for (const t of r.tuned) if (t.best && t.best.val.trades >= 12 && t.best.val.avgR > 0) live[t.k] = t.best.params;
+  localStorage.setItem('swing-tuned-live', JSON.stringify(live));
+  showToast(Object.keys(live).length ? `已採用 ${Object.keys(live).length} 套調參結果（驗證段 n≥12 且期望值為正者）` : '沒有通過驗證段的調參結果可採用', Object.keys(live).length ? 'success' : 'info');
+  renderSwingLab(); try { renderEntrySignals(); } catch {}
+}
+function swingTuneClear() { localStorage.removeItem('swing-tuned-live'); showToast('已取消調參採用，回到預設參數', 'info'); renderSwingLab(); try { renderEntrySignals(); } catch {} }
 
 // 驗證段切點：所有股票日期聯集的 70% 分位
 function btSplitDate(stocks) {
@@ -7072,7 +7142,13 @@ async function runSwingLab() {
     if (el) { el.innerHTML = `<div class="adv-loading">策略庫驗證中... ${st.name}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
   }
   const champion = pickChampions(strategies);
-  const result = { at: twClock().date, universe: ready.length, split, hasRegime: !!regimeFn, hasKind: Object.keys(kindMap).length > 0, base, rows, combo, strategies, champion };
+  // 目標導向調參：每種策略在訓練段找「期望值為正、回撤受控」下勝率最高的參數，驗證段打分
+  const tuned = [];
+  for (const st of SWING_STRATEGIES) {
+    if (el) { el.innerHTML = `<div class="adv-loading">目標導向調參中... ${st.name}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
+    try { const t = tuneStrategy(st, ready, split, BASE, 'winrate'); if (t) tuned.push(t); } catch {}
+  }
+  const result = { at: twClock().date, universe: ready.length, split, hasRegime: !!regimeFn, hasKind: Object.keys(kindMap).length > 0, base, rows, combo, strategies, champion, tuned };
   try { localStorage.setItem('swing-lab-result', JSON.stringify(result)); } catch {}
   renderSwingLab();
   return result;
@@ -7115,7 +7191,27 @@ function renderSwingLab() {
       今日盤性 <b>${KIND_NAME[cur.kind] || '不明'}</b> → 實盤採用 <b style="color:${cur.k ? 'var(--bull)' : 'var(--bear)'}">${cur.k ? cur.name : '無策略'}</b>${cur.stats ? `（驗證段 ${cur.stats.avgR > 0 ? '+' : ''}${cur.stats.avgR}R、勝率 ${cur.stats.winRate}%、n=${cur.stats.trades}）` : ''}${cur.noEdge ? '<span style="color:var(--bear)"> — 沒有經驗證的優勢，新訊號停發（設定頁可關閉「無優勢停發」）</span>' : ''}<br>
       <span style="color:var(--text3);font-size:0.66rem">每種盤性各取「驗證段 n≥12 且平均 R>0」中最高者；一個都沒有＝該盤性沒優勢。策略會隨每 5 個交易日的自動重跑切換。</span></div>`;
   })() : '';
-  el.innerHTML = stratHTML + `
+  const live = tunedLive();
+  const tuneHTML = r.tuned?.length ? (() => {
+    const fmt = x => x && x.trades ? `${x.winRate}%／${x.avgR > 0 ? '+' : ''}${x.avgR}R／回撤 ${x.maxDD}R（n=${x.trades}）` : '無交易';
+    const rowsT = r.tuned.map(t => {
+      if (!t.best) return `<tr><td style="padding:5px 6px"><b>${t.name}</b></td><td colspan="3" style="padding:5px 6px;color:var(--text3)">訓練段沒有任何參數同時滿足 n≥25、期望值 ≥+0.1R、回撤 ≥${TUNE_TARGET.maxDD}R（試了 ${t.tried} 組）— 此策略在這個池子沒有可用的參數</td></tr>`;
+      const v = t.best.val;
+      const verdict = v.trades < 12 ? { t: '驗證段樣本不足', c: 'var(--text3)' }
+        : v.avgR <= 0 ? { t: '❌ 驗證段期望值為負（訓練段過擬合）', c: 'var(--bear)' }
+        : v.winRate >= TUNE_TARGET.winRate ? { t: `✅ 驗證段達 ${v.winRate}%`, c: 'var(--bull)' }
+        : { t: `此池可達 ${v.winRate}%（目標 ${TUNE_TARGET.winRate}%）`, c: 'var(--yellow)' };
+      const pTxt = Object.entries(t.best.params).map(([k, v2]) => `${{ rsiMax: 'RSI≤', stopATR: '停損≤', targetR: '目標', adxMin: 'ADX≥', decayStop: '時間衰減', timeStop: '時間停損' }[k] || k}${v2 === null ? '壓力區' : v2 === true ? '開' : v2 === false ? '關' : v2}${k === 'stopATR' ? 'ATR' : k === 'targetR' && v2 != null ? 'R' : k === 'timeStop' ? '日' : ''}`).join('・');
+      return `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)"><td style="padding:5px 6px"><b>${t.name}</b>${live[t.k] ? ' <span style="color:var(--bull);font-size:0.64rem">（已採用）</span>' : ''}<br><span style="color:var(--text3);font-size:0.66rem">${pTxt}</span>${t.maeMfe?.mae90 != null ? `<br><span style="color:var(--text3);font-size:0.66rem">實證：贏單 MAE90 ${t.maeMfe.mae90}R・MFE 中位 ${t.maeMfe.mfe50}R → 停損可收至 ${(t.maeMfe.mae90 * 1.2).toFixed(2)}R、停利設 ${t.maeMfe.mfe50}R 約半數到得了</span>` : ''}</td><td style="padding:5px 6px;font-family:var(--mono);font-size:0.68rem">${fmt(t.best.train)}</td><td style="padding:5px 6px;font-family:var(--mono);font-size:0.68rem">${fmt(v)}</td><td style="padding:5px 6px;color:${verdict.c};font-weight:700;white-space:nowrap">${verdict.t}</td></tr>`;
+    }).join('');
+    return `<div style="margin:10px 0 6px;font-size:0.76rem;font-weight:700;color:var(--text1)">🎯 目標導向調參（目標勝率 ${TUNE_TARGET.winRate}%、訓練段回撤 ≥${TUNE_TARGET.maxDD}R、期望值 ≥+0.1R）</div>
+    <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem;color:var(--text2)">
+      <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">策略／最佳參數</td><td style="padding:4px 6px">訓練段 勝率／期望值／回撤</td><td style="padding:4px 6px">驗證段</td><td style="padding:4px 6px">判定</td></tr>${rowsT}
+    </table></div>
+    <div style="font-size:0.68rem;color:var(--text3);margin:6px 0 8px;line-height:1.6">勝率是「目標」，期望值與回撤是「底線」：調參只在底線內找最高勝率，驗證段數字才算數。達不到 ${TUNE_TARGET.winRate}% 代表這個池子與市況下，守住底線的勝率上限就是表上的數字 —— 這是誠實答案，不是演算法沒盡力。</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem" onclick="swingTuneAdopt()">🎯 採用調參參數（驗證段通過者）</button>${Object.keys(live).length ? `<button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem;color:var(--text3)" onclick="swingTuneClear()">取消調參採用</button>` : ''}</div>`;
+  })() : '';
+  el.innerHTML = stratHTML + tuneHTML + `
     <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">${r.at}｜${r.universe} 檔｜驗證段＝${r.split} 之後${r.hasRegime ? '' : '｜⚠ 本輪無大盤資料，大盤濾網未生效'}｜基準＝實盤現行技術核心</div>
     <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem;color:var(--text2)">
       <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">改法</td><td colspan="4" style="text-align:center;padding:4px 6px">驗證段（最後 30%）：筆數／勝率／平均R／獲利因子</td><td colspan="4" style="text-align:center;padding:4px 6px">全段</td><td style="padding:4px 6px">判定</td></tr>
@@ -8459,8 +8555,8 @@ function addHolding(stockId, kind = 'long') {
   if (holdings.some(h => h.id === stockId)) { showToast('此股已在持倉清單中', 'info'); return; }
 
   const m = buildManagerAnalysis(s);
-  let modeNow = 'breakout'; try { modeNow = currentSwingStrategy().k || 'breakout'; } catch {}
-  const p = buildEntryPlan(s, m, { mode: modeNow });
+  let modeNow = 'breakout', tunedNow = null; try { const cs = currentSwingStrategy(); modeNow = cs.k || 'breakout'; tunedNow = cs.tuned || null; } catch {}
+  const p = buildEntryPlan(s, m, { mode: modeNow, tuned: tunedNow });
   const def = s.analysis.price.toFixed(2);
   const input = prompt(`記錄「${s.name}(${stockId})」的持倉\n\n請輸入你的實際買進均價：`, def);
   if (input === null) return;
@@ -10318,9 +10414,13 @@ function evalEntry(s, env) {
     if (mode === 'meanrev' && !(a.rsi != null && a.rsi < 42 && a.ema50 && a.price > a.ema50 && lo20 != null && a.price <= lo20 * 1.04 && last && last.close > last.open))
       return fail('strategy', `均值回歸：需 RSI<42、價在 EMA50 上、貼近 20 日低點（≤4%）且當日收紅（現 RSI ${a.rsi?.toFixed(0) ?? '--'}）`);
     if (mode === 'trail' && !(setupProfile(s).fresh != null && setupProfile(s).fresh <= 5)) return fail('strategy', '動能續抱：需在突破 20 日高點後 5 天內');
-    ok('strategy', `符合「${SWING_STRATEGIES.find(x => x.k === mode)?.name || mode}」進場型態`);
+    // 調參採用：RSI 上限／ADX 下限成為硬門檻（參數來自訓練段找到、驗證段通過的組合）
+    const TP = env.strategy?.tuned || null;
+    if (TP?.rsiMax != null && a.rsi != null && a.rsi >= TP.rsiMax) return fail('strategy', `調參門檻：RSI ${a.rsi.toFixed(0)} ≥ ${TP.rsiMax}`);
+    if (TP?.adxMin != null && !(a.adx >= TP.adxMin)) return fail('strategy', `調參門檻：ADX ${a.adx?.toFixed(0) ?? '--'} < ${TP.adxMin}`);
+    ok('strategy', `符合「${SWING_STRATEGIES.find(x => x.k === mode)?.name || mode}」進場型態${TP ? '（含調參門檻）' : ''}`);
   }
-  const p = buildEntryPlan(s, m, { mode });
+  const p = buildEntryPlan(s, m, { mode, tuned: env.strategy?.tuned || null });
   if (!p?.ok) return fail('plan', p?.why || '無進場計畫');
   ok('plan', `進場區 ${p.lo}~${p.hi}、停損 ${p.stop}`);
   if (a.price > p.hi * 1.02) return fail('extended', `現價 ${a.price.toFixed(2)} 高於進場區上緣 ${p.hi} 逾 2% — 不追`);
@@ -10958,6 +11058,37 @@ function twiiLevel() {
   return f?.price ?? null;
 }
 
+// ── 大盤方向機率模型：以自己的預測記錄做校準（單純貝氏）────────────────
+// 特徵＝各成分當下的方向（+／−／0）與盤性；標籤＝7 日後大盤實際漲跌。
+// 樣本少時自動退回底率（Laplace 平滑），不會因為 5 筆就喊 90%。
+// 用途：機率落在 42%~58% 之間＝沒把握 → 當天方向預測記「中性」不計分（棄權比亂猜準）。
+function marketDirProbability(comps, kind) {
+  const log = getPredLog().filter(p => p.resolved && p.market && p.market.hit != null && p.comps && p.market.actualChg != null);
+  const up = log.filter(p => p.market.actualChg > 0), dn = log.filter(p => p.market.actualChg <= 0);
+  const n = log.length;
+  if (n < 8 || !comps) return { prob: null, n, txt: `校準樣本累積中（${n}/8）` };
+  const prior = (up.length + 1) / (n + 2);
+  const sgn = v => v > 0.1 ? '+' : v < -0.1 ? '-' : '0';
+  let logit = Math.log(prior / (1 - prior));
+  const used = [];
+  for (const [k, v] of Object.entries(comps)) {
+    const f = sgn(v);
+    const cu = up.filter(p => p.comps[k] != null && sgn(p.comps[k]) === f).length, cd = dn.filter(p => p.comps[k] != null && sgn(p.comps[k]) === f).length;
+    const pu = (cu + 1) / (up.length + 3), pd = (cd + 1) / (dn.length + 3);   // Laplace（三類別）
+    logit += Math.log(pu / pd); used.push(k);
+  }
+  if (kind) {
+    const cu = up.filter(p => p.market.kind === kind).length, cd = dn.filter(p => p.market.kind === kind).length;
+    logit += Math.log(((cu + 1) / (up.length + 3)) / ((cd + 1) / (dn.length + 3)));
+  }
+  // 單純貝氏會過度自信（特徵相關）→ 以 0.5 的溫度把 logit 壓回來
+  const prob = 1 / (1 + Math.exp(-logit * 0.5));
+  const pct = Math.round(prob * 100);
+  const abstain = pct >= 42 && pct <= 58;
+  return { prob: +prob.toFixed(3), pct, n, abstain, used: used.length,
+           txt: `未來 7 日上漲機率 ${pct}%（依 ${n} 筆已驗證預測校準${abstain ? '；接近五五波，方向預測記中性' : ''}）` };
+}
+
 // 每日記錄一次預測快照（掃描完成後呼叫）
 function recordPredictions() {
   const ready = allStocks.filter(s => s.analysis);
@@ -10987,6 +11118,8 @@ function recordPredictions() {
                        if (MR.noTransition && outlookData.regime?.kind === 'transition') return 0;
                        if (MR.noEvent) { try { if (imminentEvents(5).some(e => /FOMC|結算|央行|CPI|非農/.test(e.name))) return 0; } catch {} }
                        if (MR.neutralOnDiv) { const c = outlookData.regime?.comps || []; const t = c.find(x => x.k === '大盤技術結構'), b = c.find(x => x.k === '市場寬度'); if (t && b && Math.sign(t.score) * Math.sign(b.score) < 0) return 0; }
+                       // 校準機率接近五五波 → 棄權（樣本 ≥15 才啟用）
+                       try { const cm = {}; for (const c of (outlookData.regime?.comps || [])) cm[c.k] = c.score; const mp = marketDirProbability(cm, outlookData.regime?.kind); if (mp.prob != null && mp.n >= 15 && mp.abstain) return 0; } catch {}
                        return norm >= 15 ? 1 : norm <= -15 ? -1 : 0;
                      })(),
                      twii } : null,
