@@ -220,25 +220,76 @@ function cacheGetStale(key, maxAge = 24 * 60 * 60 * 1000) {
   } catch { return null; }
 }
 
+// ── 快取索引：每個 cache:* 的寫入時間與大小記在一把小索引裡 ──
+// 先前每次 localStorage 滿了，就把上千把快取鍵全部 JSON.parse 一遍找最舊的 ——
+// 100 檔 × 14 個月的月線快取讓這件事每輪掃描都發生，主執行緒被卡住幾秒，
+// 手機 Safari 累積幾次就判定「網頁沒有回應」把頁面砍掉。改用索引淘汰，成本從 O(全部解析) 變 O(排序)。
+const CACHE_IDX_KEY = 'cache:_idx';
+const CACHE_BUDGET_BYTES = 3.2 * 1024 * 1024;   // 快取總量上限（多數瀏覽器 localStorage 約 5MB）
+let _cacheIdx = null;
+function cacheIdx() {
+  if (_cacheIdx) return _cacheIdx;
+  try { _cacheIdx = JSON.parse(localStorage.getItem(CACHE_IDX_KEY) || '{}'); } catch { _cacheIdx = {}; }
+  return _cacheIdx;
+}
+function cacheIdxSave() { try { localStorage.setItem(CACHE_IDX_KEY, JSON.stringify(cacheIdx())); } catch {} }
+function cacheIdxRebuild() {
+  const idx = {};
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (!k.startsWith('cache:') || k === CACHE_IDX_KEY) continue;
+      const raw = localStorage.getItem(k) || '';
+      let t = 0; try { t = JSON.parse(raw)?.t || 0; } catch {}
+      idx[k] = [t, raw.length];
+    }
+  } catch {}
+  _cacheIdx = idx; cacheIdxSave();
+  return idx;
+}
+function cacheTotalBytes() { return Object.values(cacheIdx()).reduce((a, v) => a + (v?.[1] || 0), 0); }
+// 淘汰最舊的快取直到釋出 needBytes（或總量降到上限以下）
+function cacheEvict(needBytes) {
+  const idx = cacheIdx();
+  const ks = Object.entries(idx).sort((a, b) => (a[1]?.[0] || 0) - (b[1]?.[0] || 0));
+  let freed = 0;
+  for (const [k, v] of ks) {
+    try { localStorage.removeItem(k); } catch {}
+    delete idx[k];
+    freed += v?.[1] || 0;
+    if (freed >= needBytes) break;
+  }
+  cacheIdxSave();
+  return freed;
+}
+// 預算整理：總量超過上限就先汰舊（掃描開始時呼叫一次，而不是等寫入失敗才處理）
+function cacheBudgetTrim() {
+  const total = cacheTotalBytes();
+  if (total <= CACHE_BUDGET_BYTES) return 0;
+  return cacheEvict(total - CACHE_BUDGET_BYTES * 0.8);
+}
 function cacheSet(key, data) {
   const val = JSON.stringify({ t: Date.now(), data });
+  const idx = cacheIdx();
+  const write = () => { localStorage.setItem(key, val); idx[key] = [Date.now(), val.length]; };
   try {
-    localStorage.setItem(key, val);
+    if (cacheTotalBytes() + val.length > CACHE_BUDGET_BYTES) cacheEvict(val.length + CACHE_BUDGET_BYTES * 0.1);
+    write();
   } catch {
-    // 空間滿了 → 從最舊的快取開始淘汰（100 檔的月 K 快取量大，
-    // 全清會讓每輪掃描都重抓 → 改成汰舊留新，命中率高很多）
-    try {
-      const ks = Object.keys(localStorage).filter(k => k.startsWith('cache:'))
-        .map(k => { let t = 0; try { t = JSON.parse(localStorage.getItem(k))?.t || 0; } catch {} return { k, t }; })
-        .sort((a, b) => a.t - b.t);
-      for (let i = 0; i < ks.length; i++) {
-        localStorage.removeItem(ks[i].k);
-        if (i % 20 === 19 || i === ks.length - 1) {
-          try { localStorage.setItem(key, val); return; } catch {}
-        }
-      }
-    } catch {}
+    // 真的寫不進去（配額）：索引可能失準 → 重建索引再淘汰一輪
+    try { cacheIdxRebuild(); cacheEvict(Math.max(val.length * 2, CACHE_BUDGET_BYTES * 0.2)); write(); } catch {}
   }
+  cacheIdxSave();
+}
+
+// ── K 棒壓縮存放：物件陣列 → 數值陣列，快取體積約省 45% ──
+const BAR_KEYS = ['time', 'open', 'high', 'low', 'close', 'volume', 'exDiv', 'divAmt'];
+function packBars(bars) {
+  if (!Array.isArray(bars) || !bars.length || Array.isArray(bars[0])) return bars;
+  return bars.map(b => b.exDiv ? [b.time, b.open, b.high, b.low, b.close, b.volume, 1, b.divAmt ?? null] : [b.time, b.open, b.high, b.low, b.close, b.volume]);
+}
+function unpackBars(packed) {
+  if (!Array.isArray(packed) || !packed.length || !Array.isArray(packed[0])) return packed;
+  return packed.map(a => { const b = { time: a[0], open: a[1], high: a[2], low: a[3], close: a[4], volume: a[5] }; if (a[6]) { b.exDiv = true; if (a[7] != null) b.divAmt = a[7]; } return b; });
 }
 
 // ── 頁面內記憶的有效期 ──────────────────────────────────────────────────────
@@ -275,12 +326,12 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo', opts = {}
   // Yahoo 整體被限流時直接跳過，不必每檔股票都重試（省下大量等待）。
   // opts.force：即時報價備援用 —— 只針對少數重點標的，值得繞過熔斷器再試一次，
   // 否則「Yahoo 掛掉時的備援」在 Yahoo 被標記掛掉時永遠不會執行（先前的實際缺陷）。
-  if (srcDead('yahoo') && !opts.force) return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
+  if (srcDead('yahoo') && !opts.force) return unpackBars(cacheGetStale(key, 72 * 60 * 60 * 1000)) || [];
   // 日線盤中只有最後一根 K 會變 → 10 分鐘快取；分鐘級變動快 → 2 分鐘
   const ttl = isIntradayTF(interval) ? 2 * 60 * 1000
             : (interval === '1d' || interval === '1wk') ? 10 * 60 * 1000 : CACHE_TTL;
   const cached = cacheGet(key, ttl);
-  if (cached) return cached;
+  if (cached) return unpackBars(cached);
 
   // events=div：取得除息事件（日期+金額），標記在對應 K 棒上 —
   // 未還原股價在除息日會出現假跳空，停損判定與訊號結算需要跳過該缺口
@@ -289,7 +340,7 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo', opts = {}
   const result = data?.chart?.result?.[0];
   if (!result) {
     srcMarkDead('yahoo', 10);   // 10 分鐘內不再嘗試 Yahoo
-    return cacheGetStale(key, 72 * 60 * 60 * 1000) || [];
+    return unpackBars(cacheGetStale(key, 72 * 60 * 60 * 1000)) || [];
   }
   srcMarkAlive('yahoo');
   const { timestamp, indicators } = result;
@@ -314,7 +365,7 @@ async function fetchYahooOHLCV(symbol, interval = '1d', range = '6mo', opts = {}
     if (divDates.has(time)) { bar.exDiv = true; bar.divAmt = divDates.get(time); }
     return bar;
   }).filter(d => d.open && d.close);
-  if (ohlcv.length) cacheSet(key, ohlcv);
+  if (ohlcv.length) cacheSet(key, packBars(ohlcv));
   return ohlcv;
 }
 
@@ -430,9 +481,9 @@ function monthCacheGet(key, isCurrent) {
   if (v.empty) return isCurrent ? null : [];                     // 過去月份查無資料（新上市／下市）→ 記住，別每輪都打
   if (!v.bars?.length) return null;
   if (!isCurrent && !v.complete) return null;
-  return v.bars;
+  return unpackBars(v.bars);
 }
-function monthCacheSet(key, bars, isCurrent) { cacheSet(key, { bars, complete: !isCurrent }); }
+function monthCacheSet(key, bars, isCurrent) { cacheSet(key, { bars: packBars(bars), complete: !isCurrent }); }
 function monthCacheSetEmpty(key, isCurrent) { if (!isCurrent) cacheSet(key, { empty: true, complete: true }); }
 
 async function fetchTWSEMonth(stockId, year, month) {
