@@ -141,6 +141,7 @@ async function initApp() {
   safe('頂底反轉', renderTopBottomReversal);
   safe('刷新循環', startRefreshCycle);
   safe('推播排程器', startNotificationScheduler);
+  safe('長時間運行保護', startUptimeGuard);
   safe('掃描', startScan);
 }
 
@@ -182,6 +183,7 @@ async function runScan() {
 
   showScanBar(true);
   updateLoadingText('掃描台股技術指標...');
+  try { cacheBudgetTrim(); } catch {}   // 快取總量超標先汰舊，不要等寫入失敗才在主執行緒上大掃除
 
   // Fetch market index + outlook + institutional overview in parallel
   fetchTWII().then(renderMarketIndex).catch(() => {});
@@ -391,9 +393,7 @@ async function runScan() {
   await refetchStaleStocks({ progress: true });
   // 波段改法實驗室：每 7 天用最新日 K 自動重跑一次（背景，不擋掃描收尾），讓「有效／無效」判定跟著市況更新
   try {
-    const last = JSON.parse(localStorage.getItem('swing-lab-result') || 'null');
-    const age = last?.at ? tradingDaysBetween(last.at, twClock().date) : 99;
-    if (age >= 5 && allStocks.filter(s => s.ohlcv?.length >= 80).length >= 20) setTimeout(() => { runSwingLab().catch(() => {}); }, 4000);
+    if (swingLabAutoDue() && !document.hidden && allStocks.filter(s => s.ohlcv?.length >= 80).length >= 20) setTimeout(() => { runSwingLab().catch(() => {}); }, 4000);
   } catch {}
 
   setScanProgress(100, '掃描完成');
@@ -5020,7 +5020,7 @@ async function refreshLivePrices() {
       _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0;
       _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
       // 關鍵：讓即時價真正進入指標與研判，而不只是換掉畫面上的數字
-      for (const s of pickRecomputeTargets(touched)) recomputeAnalysis(s);
+      for (const s of pickRecomputeTargets(touched, isLowPowerDevice() ? 12 : 40)) recomputeAnalysis(s);
       // 5 分 K 累積：先前只在「使用者正在看分鐘圖」時才累積 —— 當沖候選股
       // 因此沒有日內 K，ORB/VWAP 全部算不出來。改為每輪把即時報價寫進
       // 持倉與當沖候選的 5 分桶，日內決策才有資料可用。
@@ -5050,8 +5050,14 @@ async function refreshLivePrices() {
 }
 
 // 只重繪價格相關區塊（不重跑技術分析，故成本低）
+let _liveRenderAt = 0;
 function renderLiveTick() {
   try {
+    // 手機上每 15 秒重畫整頁表格太重 → 降為每 45 秒一次（報價文字仍每次更新）
+    const el0 = document.getElementById('quote-time');
+    if (el0) { el0.textContent = _liveStatus; el0.style.color = _liveStatus.includes('無回應') || _liveStatus.includes('失敗') ? 'var(--bear)' : 'var(--text3)'; }
+    if (isLowPowerDevice() && Date.now() - _liveRenderAt < 45 * 1000) return;
+    _liveRenderAt = Date.now();
     const el = document.getElementById('quote-time');
     if (el) {
       el.textContent = _liveStatus;
@@ -7046,11 +7052,15 @@ function gridCombos(grid) {
   for (const k of keys) out = out.flatMap(o => grid[k].map(v => ({ ...o, [k]: v })));
   return out;
 }
-function tuneStrategy(st, ready, split, BASE, objective = 'winrate') {
+async function tuneStrategy(st, ready, split, BASE, objective = 'winrate', onProgress = null) {
   const grid = TUNE_GRID[st.k]; if (!grid) return null;
   const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null, maxDD: btMaxDD(tr) }; };
   let best = null; const tried = [];
-  for (const params of gridCombos(grid)) {
+  const combos = gridCombos(grid);
+  for (let ci = 0; ci < combos.length; ci++) {
+    const params = combos[ci];
+    // 每 4 組讓出主執行緒：144 組 × 全池同步跑會卡住畫面十幾秒，手機 Safari 會直接把頁面砍掉
+    if (ci % 4 === 3) { if (onProgress) onProgress(ci + 1, combos.length); await new Promise(r0 => setTimeout(r0, 0)); }
     const opts = { ...BASE, ...st.opts, ...params };
     if (params.targetR != null) opts.resistTarget = false;
     const all = [];
@@ -7097,8 +7107,25 @@ function labVerdict(v, base) {
   if (v.avgR <= base.avgR - 0.10) return { k: 'bad', t: '❌ 更差' };
   return { k: 'flat', t: '➖ 無明顯差異' };
 }
+// 是否為手機／低效能裝置：實驗室自動重跑只在電腦上做，手機請手動按（避免背景把頁面跑到被砍）
+function isLowPowerDevice() {
+  try { return (window.innerWidth || 1024) < 900 || (navigator.hardwareConcurrency || 8) <= 4 || /iPhone|iPad|Android/i.test(navigator.userAgent || ''); } catch { return false; }
+}
+// 自動重跑守門：實驗「開始」就先蓋章，上次開始距今 <1 天不再自動跑 ——
+// 先前只在「完成」時記錄日期，頁面在實驗中途被砍掉 → 每輪掃描都重跑 → 每輪都被砍（崩潰迴圈）
+function swingLabAutoDue() {
+  try {
+    if (isLowPowerDevice()) return false;
+    const started = +(localStorage.getItem('swing-lab-attempt') || 0);
+    if (Date.now() - started < 24 * 60 * 60 * 1000) return false;
+    const last = JSON.parse(localStorage.getItem('swing-lab-result') || 'null');
+    const age = last?.at ? tradingDaysBetween(last.at, twClock().date) : 99;
+    return age >= 5;
+  } catch { return false; }
+}
 async function runSwingLab() {
   const el = document.getElementById('swing-lab-body');
+  try { localStorage.setItem('swing-lab-attempt', String(Date.now())); } catch {}
   const ready = allStocks.filter(s => s.ohlcv?.length >= 80);
   if (ready.length < 5) { if (el) el.innerHTML = '<p style="font-size:0.8rem;color:var(--text3)">歷史資料尚未就緒，請等掃描完成後再執行。</p>'; return null; }
   if (el) el.innerHTML = '<div class="adv-loading">實驗中（每個改法都跑全池 14 個月）...</div>';
@@ -7106,18 +7133,18 @@ async function runSwingLab() {
   try { const tw = await fetchTWIIOHLC(14); regimeFn = makeRegimeFn(tw); twiiRet20 = btTwiiRet20Fn(tw); kindMap = regimeKindMap(tw); } catch {}
   const BASE = { rsiMax: 65, extMax: 1.05, scaleOut: true, regimeFn, resistTarget: true, pullback: true, volConfirm: true, frontRun: true, adxMin: 22, twiiRet20 };
   const split = btSplitDate(ready);
-  const run = (opts) => {
+  const run = async (opts) => {
     const all = [];
-    for (const s of ready) { try { all.push(...backtestStock(s, opts)); } catch {} }
+    for (let i = 0; i < ready.length; i++) { try { all.push(...backtestStock(ready[i], opts)); } catch {} if (i % 25 === 24) await new Promise(r0 => setTimeout(r0, 0)); }
     const val = split ? all.filter(t => t.entryTime >= split) : all;
     const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null }; };
     return { all: sum(all), val: sum(val) };
   };
-  const base = run(BASE);
+  const base = await run(BASE);
   const rows = [];
   for (let i = 0; i < SWING_VARIANTS.length; i++) {
     const v = SWING_VARIANTS[i];
-    const r = run({ ...BASE, ...v.opts });
+    const r = await run({ ...BASE, ...v.opts });
     rows.push({ k: v.k, name: v.name, why: v.why, all: r.all, val: r.val, verdict: labVerdict(r.val, base.val) });
     if (el) { el.innerHTML = `<div class="adv-loading">實驗中... ${i + 1}/${SWING_VARIANTS.length}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
   }
@@ -7126,14 +7153,14 @@ async function runSwingLab() {
   let combo = null;
   if (good.length >= 2) {
     const opts = Object.assign({}, BASE, ...good.map(r => SWING_VARIANTS.find(v => v.k === r.k).opts));
-    const r = run(opts);
+    const r = await run(opts);
     combo = { ks: good.map(r => r.k), all: r.all, val: r.val, verdict: labVerdict(r.val, base.val) };
   }
   // 策略庫：四種策略各自跑全池，驗證段再依「進場日的盤性」分組 —— 回答「哪種盤性該用哪一套」
   const strategies = [];
   for (const st of SWING_STRATEGIES) {
     const all = [];
-    for (const s of ready) { try { all.push(...backtestStock(s, { ...BASE, ...st.opts })); } catch {} }
+    for (let i = 0; i < ready.length; i++) { try { all.push(...backtestStock(ready[i], { ...BASE, ...st.opts })); } catch {} if (i % 25 === 24) await new Promise(r0 => setTimeout(r0, 0)); }
     const val = split ? all.filter(t => t.entryTime >= split) : all;
     const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null }; };
     const byKind = {};
@@ -7146,7 +7173,7 @@ async function runSwingLab() {
   const tuned = [];
   for (const st of SWING_STRATEGIES) {
     if (el) { el.innerHTML = `<div class="adv-loading">目標導向調參中... ${st.name}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
-    try { const t = tuneStrategy(st, ready, split, BASE, 'winrate'); if (t) tuned.push(t); } catch {}
+    try { const t = await tuneStrategy(st, ready, split, BASE, 'winrate', (i, n) => { if (el) el.innerHTML = `<div class="adv-loading">目標導向調參中... ${st.name} ${i}/${n}</div>`; }); if (t) tuned.push(t); } catch {}
   }
   const result = { at: twClock().date, universe: ready.length, split, hasRegime: !!regimeFn, hasKind: Object.keys(kindMap).length > 0, base, rows, combo, strategies, champion, tuned };
   try { localStorage.setItem('swing-lab-result', JSON.stringify(result)); } catch {}
@@ -7172,7 +7199,8 @@ function renderSwingLab() {
   let r = null; try { r = JSON.parse(localStorage.getItem('swing-lab-result') || 'null'); } catch {}
   const adopt = swingLabAdopted();
   const btn = `<button class="btn-primary" style="padding:6px 16px;font-size:0.76rem" onclick="runSwingLab()">▶ ${r ? '重新' : ''}執行實驗</button>`;
-  if (!r) { el.innerHTML = `<p style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">把 12 個「提高勝率的辦法」各自套回全池真實日 K，用最後 30% 時段的成績判定有沒有用。</p>${btn}`; return; }
+  const lowNote = isLowPowerDevice() ? '<div style="font-size:0.68rem;color:var(--yellow);margin-bottom:6px">📱 手機／低效能裝置不自動重跑實驗（避免背景運算把頁面跑到被系統關閉）；要更新請在電腦上開啟，或在這裡手動執行並保持畫面開著。</div>' : '';
+  if (!r) { el.innerHTML = `${lowNote}<p style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">把 13 個「提高勝率的辦法」各自套回全池真實日 K，用最後 30% 時段的成績判定有沒有用。</p>${btn}`; return; }
   const cell = (x, base) => x.trades
     ? `<td style="text-align:right;font-family:var(--mono)">${x.trades}</td><td style="text-align:right;font-family:var(--mono);color:${base && x.winRate >= base.winRate + 3 ? 'var(--bull)' : base && x.winRate <= base.winRate - 3 ? 'var(--bear)' : 'var(--text1)'}">${x.winRate}%</td><td style="text-align:right;font-family:var(--mono);color:${x.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${x.avgR > 0 ? '+' : ''}${x.avgR}</td><td style="text-align:right;font-family:var(--mono)">${x.pf ?? '∞'}</td>`
     : '<td colspan="4" style="color:var(--text3);text-align:center">無交易</td>';
@@ -7211,7 +7239,7 @@ function renderSwingLab() {
     <div style="font-size:0.68rem;color:var(--text3);margin:6px 0 8px;line-height:1.6">勝率是「目標」，期望值與回撤是「底線」：調參只在底線內找最高勝率，驗證段數字才算數。達不到 ${TUNE_TARGET.winRate}% 代表這個池子與市況下，守住底線的勝率上限就是表上的數字 —— 這是誠實答案，不是演算法沒盡力。</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"><button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem" onclick="swingTuneAdopt()">🎯 採用調參參數（驗證段通過者）</button>${Object.keys(live).length ? `<button class="btn-ghost" style="padding:6px 14px;font-size:0.74rem;color:var(--text3)" onclick="swingTuneClear()">取消調參採用</button>` : ''}</div>`;
   })() : '';
-  el.innerHTML = stratHTML + tuneHTML + `
+  el.innerHTML = lowNote + stratHTML + tuneHTML + `
     <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">${r.at}｜${r.universe} 檔｜驗證段＝${r.split} 之後${r.hasRegime ? '' : '｜⚠ 本輪無大盤資料，大盤濾網未生效'}｜基準＝實盤現行技術核心</div>
     <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem;color:var(--text2)">
       <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">改法</td><td colspan="4" style="text-align:center;padding:4px 6px">驗證段（最後 30%）：筆數／勝率／平均R／獲利因子</td><td colspan="4" style="text-align:center;padding:4px 6px">全段</td><td style="padding:4px 6px">判定</td></tr>
@@ -12111,6 +12139,33 @@ async function scheduledTick() {
     console.warn('排程掃描失敗:', e);
     runScheduledNotifications();     // 掃描失敗也用現有資料試一次，總比沒訊息好
   } finally { _slotScanBusy = false; }
+}
+
+// ── 長時間運行保護 ────────────────────────────────────────────────────────
+// 單頁應用開著好幾天，瀏覽器累積的記憶體、DOM 與計時器總會把頁面壓垮（手機尤其）。
+// 與其等它崩潰要人手動重新整理，不如在「沒人看、也沒在交易」的時候自己重整一次：
+//   ・連續運行 ≥6 小時且（休市 或 分頁在背景）→ 重新載入
+//   ・分頁從背景回到前景時，若已在背景 ≥2 小時 → 重新載入（iOS 背景分頁常被系統清掉一半狀態）
+const _bootAt = Date.now();
+let _hiddenAt = null;
+function shouldAutoReload(uptimeMs, marketOpen, hidden, hiddenMs) {
+  if (hiddenMs != null && hiddenMs >= 2 * 60 * 60 * 1000) return 'background';
+  if (uptimeMs >= 6 * 60 * 60 * 1000 && (!marketOpen || hidden)) return 'uptime';
+  return null;
+}
+function startUptimeGuard() {
+  try {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { _hiddenAt = Date.now(); return; }
+      const why = shouldAutoReload(Date.now() - _bootAt, isMarketOpenTW(), false, _hiddenAt ? Date.now() - _hiddenAt : null);
+      _hiddenAt = null;
+      if (why && !scanning) { logSysError(`自動重新載入（${why}）`); location.reload(); }
+    });
+    setInterval(() => {
+      const why = shouldAutoReload(Date.now() - _bootAt, isMarketOpenTW(), document.hidden, null);
+      if (why && !scanning) { logSysError(`自動重新載入（${why}）`); location.reload(); }
+    }, 5 * 60 * 1000);
+  } catch {}
 }
 
 function startNotificationScheduler() {
