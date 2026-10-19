@@ -142,6 +142,8 @@ async function initApp() {
   safe('刷新循環', startRefreshCycle);
   safe('推播排程器', startNotificationScheduler);
   safe('長時間運行保護', startUptimeGuard);
+  safe('主機心跳', startHeartbeat);
+  safe('主機模式', startHostMode);
   safe('掃描', startScan);
 }
 
@@ -5279,6 +5281,10 @@ function loadSettings() {
   if (sML) sML.value = localStorage.getItem('max-accept-loss') || '10';
   const sEG = document.getElementById('s-edge-gate');
   if (sEG) sEG.checked = localStorage.getItem('edge-gate') !== 'false';
+  const sHM = document.getElementById('s-host-mode');
+  if (sHM) sHM.checked = hostModeOn();
+  const sSV = document.getElementById('s-signal-volume');
+  if (sSV) sSV.value = signalVolumeMode();
   const sTF = document.getElementById('s-timeframe');
   if (sTF) sTF.value = tf;
   const sR  = document.getElementById('s-refresh');
@@ -5332,6 +5338,10 @@ function saveAllSettings() {
   if (mlEl?.value) localStorage.setItem('max-accept-loss', mlEl.value);
   const egEl = document.getElementById('s-edge-gate');
   if (egEl) localStorage.setItem('edge-gate', egEl.checked ? 'true' : 'false');
+  const hmEl = document.getElementById('s-host-mode');
+  if (hmEl) { localStorage.setItem('host-mode', hmEl.checked ? 'true' : 'false'); if (hmEl.checked) requestWakeLock(); }
+  const svEl = document.getElementById('s-signal-volume');
+  if (svEl) localStorage.setItem('signal-volume', svEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
@@ -7009,6 +7019,15 @@ function pickChampions(strategies) {
 }
 function swingLabResult() { try { return JSON.parse(localStorage.getItem('swing-lab-result') || 'null'); } catch { return null; } }
 function edgeGateOn() { return localStorage.getItem('edge-gate') !== 'false'; }
+// 訊號數量模式：嚴選（預設）／平衡／積極 —— 交易量不足時放寬的是「品質門檻與支柱數」，
+// 不放寬的是風控（停損、部位、斷路器）。放寬一定換來勝率下降，設定頁明講。
+function signalVolumeMode() { const v = localStorage.getItem('signal-volume'); return ['strict', 'balanced', 'aggressive'].includes(v) ? v : 'strict'; }
+function volumeModeParams() {
+  const m = signalVolumeMode();
+  return m === 'aggressive' ? { aCutAdj: -10, pillarsMin: 1, sectorCap: 3, rrAdj: -0.2, name: '積極' }
+       : m === 'balanced'   ? { aCutAdj: -5, pillarsMin: 1, sectorCap: 3, rrAdj: 0, name: '平衡' }
+       : { aCutAdj: 0, pillarsMin: 2, sectorCap: 2, rrAdj: 0, name: '嚴選' };
+}
 // 現行波段策略（依今日盤性）：冠軍存在就用冠軍；沒冠軍 → 無優勢（閘門開啟時停發）；還沒跑實驗 → 預設突破追蹤
 function currentSwingStrategy() {
   const lab = swingLabResult();
@@ -7103,9 +7122,11 @@ function btTwiiRet20Fn(twiiBars) {
 }
 function labVerdict(v, base) {
   if (!v || !base || (v.trades || 0) < 15 || (base.trades || 0) < 15) return { k: 'na', t: '樣本不足' };
-  if (v.avgR >= base.avgR + 0.10 && v.winRate >= base.winRate + 3) return { k: 'good', t: '✅ 有效' };
-  if (v.avgR <= base.avgR - 0.10) return { k: 'bad', t: '❌ 更差' };
-  return { k: 'flat', t: '➖ 無明顯差異' };
+  // 回撤也要看：平均 R 更好但回撤深了 1R 以上，不算有效（賺得多但中途會被洗出場）
+  const ddWorse = v.maxDD != null && base.maxDD != null && v.maxDD < base.maxDD - 1;
+  if (v.avgR >= base.avgR + 0.10 && v.winRate >= base.winRate + 3 && !ddWorse) return { k: 'good', t: '✅ 有效' };
+  if (v.avgR <= base.avgR - 0.10 || (ddWorse && v.avgR < base.avgR + 0.10)) return { k: 'bad', t: ddWorse && v.avgR > base.avgR - 0.10 ? '❌ 回撤更深' : '❌ 更差' };
+  return { k: 'flat', t: ddWorse ? '➖ 期望值略佳但回撤更深' : '➖ 無明顯差異' };
 }
 // 是否為手機／低效能裝置：實驗室自動重跑只在電腦上做，手機請手動按（避免背景把頁面跑到被砍）
 function isLowPowerDevice() {
@@ -7137,7 +7158,7 @@ async function runSwingLab() {
     const all = [];
     for (let i = 0; i < ready.length; i++) { try { all.push(...backtestStock(ready[i], opts)); } catch {} if (i % 25 === 24) await new Promise(r0 => setTimeout(r0, 0)); }
     const val = split ? all.filter(t => t.entryTime >= split) : all;
-    const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null }; };
+    const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null, maxDD: btMaxDD(tr) }; };
     return { all: sum(all), val: sum(val) };
   };
   const base = await run(BASE);
@@ -7162,7 +7183,7 @@ async function runSwingLab() {
     const all = [];
     for (let i = 0; i < ready.length; i++) { try { all.push(...backtestStock(ready[i], { ...BASE, ...st.opts })); } catch {} if (i % 25 === 24) await new Promise(r0 => setTimeout(r0, 0)); }
     const val = split ? all.filter(t => t.entryTime >= split) : all;
-    const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null }; };
+    const sum = tr => { const x = summarizeBacktest(tr); return { trades: x.trades || 0, winRate: x.winRate ?? 0, avgR: x.avgR ?? 0, pf: x.pf ?? null, maxDD: btMaxDD(tr) }; };
     const byKind = {};
     for (const kind of ['trend', 'range', 'transition']) byKind[kind] = sum(val.filter(t => kindMap[t.entryTime] === kind));
     strategies.push({ k: st.k, name: st.name, desc: st.desc, all: sum(all), val: sum(val), byKind });
@@ -7202,7 +7223,7 @@ function renderSwingLab() {
   const lowNote = isLowPowerDevice() ? '<div style="font-size:0.68rem;color:var(--yellow);margin-bottom:6px">📱 手機／低效能裝置不自動重跑實驗（避免背景運算把頁面跑到被系統關閉）；要更新請在電腦上開啟，或在這裡手動執行並保持畫面開著。</div>' : '';
   if (!r) { el.innerHTML = `${lowNote}<p style="font-size:0.78rem;color:var(--text3);margin-bottom:8px">把 13 個「提高勝率的辦法」各自套回全池真實日 K，用最後 30% 時段的成績判定有沒有用。</p>${btn}`; return; }
   const cell = (x, base) => x.trades
-    ? `<td style="text-align:right;font-family:var(--mono)">${x.trades}</td><td style="text-align:right;font-family:var(--mono);color:${base && x.winRate >= base.winRate + 3 ? 'var(--bull)' : base && x.winRate <= base.winRate - 3 ? 'var(--bear)' : 'var(--text1)'}">${x.winRate}%</td><td style="text-align:right;font-family:var(--mono);color:${x.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${x.avgR > 0 ? '+' : ''}${x.avgR}</td><td style="text-align:right;font-family:var(--mono)">${x.pf ?? '∞'}</td>`
+    ? `<td style="text-align:right;font-family:var(--mono)">${x.trades}</td><td style="text-align:right;font-family:var(--mono);color:${base && x.winRate >= base.winRate + 3 ? 'var(--bull)' : base && x.winRate <= base.winRate - 3 ? 'var(--bear)' : 'var(--text1)'}">${x.winRate}%</td><td style="text-align:right;font-family:var(--mono);color:${x.avgR > 0 ? 'var(--bull)' : 'var(--bear)'}">${x.avgR > 0 ? '+' : ''}${x.avgR}</td><td style="text-align:right;font-family:var(--mono)" title="獲利因子／最大回撤(R)">${x.pf ?? '∞'}${x.maxDD != null ? `<span style="color:${base && x.maxDD < base.maxDD - 1 ? 'var(--bear)' : 'var(--text3)'};font-size:0.62rem"> ${x.maxDD}R</span>` : ''}</td>`
     : '<td colspan="4" style="color:var(--text3);text-align:center">無交易</td>';
   const vc = { good: 'var(--bull)', bad: 'var(--bear)', flat: 'var(--text3)', na: 'var(--text3)' };
   const rows = [...r.rows].sort((a, b) => ({ good: 0, flat: 1, na: 2, bad: 3 }[a.verdict.k] - { good: 0, flat: 1, na: 2, bad: 3 }[b.verdict.k]) || (b.val.avgR - a.val.avgR));
@@ -7242,7 +7263,7 @@ function renderSwingLab() {
   el.innerHTML = lowNote + stratHTML + tuneHTML + `
     <div style="font-size:0.72rem;color:var(--text3);margin-bottom:6px">${r.at}｜${r.universe} 檔｜驗證段＝${r.split} 之後${r.hasRegime ? '' : '｜⚠ 本輪無大盤資料，大盤濾網未生效'}｜基準＝實盤現行技術核心</div>
     <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:0.72rem;color:var(--text2)">
-      <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">改法</td><td colspan="4" style="text-align:center;padding:4px 6px">驗證段（最後 30%）：筆數／勝率／平均R／獲利因子</td><td colspan="4" style="text-align:center;padding:4px 6px">全段</td><td style="padding:4px 6px">判定</td></tr>
+      <tr style="color:var(--text3);font-size:0.66rem"><td style="padding:4px 6px">改法</td><td colspan="4" style="text-align:center;padding:4px 6px">驗證段（最後 30%）：筆數／勝率／平均R／獲利因子 回撤</td><td colspan="4" style="text-align:center;padding:4px 6px">全段</td><td style="padding:4px 6px">判定</td></tr>
       <tr style="font-weight:700;border-bottom:1px solid var(--border)"><td style="padding:5px 6px">基準（現行）</td>${cell(r.base.val)}${cell(r.base.all)}<td style="padding:5px 6px;color:var(--text3)">—</td></tr>
       ${rows.map(x => `<tr style="border-bottom:1px solid rgba(255,255,255,0.04)"><td style="padding:5px 6px"><b>${x.name}</b>${adopt[x.k] ? ' <span style="color:var(--bull);font-size:0.64rem">（已採用）</span>' : ''}<br><span style="color:var(--text3);font-size:0.66rem">${x.why}</span></td>${cell(x.val, r.base.val)}${cell(x.all, r.base.all)}<td style="padding:5px 6px;color:${vc[x.verdict.k]};font-weight:700;white-space:nowrap">${x.verdict.t}</td></tr>`).join('')}
       ${r.combo ? `<tr style="border-top:1px solid var(--border);font-weight:700"><td style="padding:5px 6px">疊加全部有效改法<br><span style="color:var(--text3);font-size:0.66rem;font-weight:400">${r.combo.ks.join('＋')}</span></td>${cell(r.combo.val, r.base.val)}${cell(r.combo.all, r.base.all)}<td style="padding:5px 6px;color:${vc[r.combo.verdict.k]}">${r.combo.verdict.t}</td></tr>` : ''}
@@ -9857,7 +9878,7 @@ function actionStripHTML(n) {
     <div class="st"><div class="st-l">長期名單</div><div class="st-v">${n.lt}</div><div class="st-s">放半年以上</div></div>
     <div class="st"><div class="st-l">大盤</div><div class="st-v" style="color:${mktC};font-size:0.95rem">${mktTxt}</div><div class="st-s">研判 ${norm >= 0 ? '+' : ''}${norm}${kind === 'range' ? '・盤整' : kind === 'transition' ? '・轉換中' : kind === 'trend' ? '・趨勢' : ''}</div></div>
     <div class="st"><div class="st-l">波段策略</div><div class="st-v" style="color:${stg?.k ? 'var(--bull)' : 'var(--bear)'};font-size:0.95rem">${stg?.k ? stg.name : '無'}</div><div class="st-s">${stg?.stats ? `驗證段 ${stg.stats.avgR > 0 ? '+' : ''}${stg.stats.avgR}R・勝率 ${stg.stats.winRate}%` : stg?.src === 'default' ? '尚未跑策略實驗' : '依盤性自動切換'}</div></div>
-    <div class="st"><div class="st-l">出手模式</div><div class="st-v" style="color:${modeC};font-size:0.95rem">${modeTxt}</div><div class="st-s">${brk?.on ? `回撤 ${brk.dd}R 停手` : cd.on ? '部位減半' : `A≥${_entryFunnel?.aCut ?? (strict ? 80 : 75)}・賠率≥${strict ? 2 : 1.5}${_entryFunnel?.cutAdj ? '・門檻已校準' : ''}`}</div></div>
+    <div class="st"><div class="st-l">出手模式</div><div class="st-v" style="color:${modeC};font-size:0.95rem">${modeTxt}</div><div class="st-s">${brk?.on ? `回撤 ${brk.dd}R 停手` : cd.on ? '部位減半' : `A≥${_entryFunnel?.aCut ?? (strict ? 80 : 75)}・賠率≥${strict ? 2 : 1.5}${_entryFunnel?.cutAdj ? '・門檻已校準' : ''}${signalVolumeMode() !== 'strict' ? `・${volumeModeParams().name}模式` : ''}`}</div></div>
   </div>`;
 }
 
@@ -10393,11 +10414,12 @@ function entryEnv() {
   let heat = null; try { heat = portfolioHeat(); } catch {}
   let cooldown = null; try { cooldown = systemCooldown(); } catch {}
   let cutAdj = 0; try { cutAdj = qualityCutAdj().adj; } catch {}
+  const vm = volumeModeParams();
   let adopt = {}; try { adopt = swingLabAdopted(); } catch {}
   let strategy = null; try { strategy = currentSwingStrategy(); } catch { strategy = { k: 'breakout', name: '突破追蹤', noEdge: false }; }
   let breaker = null; try { breaker = drawdownBreaker(); } catch { breaker = { on: false }; }
   return { AF, hw: marketHeadwind(AF.headwind), perfRules: signalPerfStats(), mktNow, mret: marketRet20(),
-           strict, aCut: Math.min(85, (strict ? 80 : 75) + cutAdj), cutAdj, rrMin: strict ? 2 : 1.5, heat, heatOver: !!heat?.over, cooldown, adopt,
+           strict, aCut: Math.max(65, Math.min(85, (strict ? 80 : 75) + cutAdj + vm.aCutAdj)), cutAdj, rrMin: Math.max(1.2, (strict ? 2 : 1.5) + vm.rrAdj), vm, heat, heatOver: !!heat?.over, cooldown, adopt,
            strategy, noEdge: !!strategy?.noEdge, breaker };
 }
 
@@ -10570,7 +10592,7 @@ function evalEntry(s, env) {
   const nsSec = s.sector ? (_newsSignals?.sectors?.[s.sector]?.score ?? 0) : 0;
   if (nsStk > 0 || nsSec >= 2) pillars.push('buzz');
   const pillarTxt = ['chips', 'fund', 'buzz'].map(k => `${{ chips: '籌碼', fund: '基本面', buzz: '題材' }[k]}${pillars.includes(k) ? '✓' : '✗'}`).join(' ');
-  if (pillars.length < 2) return fail('pillars', `三支柱僅 ${pillars.length} 根（${pillarTxt}）`);
+  if (pillars.length < (env.vm?.pillarsMin ?? 2)) return fail('pillars', `三支柱僅 ${pillars.length} 根（${pillarTxt}），需 ≥${env.vm?.pillarsMin ?? 2}`);
   ok('pillars', `三支柱 ${pillars.length} 根（${pillarTxt}）`);
   return { die: null, checks, pick: { s, m, p, d, q, pillars, corr } };
 }
@@ -10607,11 +10629,12 @@ function computeEntrySignals(opts = {}) {
   // 計數包含「已持有」與「追蹤中的系統訊號」：手上已有兩檔 PCB，第三檔再好也不推。
   const { secCnt, exposed } = sectorExposureCounts();
   const preCnt = { ...secCnt };
+  const capN = env.vm?.sectorCap ?? 2;
   const out = picks.filter(pk => {
     const sec = pk.s.sector || '其他';
     if (exposed.has(pk.s.id)) return true;            // 已在部位中的股票不重複計數，也不因此被自己擋掉
     secCnt[sec] = (secCnt[sec] || 0) + 1;
-    if (secCnt[sec] > 2) { die(preCnt[sec] ? 'exposure' : 'sectorCap'); return false; }
+    if (secCnt[sec] > capN) { die(preCnt[sec] ? 'exposure' : 'sectorCap'); return false; }
     return true;
   });
   F.watchB = out.filter(pk => pk.q.grade !== 'A').length;
@@ -10863,14 +10886,101 @@ function renderLearningOverview() {
     row('🧬', '證據家族看錯校正（技術／量能／籌碼／基本面／環境）', fam) +
     row('🎯', '進場品質因子校正', (() => { try { const a = factorAccuracy(), adj = factorWeightAdj(); const ks = Object.keys(a); return ks.length ? ks.map(k => `${k} 區分力 ${a[k].disc > 0 ? '+' : ''}${a[k].disc}${adj[k] !== 1 ? ` ×${adj[k]}` : ''}`).join('・') + '<br><span style="font-size:0.68rem">區分力＝贏單與輸單的平均得分差；<0.05 降權 ×0.7、>0.2 升權 ×1.15（需 ≥20 筆且勝敗各 ≥5）</span>' : '樣本累積中（需 ≥20 筆已結算且勝敗各 ≥5）'; } catch { return '—'; } })()) +
     row('⛔', '回撤斷路器（權益曲線）', (() => { try { const b = drawdownBreaker(); return `${b.txt}${b.on ? ` <button class="btn-ghost" style="padding:1px 8px;font-size:0.66rem" onclick="ddBreakerReset()">手動重置</button>` : ''}<br><span style="font-size:0.68rem">最近 30 筆淨 R 的權益曲線由高點回撤 ≥${DD_BREAKER_R}R 即停發；冷卻是減半，斷路器是停手</span>`; } catch { return '—'; } })()) +
-    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜掃描鎖定最長 15 分鐘自動解除`; } catch { return '—'; } })()) +
+    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; const gaps = hostGaps().slice(-3); return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜運行 ${Math.round((Date.now() - _bootAt) / 60000)} 分鐘${gaps.length ? `<br>⚠ 主機中斷紀錄：${gaps.map(g => `${g.at.slice(5, 16).replace('T', ' ')} 中斷 ${g.mins} 分${g.discarded ? '（分頁被瀏覽器丟棄）' : ''}`).join('；')} — 這是電腦休眠或瀏覽器記憶體節省造成，請到設定頁開啟「主機模式」並依說明設定瀏覽器例外` : ''}${_wakeLock ? '｜🔒 螢幕喚醒鎖已取得' : hostModeOn() ? '｜主機模式開啟（點一下頁面後會取得螢幕喚醒鎖）' : ''}`; } catch { return '—'; } })()) +
     row('🎚', 'A 級門檻自我校準', (() => { try { const c = qualityCutAdj(); return `${c.txt}<br><span style="font-size:0.68rem">75~80 分區間 ≥10 筆且勝率 <45%、≥80 分高出 ≥15pp 才上調；不自動下調</span>`; } catch { return '—'; } })()) +
     row('🌐', '大盤看法看錯學習', mkt) +
     row('🧪', '策略實驗室', lab) +
     `<div style="font-size:0.68rem;color:var(--text3);margin-top:4px">所有學習皆來自系統自己發出的交易與預測，不需使用者手動結案；每條加嚴規則都受安全閥保護（≥5 次且占 ≥30% 才啟用、20 筆後期望值未改善自動回退）。</div>`;
 }
 
+// ── 成效診斷報告：用本機數據回答「為什麼成效不好」，每一條都附具體原因與建議 ──
+function effectivenessReport() {
+  const out = [];
+  const push = (k, level, title, txt, fix) => out.push({ k, level, title, txt, fix });
+  const today = twClock().date;
+  // ① 交易量
+  try {
+    const sigs = getAiSignals();
+    const recent = sigs.filter(t => t.date && tradingDaysBetween(t.date, today) <= 20);
+    const perWeek = +(recent.length / 4).toFixed(1);
+    const F = _entryFunnel;
+    const top = F ? Object.entries(F).filter(([k]) => FUNNEL_LABELS[k] && F[k] > 0).sort((a, b) => b[1] - a[1]).slice(0, 3) : [];
+    const topTxt = top.length ? top.map(([k, n]) => `${FUNNEL_LABELS[k]} ${n} 檔`).join('、') : '尚無漏斗資料';
+    const vm = volumeModeParams();
+    if (!recent.length) push('vol', 'bad', '交易量：近 20 個交易日 0 筆訊號', `候選 ${F?.total ?? '--'} 檔主要卡在：${topTxt}。${F?.noedge ? '「無經驗證優勢」把全部擋下 — 代表目前盤性下策略庫沒有正期望值，這是正確的空手，不是壞掉。' : F?.breaker ? '回撤斷路器啟動中。' : ''}`, F?.noedge ? '等盤性改變或實驗室更新；或在設定頁關閉優勢閘門（會顯示訊號但標示無優勢）' : `若想要更多訊號，設定頁「訊號數量模式」改為平衡或積極（目前 ${vm.name}）；代價是勝率會下降`);
+    else if (perWeek < 1) push('vol', 'warn', `交易量：每週約 ${perWeek} 筆`, `候選主要卡在：${topTxt}`, `門檻最嚴的三道就是上面三個；想增加訊號請改「訊號數量模式」（目前 ${vm.name}），不要手動放寬風控`);
+    else push('vol', 'ok', `交易量：每週約 ${perWeek} 筆`, `近 20 個交易日 ${recent.length} 筆（${vm.name}模式）`, null);
+  } catch {}
+  // ② 勝率與期望值
+  try {
+    const st = expectancyStats();
+    const done = getAiSignals().filter(t => ['win', 'loss'].includes(t.status));
+    if (!st) push('win', 'warn', `勝率：樣本不足（已結算 ${done.length}／5）`, '少於 5 筆結算不做結論；任何系統前 20 筆都看不出好壞', '繼續累積，不要因為前幾筆就改規則');
+    else {
+      const unfilled = getAiSignals().filter(t => t.status === 'unfilled').length;
+      if (st.expectancy > 0 && st.W < 50) push('win', 'ok', `勝率 ${st.W}%、期望值 +${st.expectancy}R`, '勝率低但期望值為正：順勢系統的正常樣貌（賺大賠小）。帳面會先負後正，看期望值不看勝率', null);
+      else if (st.expectancy <= 0) {
+        const L = aiLossLearnings();
+        const why = L.insufficient ? `止損原因樣本 ${L.n}／3，還不能歸納` : `主要止損原因：${L.rules.slice(0, 2).map(r => `${r.txt.split(' —')[0]} ${r.n} 次`).join('、')}`;
+        push('win', 'bad', `期望值 ${st.expectancy}R（勝率 ${st.W}%、賠率 ${st.avgWinR}/${st.avgLossR}）`, `${why}。${st.avgLossR > 1.05 ? '平均虧損超過 1R：跳空或滑價讓停損失效。' : ''}${st.avgWinR < 1 ? '平均獲利不到 1R：目標太近或太早減碼。' : ''}`, '到實驗室看策略庫在目前盤性有沒有正期望值；沒有就讓優勢閘門停發，有就採用冠軍與調參參數');
+      } else push('win', 'ok', `勝率 ${st.W}%、期望值 +${st.expectancy}R`, `獲利因子 ${st.pf ?? '∞'}、最大連虧 ${st.maxStreak}${unfilled ? `、未成交 ${unfilled} 筆（跳空買不到，不計分）` : ''}`, null);
+    }
+  } catch {}
+  // ③ 自動學習狀態
+  try {
+    const L = aiLossLearnings();
+    const active = L.rules?.filter(r => r.active) || [];
+    const st = ddBreakerState();
+    if (L.insufficient) push('learn', 'warn', `自動學習：止損樣本 ${L.n}／3，尚未啟動`, '學習只從系統自己的止損單歸納；每條加嚴還要同一原因 ≥5 次且占 ≥30% 才啟用（安全閥）', '這是刻意的慢：兩筆就改規則是雜訊不是學習');
+    else push('learn', active.length ? 'ok' : 'warn', `自動學習：歸納 ${L.rules.length} 類原因，${active.length} 條已加嚴`, L.rules.slice(0, 3).map(r => `${r.txt.split(' —')[0]} ${r.n} 次（${r.pct}%）${r.active ? '✓' : ''}`).join('、'), active.length ? null : '最常見原因尚未達 5 次或 30%，門檻未啟用；累積中');
+    if (st.on) push('learn', 'bad', '回撤斷路器啟動中', `${st.at} 觸發，權益曲線回撤 ${st.dd}R`, '這段期間不發新訊號是設計；若已確認市況改變可手動重置');
+  } catch {}
+  // ④ 價格矯正
+  try {
+    const ready = allStocks.filter(s => s.analysis);
+    const stale = ready.filter(s => s._staleDays >= STALE_LIMIT).length;
+    const todayN = ready.filter(s => String(s.ohlcv?.[s.ohlcv.length - 1]?.time || '').slice(0, 10) === today).length;
+    const live = Object.keys(_liveQuotes || {}).length;
+    const th = (() => { try { return histThrottleStatus(); } catch { return { paused: false }; } })();
+    if (stale > ready.length * 0.2) push('price', 'bad', `價格：${stale}／${ready.length} 檔資料過期`, `來源：${ohlcvFailReason[ready.find(s => s._staleDays >= STALE_LIMIT)?.id] || '不明'}${th.paused ? `；官方來源限流暫停 ${th.secondsLeft}s` : ''}`, '系統每 10 分鐘自動重抓；若持續過期，設定頁填 FinMind token 增加一條備援');
+    else push('price', isMarketOpenTW() && !live ? 'warn' : 'ok', `價格：${todayN} 檔有今日 K、${live} 檔有即時報價${stale ? `、${stale} 檔過期` : ''}`, _liveStatus || '非交易時段', isMarketOpenTW() && !live ? '盤中沒有即時報價：MIS 可能被擋，稍後自動重連；可填 FinMind token' : null);
+  } catch {}
+  // ⑤ 大盤預測
+  try {
+    const a = computePredAccuracy();
+    const abst = getPredLog().filter(p => p.market && p.market.dir === 0).length, tot = getPredLog().filter(p => p.market).length;
+    if (a.market.n < 10) push('pred', 'warn', `大盤預測：已驗證 ${a.market.n}／10 次`, `棄權（記中性）${abst}／${tot} 次 — 沒把握時不猜，是命中率的來源之一`, '每天自動累積一筆，10 次後開始有參考性');
+    else push('pred', a.market.pct >= 55 ? 'ok' : 'warn', `大盤預測命中率 ${a.market.pct.toFixed(0)}%（${a.market.n} 次）`, `高信心命中 ${a.marketHiConf.pct != null ? a.marketHiConf.pct.toFixed(0) + '%' : '--'}（${a.marketHiConf.n} 次）、棄權 ${abst}／${tot}`, a.market.pct < 55 ? '看錯學習會依誤判原因自動加嚴（事件、低信心、盤性轉換）；方向機率模型 42~58% 棄權已啟用' : null);
+  } catch {}
+  // ⑥ 實驗室
+  try {
+    const lab = swingLabResult();
+    if (!lab) push('lab', 'warn', '實驗室：尚未執行', '策略庫、改法驗證、調參都要先跑一次才有結果', '交易總結頁按「執行實驗」（電腦上執行，手機不自動跑）');
+    else {
+      const cs = currentSwingStrategy();
+      const good = lab.rows.filter(r => r.verdict.k === 'good').length;
+      const tunedOk = (lab.tuned || []).filter(t => t.best && t.best.val.trades >= 12 && t.best.val.avgR > 0).length;
+      const age = tradingDaysBetween(lab.at, today);
+      push('lab', cs.k ? 'ok' : 'bad', `實驗室：${lab.at}（${age} 個交易日前）`, `今日盤性 ${KIND_NAME[cs.kind] || '不明'} → ${cs.k ? `採用「${cs.name}」${cs.stats ? `（驗證段 ${cs.stats.avgR > 0 ? '+' : ''}${cs.stats.avgR}R、勝率 ${cs.stats.winRate}%）` : ''}` : '無任何策略在驗證段有正期望值'}；有效改法 ${good} 項、調參通過 ${tunedOk} 套`, !cs.k ? '這個盤性下系統沒有優勢：空手是對的；等盤性改變' : (good && !Object.keys(swingLabAdopted()).length) || (tunedOk && !Object.keys(tunedLive()).length) ? '有驗證有效的改法／參數尚未採用：到實驗室按「採用」' : null);
+    }
+  } catch {}
+  return out;
+}
+function renderEffectiveness() {
+  const el = document.getElementById('effect-body');
+  if (!el) return;
+  const rows = effectivenessReport();
+  const c = { ok: 'var(--bull)', warn: 'var(--yellow)', bad: 'var(--bear)' };
+  const ic = { ok: '✅', warn: '⚠️', bad: '🔴' };
+  el.innerHTML = rows.map(r => `<div style="padding:8px 11px;border-radius:8px;background:${c[r.level]}0d;border-left:3px solid ${c[r.level]};margin-bottom:6px">
+      <div style="font-size:0.78rem;font-weight:700;color:${c[r.level]}">${ic[r.level]} ${r.title}</div>
+      <div style="font-size:0.73rem;color:var(--text2);line-height:1.6;margin-top:2px">${r.txt}</div>
+      ${r.fix ? `<div style="font-size:0.72rem;color:var(--text1);margin-top:3px">→ ${r.fix}</div>` : ''}
+    </div>`).join('') || '<div class="adv-loading">掃描完成後產生</div>';
+}
+
 function renderJournal() {
+  renderEffectiveness();
   renderLearningOverview();
   renderExpectancy();
   renderJournalStats();
@@ -12153,6 +12263,44 @@ function shouldAutoReload(uptimeMs, marketOpen, hidden, hiddenMs) {
   if (uptimeMs >= 6 * 60 * 60 * 1000 && (!marketOpen || hidden)) return 'uptime';
   return null;
 }
+// ── 主機心跳：每分鐘記一次「我還活著」。重新載入時若上次心跳距今 >30 分鐘，
+// 代表這段時間頁面被瀏覽器丟棄／電腦休眠／分頁被關 —— 記成系統事件，讓使用者看得到中斷了多久。
+function startHeartbeat() {
+  try {
+    const last = +(localStorage.getItem('host-heartbeat') || 0);
+    if (last && Date.now() - last > 30 * 60 * 1000) {
+      const mins = Math.round((Date.now() - last) / 60000);
+      logSysError(`主機曾中斷 ${mins} 分鐘（上次心跳 ${new Date(last).toLocaleString('zh-TW', { hour12: false })}）${document.wasDiscarded ? '；分頁曾被瀏覽器丟棄（記憶體節省）' : ''}`);
+      const hist = JSON.parse(localStorage.getItem('host-gaps') || '[]');
+      hist.push({ at: new Date().toISOString(), mins, discarded: !!document.wasDiscarded });
+      localStorage.setItem('host-gaps', JSON.stringify(hist.slice(-20)));
+    }
+    const beat = () => { try { localStorage.setItem('host-heartbeat', String(Date.now())); } catch {} };
+    beat(); setInterval(beat, 60 * 1000);
+  } catch {}
+}
+function hostGaps() { try { return JSON.parse(localStorage.getItem('host-gaps') || '[]'); } catch { return []; } }
+// 主機模式：盡量讓瀏覽器不要把這個分頁丟棄或讓電腦休眠
+//   ・Screen Wake Lock：有使用者互動後申請，防止螢幕休眠連帶讓分頁進入節流（需使用者手勢，失敗就算了）
+//   ・Chrome「記憶體節省」會丟棄背景分頁 —— 程式擋不住，設定頁提供一鍵說明如何加入例外
+let _wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if (!('wakeLock' in navigator)) return false;
+    _wakeLock = await navigator.wakeLock.request('screen');
+    _wakeLock.addEventListener?.('release', () => { _wakeLock = null; });
+    return true;
+  } catch { return false; }
+}
+function hostModeOn() { return localStorage.getItem('host-mode') === 'true'; }
+function startHostMode() {
+  if (!hostModeOn()) return;
+  const tryLock = () => { if (!_wakeLock && !document.hidden) requestWakeLock(); };
+  ['click', 'keydown', 'touchstart'].forEach(ev => document.addEventListener(ev, tryLock, { passive: true }));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) tryLock(); });
+  tryLock();
+}
+
 function startUptimeGuard() {
   try {
     document.addEventListener('visibilitychange', () => {
