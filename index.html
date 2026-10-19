@@ -804,6 +804,11 @@
 
       <div id="journal-summary">
         <div class="market-outlook-card" style="margin-bottom:16px">
+          <h3 style="font-size:0.9rem;font-weight:700">🩻 成效診斷報告</h3>
+          <span style="font-size:0.7rem;color:var(--text3)">用本機數據回答「為什麼成效不好」：交易量、勝率與期望值、自動學習、價格、大盤預測、實驗室，各自的原因與下一步</span>
+          <div id="effect-body" style="margin-top:10px"><div class="adv-loading">掃描完成後產生</div></div>
+        </div>
+        <div class="market-outlook-card" style="margin-bottom:16px">
           <h3 style="font-size:0.9rem;font-weight:700">🧠 系統學習總覽</h3>
           <span style="font-size:0.7rem;color:var(--text3)">長期／短期／當沖／技術／基本面／籌碼／大盤看法 — 每個會影響判斷的元件，看錯後各自歸納原因並修正；此處一次看完所有迴路的狀態</span>
           <div id="learning-overview-body" style="margin-top:10px"><div class="adv-loading">整理學習狀態中...</div></div>
@@ -914,6 +919,27 @@
               <option value="15">15%</option>
               <option value="20">20%</option>
             </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">訊號數量模式</div>
+              <div class="setting-desc">嚴選＝A 級 75 分、三支柱至少兩根、同族群 2 檔。平衡＝門檻 −5 分、支柱一根即可、同族群 3 檔。積極＝門檻 −10 分、風報比 −0.2。放寬只影響「要不要推」，停損、部位、斷路器不放寬；交易量上升，勝率會下降</div>
+            </div>
+            <select class="setting-select" id="s-signal-volume">
+              <option value="strict" selected>嚴選（預設）</option>
+              <option value="balanced">平衡</option>
+              <option value="aggressive">積極</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">主機模式（電腦長時間掛著跑推播）</div>
+              <div class="setting-desc">開啟後點一下頁面會取得「螢幕喚醒鎖」避免螢幕休眠。但瀏覽器的「記憶體節省」會丟棄背景分頁，程式擋不住，請另外做兩件事：① Chrome 網址列輸入 chrome://settings/performance，在「永遠保持這些網站的活動狀態」加入本站網址；② 系統電源設定取消睡眠。交易總結頁「系統健康」會顯示主機曾中斷幾分鐘</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="s-host-mode" />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
           </div>
           <div class="setting-row">
             <div class="setting-info">
