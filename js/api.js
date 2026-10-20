@@ -1848,7 +1848,8 @@ async function fetchRealtimeQuote(stockId) {
   const isOTC = localStorage.getItem(`sym-suffix:${stockId}`) === 'TWO';
   const ch = `${isOTC ? 'otc' : 'tse'}_${stockId}.tw`;
   const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=${encodeURIComponent(ch)}&json=1&delay=0&_=${Date.now()}`;
-  const j = await proxyFetch(url, 6000).catch(() => null);
+  let j = await misDirectFetch(url, 6000).catch(() => null);   // 先直連（自己的 IP），再走共用代理
+  if (!j) j = await proxyFetch(url, 6000).catch(() => null);
   const m = j?.msgArray?.[0];
   if (!m) return null;
   const num = v => { const f = parseFloat(String(v ?? '').replace(/,/g, '')); return isFinite(f) ? f : null; };
@@ -1874,16 +1875,31 @@ let lastQuoteFail = '';       // 供 UI 說明「為什麼沒有即時價」
 // MIS 直連能力偵測：所有請求都經由同一個 Vercel IP 出去，是限流的根本原因。
 // 若瀏覽器能直連（對方允許 CORS），每位使用者用自己的 IP，限流問題自然消失。
 // 只試一次並記住結果，避免每 15 秒浪費一個必失敗的請求。
-async function misDirectFetch(url, timeout = 6000) {
+// 「不支援直連」的判定不再永久：先前只要第一次直連失敗（可能只是當下網路閃斷），
+// 就永遠改走共用代理 —— 共用代理的 IP 被 MIS 限流時，即時報價從此全掛，手動重試也救不回來。
+// 改為：直連失敗記下時間，30 分鐘後再試一次。
+const MIS_DIRECT_RETRY_MS = 30 * 60 * 1000;
+function misDirectBlocked() {
   const flag = localStorage.getItem('mis-direct');
-  if (flag === 'no') return null;
+  if (flag !== 'no') return false;
+  const at = +(localStorage.getItem('mis-direct-at') || 0);
+  return Date.now() - at < MIS_DIRECT_RETRY_MS;
+}
+function misDirectMark(ok) {
+  try {
+    localStorage.setItem('mis-direct', ok ? 'yes' : 'no');
+    localStorage.setItem('mis-direct-at', String(Date.now()));
+  } catch {}
+}
+async function misDirectFetch(url, timeout = 6000) {
+  if (misDirectBlocked()) return null;
   const res = await fetchWithTimeout(url, timeout);
-  if (!res) { if (flag !== 'yes') localStorage.setItem('mis-direct', 'no'); return null; }
+  if (!res) { misDirectMark(false); return null; }
   try {
     const j = await res.json();
-    if (j?.msgArray) { localStorage.setItem('mis-direct', 'yes'); return j; }
+    if (j?.msgArray) { misDirectMark(true); return j; }
   } catch {}
-  if (flag !== 'yes') localStorage.setItem('mis-direct', 'no');
+  misDirectMark(false);
   return null;
 }
 
