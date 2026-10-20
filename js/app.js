@@ -424,6 +424,9 @@ async function runScan() {
   after('記錄預測', recordPredictions);
   after('預測準確度', renderPredAccuracy);
   after('分析基準價', () => { allStocks.forEach(s => { if (s.analysis) s._anaPrice = s.analysis.price; }); });
+  // 官方收盤合併補跑：掃描開始時全市場行情尚未抓回，前半段處理的股票根本沒合併到今日收盤
+  // （競態）→ 同一天有些股票有今日 K、有些沒有，就是「有些要手動更新」的來源之一
+  after('官方收盤合併', () => { mergeOfficialCloses().catch(e => console.warn('官方收盤合併失敗:', e)); });
   after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); try { renderAiLossLearning(); } catch {} });
@@ -3788,7 +3791,7 @@ function quoteStampHTML(s) {
   const today = twClock().date;
   const barDate = s?.ohlcv?.length ? String(s.ohlcv[s.ohlcv.length - 1].time).slice(0, 10) : null;
   if (s?._quoteTime) return `<span style="color:var(--bull)">● 即時 ${s._quoteTime}</span>`;
-  if (barDate === today) return `● 今日 ${isMarketOpenTW() ? '盤中' : '收盤'}價`;
+  if (barDate === today) return `● 今日 ${isMarketOpenTW() ? '盤中' : '收盤'}價${s?._quoteTime && !isMarketOpenTW() ? `（MIS 盤後 ${s._quoteTime.slice(0, 5)}）` : ''}`;
   if (barDate) {
     const md = barDate.slice(5).replace('-', '/');
     const age = dataAgeDays(s);
@@ -4934,7 +4937,7 @@ function limitDistance(s) {
 // 掃描完成後復原即時價 —— runScan 會重建 allStocks，
 // 若不復原，價格會倒退回日 K 快取（最舊可達 10 分鐘前）直到下一次 tick
 function reapplyLiveQuotes() {
-  if (!isMarketOpenTW()) return;
+  if (!liveWindowTW()) return;
   const today = twClock().date;
   for (const s of allStocks) applyLiveQuote(s, _liveQuotes[s.id], today);
 }
@@ -4944,7 +4947,10 @@ async function refreshLivePrices() {
   // 開站後要等第一輪掃描結束才會有即時價（使用者感受到的「很久才連上」）。
   // 改為只擋自身重入：已完成分析的股票即可即時更新，掃描結束再統一復原一次。
   if (_liveBusy) return 0;
-  if (!isMarketOpenTW()) { _liveStatus = ''; return 0; }
+  const win = liveWindowTW();
+  if (!win) { _liveStatus = ''; return 0; }
+  // 盤後只每 5 分鐘抓一次「今日最後成交價」，補齊今日收盤；不浪費額度
+  if (win === 'post') { if (Date.now() - _postLastAt < 5 * 60 * 1000) return 0; _postLastAt = Date.now(); }
   const ids = allStocks.filter(s => s.analysis).map(s => s.id);
   if (!ids.length) return 0;
   _liveBusy = true;
@@ -5020,7 +5026,7 @@ async function refreshLivePrices() {
 
     if (n) {
       _lastQuoteTime = latest; _liveFail = ''; _liveFailStreak = 0;
-      _liveStatus = `報價 ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
+      _liveStatus = `${win === 'post' ? '今日收盤' : '報價'} ${latest}${src === 'MIS' ? '' : `（${src}）`}`;
       // 關鍵：讓即時價真正進入指標與研判，而不只是換掉畫面上的數字
       for (const s of pickRecomputeTargets(touched, isLowPowerDevice() ? 12 : 40)) recomputeAnalysis(s);
       // 5 分 K 累積：先前只在「使用者正在看分鐘圖」時才累積 —— 當沖候選股
@@ -5175,8 +5181,9 @@ async function retryLiveQuotes() {
   try { await _retryLiveQuotesInner(); } finally { _retryBusy = false; }
 }
 async function _retryLiveQuotesInner() {
-  try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); } catch {}
+  try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); localStorage.removeItem('mis-direct'); localStorage.removeItem('mis-direct-at'); } catch {}
   Object.keys(localStorage).filter(k => k.startsWith('cache:ohlcv:')).forEach(k => localStorage.removeItem(k));
+  _postLastAt = 0;
   showToast('重新取得即時報價中...', 'info');
   const n = await refreshLivePrices();
   showToast(n ? `已更新 ${n} 檔即時報價（${_liveStatus}）` : `仍無法取得：${_liveFail || '未知原因'}`, n ? 'success' : 'error');
@@ -5192,6 +5199,25 @@ function startLiveQuotes() {
   }, 15000);
   refreshLivePrices();
   startNewsCycle();
+}
+
+// ── 官方收盤合併補跑（14:00 後）：把全市場收盤行情合併進每檔最後一根 K，有變動就重算 ──
+async function mergeOfficialCloses() {
+  if (twClock().hour < 14) return 0;
+  const all = await fetchTWDayAll().catch(() => null);
+  if (!all) return 0;
+  let n = 0;
+  for (const s of allStocks) {
+    const q = all[s.id];
+    if (!q || !s.ohlcv?.length) continue;
+    const before = s.ohlcv[s.ohlcv.length - 1];
+    const sig = `${before.time}|${before.close}|${before.volume}`;
+    try { mergeOfficialBar(s.ohlcv, q); } catch { continue; }
+    const after0 = s.ohlcv[s.ohlcv.length - 1];
+    if (`${after0.time}|${after0.close}|${after0.volume}` !== sig) { recomputeAnalysis(s); n++; }
+  }
+  if (n) { try { renderDashboard(); renderFocusStocks(); if (currentPage === 'ranking') renderRanking(); if (currentPage === 'stock' && currentStockId) { const s = allStocks.find(x => x.id === currentStockId); if (s) renderStockDetail(s); } } catch {} }
+  return n;
 }
 
 // ── 盤中新聞即時分析：每 10 分鐘重抓重判，追蹤標的的新新聞記入流水帳 ──────
@@ -5576,7 +5602,8 @@ async function runDiagnostics() {
       } },
     { name: '即時報價來源總覽', run: async () => {
         const direct = localStorage.getItem('mis-direct');
-        const parts = [`MIS 直連：${direct === 'yes' ? '可用（用你自己的 IP，不受共用限流）' : direct === 'no' ? '不支援（改走共用代理）' : '尚未偵測'}`];
+        const at = +(localStorage.getItem('mis-direct-at') || 0);
+        const parts = [`MIS 直連：${direct === 'yes' ? '可用（用你自己的 IP，不受共用限流）' : direct === 'no' ? `暫不可用（改走共用代理，${Math.max(0, Math.ceil((MIS_DIRECT_RETRY_MS - (Date.now() - at)) / 60000))} 分鐘後再試直連）` : '尚未偵測'}`];
         parts.push(`FinMind token：${finmindToken() ? '已設定' : '未設定'}`);
         parts.push(`Yahoo：${srcDead('yahoo') ? '限流中' : '可用'}`);
         return { ok: true, msg: parts.join('｜') };
@@ -8045,6 +8072,22 @@ function whaleFor(stockId) {
   return _whaleResults.find(r => r.s.id === stockId && !r.trap.length && r.sig?.length) || null;
 }
 
+// 即時報價時段：open＝盤中（09:00–13:35，每 15 秒）；post＝盤後（13:35–15:30，每 5 分鐘）。
+// 盤後 MIS 仍回「今日最後成交價」，這是今日收盤價最早也最可靠的來源 ——
+// 先前 13:30 一過就完全不抓，今日收盤只能等官方全市場行情（約 14:30 後）或 Yahoo（常限流），
+// 於是「收盤價要手動更新」。
+function liveWindowTW() {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
+    const g = t => p.find(x => x.type === t)?.value;
+    if (['Sat', 'Sun'].includes(g('weekday'))) return null;
+    const hm = +g('hour') * 60 + +g('minute');
+    if (hm >= 540 && hm <= 815) return 'open';
+    if (hm > 815 && hm <= 930) return 'post';
+    return null;
+  } catch { return null; }
+}
+let _postLastAt = 0;
 function isMarketOpenTW() {
   try {
     const p = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
@@ -10943,7 +10986,7 @@ function effectivenessReport() {
     const live = Object.keys(_liveQuotes || {}).length;
     const th = (() => { try { return histThrottleStatus(); } catch { return { paused: false }; } })();
     if (stale > ready.length * 0.2) push('price', 'bad', `價格：${stale}／${ready.length} 檔資料過期`, `來源：${ohlcvFailReason[ready.find(s => s._staleDays >= STALE_LIMIT)?.id] || '不明'}${th.paused ? `；官方來源限流暫停 ${th.secondsLeft}s` : ''}`, '系統每 10 分鐘自動重抓；若持續過期，設定頁填 FinMind token 增加一條備援');
-    else push('price', isMarketOpenTW() && !live ? 'warn' : 'ok', `價格：${todayN} 檔有今日 K、${live} 檔有即時報價${stale ? `、${stale} 檔過期` : ''}`, _liveStatus || '非交易時段', isMarketOpenTW() && !live ? '盤中沒有即時報價：MIS 可能被擋，稍後自動重連；可填 FinMind token' : null);
+    else push('price', liveWindowTW() && !live ? 'warn' : 'ok', `價格：${todayN} 檔有今日 K、${live} 檔有即時報價${stale ? `、${stale} 檔過期` : ''}`, _liveStatus || '非交易時段', liveWindowTW() && !live ? `${liveWindowTW() === 'post' ? '盤後' : '盤中'}沒有報價：MIS 可能被擋（${lastQuoteFail || '未知'}），30 分鐘內自動重試直連；可填 FinMind token` : null);
   } catch {}
   // ⑤ 大盤預測
   try {
