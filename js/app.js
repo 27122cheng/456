@@ -144,6 +144,7 @@ async function initApp() {
   safe('長時間運行保護', startUptimeGuard);
   safe('主機心跳', startHeartbeat);
   safe('主機模式', startHostMode);
+  safe('Telegram 指令', startTgInbound);
   safe('掃描', startScan);
 }
 
@@ -5309,6 +5310,8 @@ function loadSettings() {
   if (sEG) sEG.checked = localStorage.getItem('edge-gate') !== 'false';
   const sHM = document.getElementById('s-host-mode');
   if (sHM) sHM.checked = hostModeOn();
+  const sTI = document.getElementById('s-tg-inbound');
+  if (sTI) sTI.checked = tgInboundOn();
   const sSV = document.getElementById('s-signal-volume');
   if (sSV) sSV.value = signalVolumeMode();
   const sTF = document.getElementById('s-timeframe');
@@ -5366,6 +5369,8 @@ function saveAllSettings() {
   if (egEl) localStorage.setItem('edge-gate', egEl.checked ? 'true' : 'false');
   const hmEl = document.getElementById('s-host-mode');
   if (hmEl) { localStorage.setItem('host-mode', hmEl.checked ? 'true' : 'false'); if (hmEl.checked) requestWakeLock(); }
+  const tiEl = document.getElementById('s-tg-inbound');
+  if (tiEl) localStorage.setItem('tg-inbound', tiEl.checked ? 'true' : 'false');
   const svEl = document.getElementById('s-signal-volume');
   if (svEl) localStorage.setItem('signal-volume', svEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
@@ -8379,6 +8384,14 @@ function closeHolding(stockId) {
   if (input === null) return;
   const exit = parseFloat(input);
   if (!isFinite(exit) || exit <= 0) { showToast('出場價格式不正確', 'error'); return; }
+  closeHoldingAt(stockId, exit);
+}
+// 程式化結案（Telegram 指令與介面共用）：回傳結案摘要或 null
+function closeHoldingAt(stockId, exit, opts = {}) {
+  const holdings = getHoldings();
+  const h = holdings.find(x => x.id === stockId);
+  if (!h || !(exit > 0)) return null;
+  const s = allStocks.find(x => x.id === stockId);
 
   // 除息還原：報酬含息、停損基準平移，除息缺口不算虧損也不算凹單
   const div = s ? exDivAdjust(s.ohlcv, h.addedAt) : 0;
@@ -8389,7 +8402,7 @@ function closeHolding(stockId) {
   const journal = getJournal();
   journal.push({
     id: stockId, name: h.name, entry: h.entry, exit: +exit.toFixed(2),
-    entryDate: h.addedAt, exitDate: new Date().toISOString().slice(0, 10),
+    entryDate: h.addedAt, exitDate: opts.date || twClock().date,
     retPct, reason, ctx: h.ctx ?? null, lesson: '',
     src: h.src ?? 'ai', kind: h.kind ?? 'long',
     stars: rating.stars, review: rating.notes,
@@ -8398,9 +8411,10 @@ function closeHolding(stockId) {
   saveJournal(journal);
   saveHoldings(holdings.filter(x => x.id !== stockId));
   const starStr = '★'.repeat(rating.stars) + '☆'.repeat(5 - rating.stars);
-  showToast(`已結案 ${h.name}：${retPct >= 0 ? '+' : ''}${retPct}%（${reason}）評分 ${starStr}`, retPct >= 0 ? 'success' : 'error');
-  renderHoldings(); renderJournal();
-  if (tgWants('sig')) tgPush(`📒 交易結案\n\n${h.name}(${stockId}) ${reason}\n進場 ${h.entry} → 出場 ${exit}\n報酬 ${retPct >= 0 ? '+' : ''}${retPct}%`);
+  if (!opts.quiet) showToast(`已結案 ${h.name}：${retPct >= 0 ? '+' : ''}${retPct}%（${reason}）評分 ${starStr}`, retPct >= 0 ? 'success' : 'error');
+  try { renderHoldings(); renderJournal(); } catch {}
+  if (!opts.noTg && tgWants('sig')) tgPush(`📒 交易結案\n\n${h.name}(${stockId}) ${reason}\n進場 ${h.entry} → 出場 ${exit}\n報酬 ${retPct >= 0 ? '+' : ''}${retPct}%`);
+  return { id: stockId, name: h.name, entry: h.entry, exit: +exit.toFixed(2), retPct, reason, stars: rating.stars };
 }
 
 function setLesson(idx) {
@@ -8733,9 +8747,22 @@ async function addManualHolding() {
   const r = await resolveStock(raw);
   if (r?.ambiguous) { showToast(`找到多檔符合「${raw}」：${r.ambiguous.join('、')} — 請輸入完整名稱或代號`, 'info'); return; }
   if (!r) { showToast(`找不到「${raw}」— 請確認代號或中文名稱是否正確（需為上市/上櫃股票）`, 'error'); return; }
-  const id = r.id, resolvedName = r.name;
+  const res = addHoldingRecord({ id: r.id, name: r.name, entry, qty, kind, src: 'manual' });
+  if (!res.ok) { showToast(res.msg, 'info'); return; }
+  if (idEl) idEl.value = '';
+  if (priceEl) priceEl.value = '';
+  if (qtyEl) qtyEl.value = '';
+  showToast(`已加入持倉：${res.name}（${res.id}・${kind === 'day' ? '當沖單' : '長線單'}）${res.addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
+  renderHoldings();
+  if (res.hasAnalysis) showHoldingView(res.id); // 立即顯示 AI 對此價位的看法
+  else if (res.addedToList) showToast('此股尚未掃描，下輪掃描後即可查看 AI 看法', 'info');
+}
+
+// 程式化新增持倉（介面表單與 Telegram 指令共用）
+function addHoldingRecord({ id, name: resolvedName, entry, qty = null, kind = 'long', src = 'manual', stop: stopIn = null, date = null }) {
   const holdings = getHoldings();
-  if (holdings.some(h => h.id === id)) { showToast('此股已在持倉清單中', 'info'); return; }
+  if (holdings.some(h => h.id === id)) return { ok: false, msg: '此股已在持倉清單中' };
+  if (!(entry > 0)) return { ok: false, msg: '進場價格式不正確' };
 
   // 不在掃描清單的股票 → 自動加入自選股，下輪掃描即可取得分析資料
   let addedToList = false;
@@ -8750,15 +8777,16 @@ async function addManualHolding() {
   const s = allStocks.find(x => x.id === id);
   const m = s?.analysis ? buildManagerAnalysis(s) : null;
   const p = m ? buildEntryPlan(s, m) : null;
-  holdings.push({
+  const stopAuto = (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2);
+  const rec = {
     id, name: s?.name || resolvedName, entry: +entry.toFixed(2), qty,
-    // 停損：有進場計畫且其停損低於你的進場價就沿用；否則當沖 -3%、長線 -7%
-    stop: (p?.ok && p.stop < entry) ? p.stop : +(entry * (kind === 'day' ? 0.97 : 0.93)).toFixed(2),
+    // 停損：指定優先；否則有進場計畫且其停損低於你的進場價就沿用；否則當沖 -3%、長線 -7%
+    stop: stopIn > 0 && stopIn < entry ? +(+stopIn).toFixed(2) : stopAuto,
     t1: p?.ok && p.t1 ? p.t1 : null,
-    src: 'manual', kind,
+    src, kind, mode: p?.ok ? (p.mode || 'breakout') : 'breakout',
     thesis: s?.analysis ? thesisSnapshot(s, m) : null,
     planLo: p?.ok ? p.lo : null, planHi: p?.ok ? p.hi : null,
-    addedAt: new Date().toISOString().slice(0, 10),
+    addedAt: date || twClock().date,
     ctx: s?.analysis ? {
       score: s.analysis.score, rsi: s.analysis.rsi != null ? +s.analysis.rsi.toFixed(1) : null,
       adx: s.analysis.adx != null ? +s.analysis.adx.toFixed(1) : null,
@@ -8772,15 +8800,10 @@ async function addManualHolding() {
       reasons: (m?.bull ?? []).slice(0, 3),
       warns: (m?.bear ?? []).slice(0, 2),
     } : null,
-  });
+  };
+  holdings.push(rec);
   saveHoldings(holdings);
-  if (idEl) idEl.value = '';
-  if (priceEl) priceEl.value = '';
-  if (qtyEl) qtyEl.value = '';
-  showToast(`已加入持倉：${s?.name || resolvedName}（${id}・${kind === 'day' ? '當沖單' : '長線單'}）${addedToList ? '，並加入自選掃描清單' : ''}`, 'success');
-  renderHoldings();
-  if (s?.analysis) showHoldingView(id); // 立即顯示 AI 對此價位的看法
-  else if (addedToList) showToast('此股尚未掃描，下輪掃描後即可查看 AI 看法', 'info');
+  return { ok: true, id, name: rec.name, stop: rec.stop, t1: rec.t1, addedToList, hasAnalysis: !!s?.analysis, rec };
 }
 
 // ── 持倉檢視小頁面：AI 對此股與你的進場價的看法 ────────────────────────────
@@ -11843,6 +11866,138 @@ function tgPush(text) {
   if (token && chatId) return sendTelegram(token, chatId, text);
 }
 
+// ── Telegram 指令：在手機上打字就能記錄持倉與結案 ───────────────────────────
+// 網站沒有後端，由主機瀏覽器每 30 秒向 Bot API 拉 getUpdates（只接受設定頁那個 Chat ID 的訊息），
+// 解析成指令後直接寫進持倉／交易紀錄，再回覆確認。只有「訊號主機」會拉，避免多台裝置重複處理。
+// 支援格式（代號或中文名皆可、順序不拘、全形半形空白皆可）：
+//   買 2330 890 2        → 以 890 記錄長線持倉 2 張（張數可省略）
+//   當沖買 2330 890 2    → 當沖單
+//   買 台積電 890 停損 870 → 指定停損
+//   賣 2330 940          → 以 940 結案（出 / 結案 / sell 同義）
+//   停損 2330 870        → 改停損；   停利 2330 960 → 改目標
+//   持倉 / 查             → 列出持倉；  刪 2330 → 移除不記錄；  幫助 → 說明
+const TG_HELP = `🤖 可用指令（代號或中文名皆可）
+買 2330 890 2　→ 記錄長線持倉（張數可省）
+當沖買 2330 890　→ 記錄當沖單
+買 2330 890 停損 870　→ 指定停損
+賣 2330 940　→ 以 940 結案（出／結案 同義）
+停損 2330 870　→ 改停損
+停利 2330 960　→ 改目標
+持倉　→ 列出目前持倉
+刪 2330　→ 移除（不記錄）`;
+function tgInboundOn() { return localStorage.getItem('tg-inbound') !== 'false'; }
+function parseTgCommand(text) {
+  const t = String(text || '').trim().replace(/[，,]/g, ' ').replace(/\s+/g, ' ');
+  if (!t) return null;
+  if (/^(\/start|幫助|help|說明|\?)$/i.test(t)) return { cmd: 'help' };
+  if (/^(持倉|列表|查|list|持股)$/i.test(t)) return { cmd: 'list' };
+  const toks = t.split(' ');
+  let cmd = null, kind = 'long';
+  const verbs = [
+    [/^(當沖買|沖買|當沖)$/i, () => { cmd = 'buy'; kind = 'day'; }],
+    [/^(買|買進|buy|進|進場)$/i, () => { cmd = 'buy'; }],
+    [/^(賣|賣出|出|出場|結案|sell|close)$/i, () => { cmd = 'sell'; }],
+    [/^(停損|止損|stop)$/i, () => { cmd = cmd || 'stop'; }],
+    [/^(停利|止盈|目標|target)$/i, () => { cmd = cmd || 'target'; }],
+    [/^(刪|刪除|移除|remove|del)$/i, () => { cmd = 'remove'; }],
+  ];
+  const rest = [];
+  let stopVal = null, targetVal = null, pendingKey = null;
+  for (const tok of toks) {
+    const v = verbs.find(([re]) => re.test(tok));
+    if (v) {
+      if (/^(停損|止損|stop)$/i.test(tok) && cmd === 'buy') { pendingKey = 'stop'; continue; }
+      if (/^(停利|止盈|目標|target)$/i.test(tok) && cmd === 'buy') { pendingKey = 'target'; continue; }
+      v[1](); continue;
+    }
+    if (pendingKey && /^\d+(\.\d+)?$/.test(tok)) { if (pendingKey === 'stop') stopVal = +tok; else targetVal = +tok; pendingKey = null; continue; }
+    if (/^(張|股)$/.test(tok)) continue;
+    rest.push(tok.replace(/張$/, ''));
+  }
+  if (!cmd) {
+    // 「2330 890 2」沒有動詞 → 視為買；「2330 940 賣」已由上面處理
+    if (rest.length >= 2 && rest.some(x => /^\d{4,6}[A-Z]?$/.test(x)) && rest.some(x => /^\d+(\.\d+)?$/.test(x) && !/^\d{4,6}$/.test(x))) cmd = 'buy';
+    else return null;
+  }
+  const stockTok = rest.find(x => /^\d{4,6}[A-Z]?$/.test(x)) ?? rest.find(x => /[\u4e00-\u9fff]/.test(x)) ?? null;
+  const nums = rest.filter(x => x !== stockTok && /^\d+(\.\d+)?$/.test(x)).map(Number);
+  return { cmd, kind, stock: stockTok, price: nums[0] ?? null, qty: nums[1] ?? null, stop: stopVal, target: targetVal };
+}
+async function execTgCommand(c) {
+  if (!c) return '看不懂這則訊息。輸入「幫助」查看指令格式。';
+  if (c.cmd === 'help') return TG_HELP;
+  if (c.cmd === 'list') {
+    const hs = getHoldings();
+    if (!hs.length) return '目前沒有持倉。';
+    return '📌 目前持倉\n' + hs.map(h => { const s = allStocks.find(x => x.id === h.id); const px = s?.analysis?.price; const ret = px ? ((px - h.entry) / h.entry * 100) : null; return `${h.name}(${h.id}) 成本 ${h.entry}｜停損 ${h.stop}${h.t1 ? `｜目標 ${h.t1}` : ''}${h.qty ? `｜${h.qty} 張` : ''}${ret != null ? `｜${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%` : ''}`; }).join('\n');
+  }
+  if (!c.stock) return '缺少股票代號或名稱。例：買 2330 890 2';
+  const r = await resolveStock(c.stock);
+  if (r?.ambiguous) return `找到多檔符合「${c.stock}」：${r.ambiguous.join('、')}，請用代號。`;
+  if (!r) return `找不到「${c.stock}」，請確認代號或名稱。`;
+  if (c.cmd === 'buy') {
+    if (!(c.price > 0)) return `缺少進場價。例：買 ${r.id} 890 2`;
+    const res = addHoldingRecord({ id: r.id, name: r.name, entry: c.price, qty: c.qty, kind: c.kind, src: 'manual', stop: c.stop });
+    if (!res.ok) return `❌ ${res.msg}`;
+    if (c.target > 0) { const hs = getHoldings(); const h = hs.find(x => x.id === r.id); if (h) { h.t1 = +c.target.toFixed(2); saveHoldings(hs); } }
+    try { renderHoldings(); } catch {}
+    return `✅ 已記錄${c.kind === 'day' ? '當沖' : '長線'}持倉：${res.name}(${res.id})\n進場 ${(+c.price).toFixed(2)}${c.qty ? `｜${c.qty} 張` : ''}\n停損 ${res.stop}${c.target > 0 ? `｜目標 ${(+c.target).toFixed(2)}` : res.t1 ? `｜目標 ${res.t1}` : ''}${res.addedToList ? '\n（已加入自選掃描清單，下輪掃描後有 AI 看法）' : ''}\n網站持倉頁每日自動檢查出場訊號。`;
+  }
+  if (c.cmd === 'sell') {
+    if (!(c.price > 0)) return `缺少出場價。例：賣 ${r.id} 940`;
+    const res = closeHoldingAt(r.id, c.price, { quiet: true, noTg: true });
+    if (!res) return `❌ ${r.name}(${r.id}) 不在持倉中。`;
+    return `📒 已結案：${res.name}(${res.id})\n進場 ${res.entry} → 出場 ${res.exit}\n報酬 ${res.retPct >= 0 ? '+' : ''}${res.retPct}%（${res.reason}）評分 ${'★'.repeat(res.stars)}${'☆'.repeat(5 - res.stars)}\n已寫入交易紀錄。`;
+  }
+  if (c.cmd === 'stop' || c.cmd === 'target') {
+    if (!(c.price > 0)) return '缺少價格。';
+    const hs = getHoldings(); const h = hs.find(x => x.id === r.id);
+    if (!h) return `❌ ${r.name}(${r.id}) 不在持倉中。`;
+    if (c.cmd === 'stop') { h.stop = +c.price.toFixed(2); h.trailNote = `Telegram 手動設定停損 ${h.stop}`; } else h.t1 = +c.price.toFixed(2);
+    saveHoldings(hs); try { renderHoldings(); } catch {}
+    return `✅ ${h.name}(${h.id}) ${c.cmd === 'stop' ? '停損' : '目標'}已改為 ${(+c.price).toFixed(2)}`;
+  }
+  if (c.cmd === 'remove') {
+    const hs = getHoldings(); const h = hs.find(x => x.id === r.id);
+    if (!h) return `❌ ${r.name}(${r.id}) 不在持倉中。`;
+    saveHoldings(hs.filter(x => x.id !== r.id)); try { renderHoldings(); } catch {}
+    return `🗑 已移除 ${h.name}(${h.id})（不記錄）`;
+  }
+  return TG_HELP;
+}
+let _tgPollBusy = false, _tgPollFail = 0;
+async function tgPollUpdates() {
+  if (_tgPollBusy || !tgInboundOn() || !isSignalMaster()) return 0;
+  const { token, chatId } = tgCreds();
+  if (!token || !chatId) return 0;
+  _tgPollBusy = true;
+  try {
+    const offset = +(localStorage.getItem('tg-update-offset') || 0);
+    const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=0&allowed_updates=%5B%22message%22%5D`, { signal: AbortSignal.timeout(10000) });
+    const data = await res.json();
+    if (!data?.ok) { _tgPollFail++; if (_tgPollFail === 3) logSysError(`Telegram 指令拉取失敗：${data?.description || res.status}`); return 0; }
+    _tgPollFail = 0;
+    let handled = 0, maxId = offset - 1;
+    for (const u of data.result || []) {
+      maxId = Math.max(maxId, u.update_id);
+      const msg = u.message; if (!msg?.text) continue;
+      if (String(msg.chat?.id) !== String(chatId)) continue;          // 只接受設定頁那個聊天室
+      if (msg.date && Date.now() / 1000 - msg.date > 24 * 3600) continue;   // 太舊的不處理（主機離線期間的積壓）
+      let reply;
+      try { reply = await execTgCommand(parseTgCommand(msg.text)); } catch (e) { reply = `處理失敗：${e?.message || e}`; }
+      await sendTelegram(token, chatId, reply, { quiet: true });
+      handled++;
+    }
+    if (maxId >= offset) localStorage.setItem('tg-update-offset', String(maxId + 1));
+    return handled;
+  } catch (e) { _tgPollFail++; return 0; }
+  finally { _tgPollBusy = false; }
+}
+function startTgInbound() {
+  setInterval(() => { tgPollUpdates().catch(() => {}); }, 30 * 1000);
+  setTimeout(() => { tgPollUpdates().catch(() => {}); }, 5000);
+}
+
 // ── 當日已推內容登記表：跨訊息類型的內容去重 ────────────────────────────────
 // 問題：同一檔股票一天會被「強勢多頭」「進場訊號」「重點關注」「簡報推薦」
 // 各推一次 — 每則訊息各自有每日一次的限制，但彼此不知道對方推過什麼。
@@ -11876,7 +12031,7 @@ async function testTelegramNotif() {
   showToast('✅ 測試成功，Telegram 設定已自動儲存並啟用', 'success');
 }
 
-async function sendTelegram(token, chatId, text) {
+async function sendTelegram(token, chatId, text, opts = {}) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -11884,10 +12039,10 @@ async function sendTelegram(token, chatId, text) {
       signal: AbortSignal.timeout(8000),
     });
     const data = await res.json();
-    if (data.ok) { showToast('Telegram 傳送成功！', 'success'); return true; }
-    else { showToast('Telegram 錯誤: ' + (data.description || 'unknown'), 'error'); return false; }
+    if (data.ok) { if (!opts.quiet) showToast('Telegram 傳送成功！', 'success'); return true; }
+    else { if (!opts.quiet) showToast('Telegram 錯誤: ' + (data.description || 'unknown'), 'error'); return false; }
   } catch (e) {
-    showToast('Telegram 連線失敗', 'error'); return false;
+    if (!opts.quiet) showToast('Telegram 連線失敗', 'error'); return false;
   }
 }
 
