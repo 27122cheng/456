@@ -10952,7 +10952,7 @@ function renderLearningOverview() {
     row('🧬', '證據家族看錯校正（技術／量能／籌碼／基本面／環境）', fam) +
     row('🎯', '進場品質因子校正', (() => { try { const a = factorAccuracy(), adj = factorWeightAdj(); const ks = Object.keys(a); return ks.length ? ks.map(k => `${k} 區分力 ${a[k].disc > 0 ? '+' : ''}${a[k].disc}${adj[k] !== 1 ? ` ×${adj[k]}` : ''}`).join('・') + '<br><span style="font-size:0.68rem">區分力＝贏單與輸單的平均得分差；<0.05 降權 ×0.7、>0.2 升權 ×1.15（需 ≥20 筆且勝敗各 ≥5）</span>' : '樣本累積中（需 ≥20 筆已結算且勝敗各 ≥5）'; } catch { return '—'; } })()) +
     row('⛔', '回撤斷路器（權益曲線）', (() => { try { const b = drawdownBreaker(); return `${b.txt}${b.on ? ` <button class="btn-ghost" style="padding:1px 8px;font-size:0.66rem" onclick="ddBreakerReset()">手動重置</button>` : ''}<br><span style="font-size:0.68rem">最近 30 筆淨 R 的權益曲線由高點回撤 ≥${DD_BREAKER_R}R 即停發；冷卻是減半，斷路器是停手</span>`; } catch { return '—'; } })()) +
-    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; const gaps = hostGaps().slice(-3); return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜運行 ${Math.round((Date.now() - _bootAt) / 60000)} 分鐘${gaps.length ? `<br>⚠ 主機中斷紀錄：${gaps.map(g => `${g.at.slice(5, 16).replace('T', ' ')} 中斷 ${g.mins} 分${g.discarded ? '（分頁被瀏覽器丟棄）' : ''}`).join('；')} — 這是電腦休眠或瀏覽器記憶體節省造成，請到設定頁開啟「主機模式」並依說明設定瀏覽器例外` : ''}${_wakeLock ? '｜🔒 螢幕喚醒鎖已取得' : hostModeOn() ? '｜主機模式開啟（點一下頁面後會取得螢幕喚醒鎖）' : ''}`; } catch { return '—'; } })()) +
+    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; const gaps = hostGaps().slice(-3); return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜運行 ${Math.round((Date.now() - _bootAt) / 60000)} 分鐘${jsHeapMB() != null ? `｜JS 記憶體 ${jsHeapMB()}MB（本次最高 ${_memPeak || jsHeapMB()}MB，超過 ${MEM_SOFT_MB}MB 休市時自動重載）` : ''}${gaps.length ? `<br>⚠ 主機中斷紀錄：${gaps.map(g => `${g.at.slice(5, 16).replace('T', ' ')} 中斷 ${g.mins} 分${g.discarded ? '（分頁被瀏覽器丟棄）' : ''}`).join('；')} — 這是電腦休眠或瀏覽器記憶體節省造成，請到設定頁開啟「主機模式」並依說明設定瀏覽器例外` : ''}${_wakeLock ? '｜🔒 螢幕喚醒鎖已取得' : hostModeOn() ? '｜主機模式開啟（點一下頁面後會取得螢幕喚醒鎖）' : ''}`; } catch { return '—'; } })()) +
     row('🎚', 'A 級門檻自我校準', (() => { try { const c = qualityCutAdj(); return `${c.txt}<br><span style="font-size:0.68rem">75~80 分區間 ≥10 筆且勝率 <45%、≥80 分高出 ≥15pp 才上調；不自動下調</span>`; } catch { return '—'; } })()) +
     row('🌐', '大盤看法看錯學習', mkt) +
     row('🧪', '策略實驗室', lab) +
@@ -12499,8 +12499,29 @@ function startHostMode() {
   tryLock();
 }
 
+// ── 記憶體監看（Chrome 提供 performance.memory）──────────────────────────
+// Windows 錯誤 0xc000012d（分頁檔太小／記憶體承諾額度用完）會把整個 Chrome 砍掉，
+// 不是網頁自己能擋的；網頁能做的是把自己的堆疊壓低、在變大前就自我重載。
+const MEM_SOFT_MB = 350, MEM_HARD_MB = 700;
+function jsHeapMB() { try { const m = performance?.memory; return m?.usedJSHeapSize ? Math.round(m.usedJSHeapSize / 1048576) : null; } catch { return null; } }
+function memoryVerdict(mb, scanning, marketOpen, hidden) {
+  if (mb == null) return null;
+  if (mb >= MEM_HARD_MB && !scanning) return 'hard';
+  if (mb >= MEM_SOFT_MB && !scanning && (!marketOpen || hidden)) return 'soft';
+  return null;
+}
+let _memPeak = 0;
+function memoryTick() {
+  const mb = jsHeapMB(); if (mb == null) return;
+  _memPeak = Math.max(_memPeak, mb);
+  try { localStorage.setItem('mem-peak', String(Math.max(_memPeak, +(localStorage.getItem('mem-peak') || 0)))); } catch {}
+  const v = memoryVerdict(mb, typeof scanning !== 'undefined' && scanning, isMarketOpenTW(), document.hidden);
+  if (v) { logSysError(`記憶體 ${mb}MB 超過${v === 'hard' ? '硬' : '軟'}上限，自動重新載入釋放`); location.reload(); }
+}
+
 function startUptimeGuard() {
   try {
+    setInterval(memoryTick, 2 * 60 * 1000);
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) { _hiddenAt = Date.now(); return; }
       const why = shouldAutoReload(Date.now() - _bootAt, isMarketOpenTW(), false, _hiddenAt ? Date.now() - _hiddenAt : null);
