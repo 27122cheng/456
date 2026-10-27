@@ -5605,6 +5605,12 @@ async function runDiagnostics() {
         const r = await fetchNewsRSS('台股 股市', 5).catch(() => null);
         return r?.length ? { ok: true, msg: `${r.length} 則，最新：${r[0].headline.slice(0, 24)}…` } : { ok: false, msg: '無回應' };
       } },
+    { name: 'Telegram 指令讀取狀態', run: async () => {
+        const st = tgInboundStatus();
+        if (!tgCreds().token || !tgCreds().chatId) return { ok: false, msg: '未填 Bot Token 或 Chat ID' };
+        const n = await tgPollUpdates();
+        return { ok: !st.error && !tgInboundStatus().error, msg: `${tgInboundStatusTxt()}（剛才立即讀取：${n} 則）` };
+      } },
     { name: '即時報價來源總覽', run: async () => {
         const direct = localStorage.getItem('mis-direct');
         const at = +(localStorage.getItem('mis-direct-at') || 0);
@@ -10952,7 +10958,7 @@ function renderLearningOverview() {
     row('🧬', '證據家族看錯校正（技術／量能／籌碼／基本面／環境）', fam) +
     row('🎯', '進場品質因子校正', (() => { try { const a = factorAccuracy(), adj = factorWeightAdj(); const ks = Object.keys(a); return ks.length ? ks.map(k => `${k} 區分力 ${a[k].disc > 0 ? '+' : ''}${a[k].disc}${adj[k] !== 1 ? ` ×${adj[k]}` : ''}`).join('・') + '<br><span style="font-size:0.68rem">區分力＝贏單與輸單的平均得分差；<0.05 降權 ×0.7、>0.2 升權 ×1.15（需 ≥20 筆且勝敗各 ≥5）</span>' : '樣本累積中（需 ≥20 筆已結算且勝敗各 ≥5）'; } catch { return '—'; } })()) +
     row('⛔', '回撤斷路器（權益曲線）', (() => { try { const b = drawdownBreaker(); return `${b.txt}${b.on ? ` <button class="btn-ghost" style="padding:1px 8px;font-size:0.66rem" onclick="ddBreakerReset()">手動重置</button>` : ''}<br><span style="font-size:0.68rem">最近 30 筆淨 R 的權益曲線由高點回撤 ≥${DD_BREAKER_R}R 即停發；冷卻是減半，斷路器是停手</span>`; } catch { return '—'; } })()) +
-    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; const gaps = hostGaps().slice(-3); return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜運行 ${Math.round((Date.now() - _bootAt) / 60000)} 分鐘${jsHeapMB() != null ? `｜JS 記憶體 ${jsHeapMB()}MB（本次最高 ${_memPeak || jsHeapMB()}MB，超過 ${MEM_SOFT_MB}MB 休市時自動重載）` : ''}${gaps.length ? `<br>⚠ 主機中斷紀錄：${gaps.map(g => `${g.at.slice(5, 16).replace('T', ' ')} 中斷 ${g.mins} 分${g.discarded ? '（分頁被瀏覽器丟棄）' : ''}`).join('；')} — 這是電腦休眠或瀏覽器記憶體節省造成，請到設定頁開啟「主機模式」並依說明設定瀏覽器例外` : ''}${_wakeLock ? '｜🔒 螢幕喚醒鎖已取得' : hostModeOn() ? '｜主機模式開啟（點一下頁面後會取得螢幕喚醒鎖）' : ''}`; } catch { return '—'; } })()) +
+    row('🩺', '系統健康', (() => { try { const log = sysErrors(); const sc = typeof scanning !== 'undefined' && scanning; const gaps = hostGaps().slice(-3); return `${log.length ? `近 24 小時錯誤 ${log.length} 次，最近：${log[log.length - 1].t.slice(11, 16)} ${log[log.length - 1].m}` : '近 24 小時無錯誤'}｜掃描${sc ? '進行中' : '閒置'}｜運行 ${Math.round((Date.now() - _bootAt) / 60000)} 分鐘<br>${tgInboundStatusTxt()}${jsHeapMB() != null ? `｜JS 記憶體 ${jsHeapMB()}MB（本次最高 ${_memPeak || jsHeapMB()}MB，超過 ${MEM_SOFT_MB}MB 休市時自動重載）` : ''}${gaps.length ? `<br>⚠ 主機中斷紀錄：${gaps.map(g => `${g.at.slice(5, 16).replace('T', ' ')} 中斷 ${g.mins} 分${g.discarded ? '（分頁被瀏覽器丟棄）' : ''}`).join('；')} — 這是電腦休眠或瀏覽器記憶體節省造成，請到設定頁開啟「主機模式」並依說明設定瀏覽器例外` : ''}${_wakeLock ? '｜🔒 螢幕喚醒鎖已取得' : hostModeOn() ? '｜主機模式開啟（點一下頁面後會取得螢幕喚醒鎖）' : ''}`; } catch { return '—'; } })()) +
     row('🎚', 'A 級門檻自我校準', (() => { try { const c = qualityCutAdj(); return `${c.txt}<br><span style="font-size:0.68rem">75~80 分區間 ≥10 筆且勝率 <45%、≥80 分高出 ≥15pp 才上調；不自動下調</span>`; } catch { return '—'; } })()) +
     row('🌐', '大盤看法看錯學習', mkt) +
     row('🧪', '策略實驗室', lab) +
@@ -11966,6 +11972,24 @@ async function execTgCommand(c) {
   return TG_HELP;
 }
 let _tgPollBusy = false, _tgPollFail = 0;
+// 指令讀取狀態：最後讀取時間、累計處理筆數、最近錯誤 —— 讓使用者看得出「有沒有在動」
+function tgInboundStatus() { try { return JSON.parse(localStorage.getItem('tg-inbound-status') || '{}'); } catch { return {}; } }
+function tgInboundStamp({ handled = 0, error = null } = {}) {
+  const st = tgInboundStatus();
+  st.at = new Date().toISOString();
+  st.total = (st.total || 0) + handled;
+  if (handled) st.lastHandledAt = st.at;
+  st.error = error;
+  try { localStorage.setItem('tg-inbound-status', JSON.stringify(st)); } catch {}
+}
+function tgInboundStatusTxt() {
+  const st = tgInboundStatus();
+  if (!tgInboundOn()) return 'Telegram 指令：已關閉';
+  if (!isSignalMaster()) return 'Telegram 指令：此裝置非訊號主機，不讀取';
+  if (!st.at) return 'Telegram 指令：尚未讀取過（主機啟動 5 秒後開始，每 30 秒一次）';
+  const ago = Math.round((Date.now() - new Date(st.at).getTime()) / 60000);
+  return `Telegram 指令：${ago} 分鐘前讀取${st.error ? `（錯誤：${st.error}）` : '正常'}｜累計處理 ${st.total || 0} 則${st.lastHandledAt ? `，最近 ${st.lastHandledAt.slice(5, 16).replace('T', ' ')}` : ''}`;
+}
 async function tgPollUpdates() {
   if (_tgPollBusy || !tgInboundOn() || !isSignalMaster()) return 0;
   const { token, chatId } = tgCreds();
@@ -11975,7 +11999,7 @@ async function tgPollUpdates() {
     const offset = +(localStorage.getItem('tg-update-offset') || 0);
     const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=0&allowed_updates=%5B%22message%22%5D`, { signal: AbortSignal.timeout(10000) });
     const data = await res.json();
-    if (!data?.ok) { _tgPollFail++; if (_tgPollFail === 3) logSysError(`Telegram 指令拉取失敗：${data?.description || res.status}`); return 0; }
+    if (!data?.ok) { _tgPollFail++; tgInboundStamp({ error: data?.description || `HTTP ${res.status}` }); if (_tgPollFail === 3) logSysError(`Telegram 指令拉取失敗：${data?.description || res.status}`); return 0; }
     _tgPollFail = 0;
     let handled = 0, maxId = offset - 1;
     for (const u of data.result || []) {
@@ -11989,8 +12013,9 @@ async function tgPollUpdates() {
       handled++;
     }
     if (maxId >= offset) localStorage.setItem('tg-update-offset', String(maxId + 1));
+    tgInboundStamp({ handled });
     return handled;
-  } catch (e) { _tgPollFail++; return 0; }
+  } catch (e) { _tgPollFail++; tgInboundStamp({ error: e?.message || String(e) }); return 0; }
   finally { _tgPollBusy = false; }
 }
 function startTgInbound() {
