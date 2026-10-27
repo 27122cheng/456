@@ -11882,6 +11882,65 @@ function tgPush(text) {
 //   賣 2330 940          → 以 940 結案（出 / 結案 / sell 同義）
 //   停損 2330 870        → 改停損；   停利 2330 960 → 改目標
 //   持倉 / 查             → 列出持倉；  刪 2330 → 移除不記錄；  幫助 → 說明
+// 確保某檔有日 K 與分析（不在掃描清單的股票臨時抓一次）
+async function ensureStockLoaded(id, name) {
+  let s = allStocks.find(x => x.id === id);
+  if (s?.analysis && !(s._staleDays >= STALE_LIMIT)) return s;
+  const ohlcv = await fetchStockOHLCV(id, '1d', '6mo').catch(() => []);
+  if (!(ohlcv?.length >= 20)) return s || null;
+  if (!s) { const meta = getStockList().find(x => x.id === id) || { id, name: name || id, sector: '自訂' }; s = { ...meta, ohlcv }; allStocks.push(s); }
+  else s.ohlcv = ohlcv;
+  s.analysis = calculateScore(ohlcv);
+  try { s.reversal = detectReversal(ohlcv, s.analysis); } catch {}
+  delete s._verdict; delete s._staleDays;
+  return s;
+}
+const tgEsc = t => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// 單檔交易看法（Telegram 用純文字）：研判、多空證據、誘多判別、交易建議（三價位／部位／理由或卡在哪一道）、持倉狀態
+function stockViewText(s) {
+  const a = s.analysis, m = buildManagerAnalysis(s), v = getVerdict(s);
+  const chg = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : null;
+  const L = [];
+  L.push(`📊 ${s.name}(${s.id})　現價 ${a.price.toFixed(2)}${chg != null ? `（${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%）` : ''}${s._quoteTime ? `　${s._quoteTime.slice(0, 5)}` : ''}${s._staleDays >= STALE_LIMIT ? '　⚠ 資料過期' : ''}`);
+  L.push(`研判：${v?.signal || '--'}／${m?.stance || '--'}（強度 ${m ? (m.dir >= 0 ? '+' : '') + m.dir.toFixed(1) : '--'}、一致性 ${m ? (m.agr * 100).toFixed(0) : '--'}%、信心 ${m ? (m.conf * 100).toFixed(0) : '--'}%）`);
+  if (m?.bull?.length) L.push(`多方：${m.bull.slice(0, 3).map(x => x.split('（')[0]).join('・')}`);
+  if (m?.bear?.length) L.push(`空方：${m.bear.slice(0, 2).map(x => x.split('（')[0]).join('・')}`);
+  try { const tp = trapAnalysis(s); if (tp && tp.verdict !== 'none') L.push(`🪤 ${tp.txt.split(' —')[0]}`); } catch {}
+  // 交易建議：沿用網站的門檻體檢
+  try {
+    const R = entryGateReport(s);
+    if (R.die) {
+      const last = R.checks[R.checks.length - 1];
+      L.push(`🎯 交易建議：⏳ 未列入推薦 — 卡在「${FUNNEL_LABELS[R.die] || R.die}」：${last?.txt || ''}`);
+      const p = buildEntryPlan(s, m, { mode: currentSwingStrategy().k || 'breakout', tuned: currentSwingStrategy().tuned || null });
+      if (p?.ok) L.push(`　若日後通過門檻，參考計畫：🟦 掛買 ${p.lo}~${p.hi}　🟥 停損 ${p.stop}（−${p.riskPct.toFixed(1)}%）　🟩 ${p.holdOn ? '無壓力續抱' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}`);
+    } else {
+      const pk = R.pick, p = pk.p, q = pk.q;
+      const isA = q.grade === 'A';
+      L.push(`🎯 交易建議：${isA ? '✅ 可進場' : '⏳ 先觀察'} ${q.grade} 級 ${q.score} 分（策略：${SWING_STRATEGIES.find(x => x.k === p.mode)?.name || '突破追蹤'}）`);
+      L.push(`　🟦 掛買 ${p.lo}~${p.hi}　🟥 停損 ${p.stop}（−${p.riskPct.toFixed(1)}%）　🟩 ${p.holdOn ? '無壓力續抱' : `目標 ${p.t1}（+${p.rewardPct1.toFixed(1)}%）`}${p.rr ? `　賠率 1:${p.rr.toFixed(1)}` : ''}`);
+      L.push(`　${p.sizing ? `部位 ${p.sizing.shares > 0 ? `${p.sizing.shares} 張` : `零股 ${p.sizing.oddLot} 股`}｜` : ''}+1R ${(p.lo * 2 - p.stop).toFixed(2)} 減半保本`);
+      L.push(`　理由：${plainReason(pk)}`);
+      const warn = [];
+      if (p.evt?.length) warn.push(...p.evt.map(e => e.txt.split(' —')[0].split('（')[0]));
+      if (p.trap?.verdict === 'caution') warn.push('誘多警訊');
+      if (p.scen?.asym) warn.push('賠率不對稱');
+      if (!isA) warn.push(`距 A 級差 ${q.gapToA} 分（最弱：${(q.weakest || []).join('、')}）`);
+      if (warn.length) L.push(`　⚠ ${warn.join('・')}`);
+      if (R.secNow >= R.secCap) L.push(`　族群曝險已滿（${R.secNow}／${R.secCap}），本輪不推`);
+    }
+  } catch (e) { L.push(`🎯 交易建議：目前無法評估（${e?.message || e}）`); }
+  // 持倉狀態
+  try {
+    const h = getHoldings().find(x => x.id === s.id);
+    if (h) {
+      const r = checkHoldingExit(h);
+      if (r) L.push(`📌 持倉：成本 ${h.entry}｜${r.retPct >= 0 ? '+' : ''}${r.retPct.toFixed(2)}%｜${{ exit: '🔴 建議出場', watch: '🟡 留意', hold: '🟢 續抱' }[r.level]}｜停損 ${h.stop}${h.t1 ? `｜目標 ${h.t1}` : ''}\n　下一步：${r.reasons[0]}`);
+    }
+  } catch {}
+  L.push('⚠ 僅供參考，非投資建議');
+  return tgEsc(L.join('\n'));
+}
 const TG_HELP = `🤖 可用指令（代號或中文名皆可）
 買 2330 890 2　→ 記錄長線持倉（張數可省）
 當沖買 2330 890　→ 記錄當沖單
@@ -11890,13 +11949,18 @@ const TG_HELP = `🤖 可用指令（代號或中文名皆可）
 停損 2330 870　→ 改停損
 停利 2330 960　→ 改目標
 持倉　→ 列出目前持倉
-刪 2330　→ 移除（不記錄）`;
+刪 2330　→ 移除（不記錄）
+清零　→ 以當下價格結算全部持倉並回傳結果
+2330 或 台積電　→ 回傳這檔的交易看法與建議`;
 function tgInboundOn() { return localStorage.getItem('tg-inbound') !== 'false'; }
 function parseTgCommand(text) {
   const t = String(text || '').trim().replace(/[，,]/g, ' ').replace(/\s+/g, ' ');
   if (!t) return null;
   if (/^(\/start|幫助|help|說明|\?)$/i.test(t)) return { cmd: 'help' };
   if (/^(持倉|列表|查|list|持股)$/i.test(t)) return { cmd: 'list' };
+  if (/^(清零|清空|全部出清|closeall)$/i.test(t)) return { cmd: 'closeall' };
+  // 單獨一個代號或中文名（或「看 2330」）→ 回傳這檔的交易看法
+  { const mv = t.match(/^(?:看|查看|分析|view)?\s*(\d{4,6}[A-Z]?|[\u4e00-\u9fff]{2,8}(?:-KY)?)$/i); if (mv && !/^(持倉|列表|持股|幫助|說明|清零|清空)$/.test(mv[1])) return { cmd: 'view', stock: mv[1] }; }
   const toks = t.split(' ');
   let cmd = null, kind = 'long';
   const verbs = [
@@ -11936,6 +12000,29 @@ async function execTgCommand(c) {
     const hs = getHoldings();
     if (!hs.length) return '目前沒有持倉。';
     return '📌 目前持倉\n' + hs.map(h => { const s = allStocks.find(x => x.id === h.id); const px = s?.analysis?.price; const ret = px ? ((px - h.entry) / h.entry * 100) : null; return `${h.name}(${h.id}) 成本 ${h.entry}｜停損 ${h.stop}${h.t1 ? `｜目標 ${h.t1}` : ''}${h.qty ? `｜${h.qty} 張` : ''}${ret != null ? `｜${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%` : ''}`; }).join('\n');
+  }
+  if (c.cmd === 'closeall') {
+    const hs = getHoldings();
+    if (!hs.length) return '目前沒有持倉，沒有東西可清。';
+    const lines = []; let sum = 0, n = 0, skipped = [];
+    for (const h of [...hs]) {
+      const s = allStocks.find(x => x.id === h.id);
+      const px = s?.analysis?.price;
+      if (!(px > 0)) { skipped.push(`${h.name}(${h.id})`); continue; }
+      const res = closeHoldingAt(h.id, px, { quiet: true, noTg: true });
+      if (!res) { skipped.push(`${h.name}(${h.id})`); continue; }
+      n++; sum += res.retPct;
+      lines.push(`${res.retPct >= 0 ? '🟢' : '🔴'} ${res.name}(${res.id}) ${res.entry} → ${res.exit}　${res.retPct >= 0 ? '+' : ''}${res.retPct}%（${res.reason}）`);
+    }
+    return `🧹 清零完成：以當下價格結算 ${n} 筆${skipped.length ? `，${skipped.length} 筆無現價未結算（${skipped.join('、')}），稍後再傳一次「清零」` : ''}\n${lines.join('\n')}${n ? `\n平均報酬 ${sum / n >= 0 ? '+' : ''}${(sum / n).toFixed(2)}%，已全部寫入交易紀錄。` : ''}`;
+  }
+  if (c.cmd === 'view') {
+    const r = await resolveStock(c.stock);
+    if (r?.ambiguous) return `找到多檔符合「${c.stock}」：${r.ambiguous.join('、')}，請用代號。`;
+    if (!r) return `找不到「${c.stock}」。`;
+    const s = await ensureStockLoaded(r.id, r.name);
+    if (!s?.analysis) return `${r.name}(${r.id}) 目前抓不到日 K（資料來源限流或代號無官方日 K），稍後再試。`;
+    return stockViewText(s);
   }
   if (!c.stock) return '缺少股票代號或名稱。例：買 2330 890 2';
   const r = await resolveStock(c.stock);
