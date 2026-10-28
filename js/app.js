@@ -331,6 +331,10 @@ async function runScan() {
   fetchTWIIOHLC(5).then(bars => {
     if (bars?.length) { _twiiSeries = bars; renderFocusStocks(); }
   }).catch(() => {});
+  // 大盤歷史校準模型：用 14 個月加權指數日線訓練（每 5 個交易日重訓一次，結果快取）
+  fetchTWIIOHLC(14).then(bars => {
+    if (bars?.length >= 120) { _twiiLong = bars; try { marketHistModel(true); } catch (e) { console.warn('大盤模型', e); } try { renderMarketOutlook(); } catch {} }
+  }).catch(() => {});
 
   // 並行掃描（5 個 worker 同時抓，取代逐檔串行 + 300ms 延遲 → 快 5-8 倍）
   const queue = [...allStocks];
@@ -939,6 +943,8 @@ function renderMarketOutlook() {
   let predict = `綜合 ${rows.length} 項因子，市場評分 <strong>${norm > 0 ? '+' : ''}${norm}</strong>（區間 -100 ~ +100）${confTxt}`;
   if (reg.kindTxt) predict += `<br><span style="color:${reg.kind === 'trend' ? 'var(--bull)' : reg.kind === 'range' ? 'var(--yellow)' : 'var(--text3)'}">盤性：${reg.kindTxt}</span>`;
   if (reg.vol?.txt) predict += `<br><span style="color:${reg.vol.level === 'high' ? 'var(--bear)' : 'var(--text3)'}">${reg.vol.txt}</span>`;
+  try { const pos = marketPositionTxt(); if (pos) predict += `<br><span style="color:var(--text3)">📍 ${pos}</span>`; } catch {}
+  try { const mm = marketModelTxt(); if (mm) predict += `<br><span style="color:${!mm.usable ? 'var(--text3)' : mm.pct >= 55 ? 'var(--bull)' : mm.pct <= 45 ? 'var(--bear)' : 'var(--yellow)'}">📐 ${mm.txt}</span>${mm.why ? `<br><span style="color:var(--text3);font-size:0.72rem">　依據：${mm.why}</span>` : ''}`; } catch {}
   try { const cm = {}; for (const c of reg.comps || []) cm[c.k] = c.score; const mp = marketDirProbability(cm, reg.kind); if (mp.prob != null) predict += `<br><span style="color:${mp.abstain ? 'var(--yellow)' : mp.pct >= 58 ? 'var(--bull)' : 'var(--bear)'}">🎲 ${mp.txt}</span>`; else predict += `<br><span style="color:var(--text3)">🎲 方向機率模型：${mp.txt}</span>`; } catch {}
   predict += coverage >= 85
     ? '。'
@@ -11303,6 +11309,103 @@ function marketDirProbability(comps, kind) {
            txt: `未來 7 日上漲機率 ${pct}%（依 ${n} 筆已驗證預測校準${abstain ? '；接近五五波，方向預測記中性' : ''}）` };
 }
 
+// ── 大盤歷史校準模型：拿 14 個月加權指數日線，回答「現在這種型態，未來 5 日漲的機率多少」 ──
+// 預測記錄每天只有一筆、要累積好幾個月才有樣本；歷史日線一次就有 ~280 個樣本。
+// 做法：每天算 7 個技術特徵（均線結構、5 日／20 日動能、RSI 區、乖離 EMA20、ADX 趨勢、波動位階、距 20 日高），
+// 分箱後做單純貝氏（Laplace 平滑、溫度 0.5），前 70% 訓練、後 30% 驗證；驗證段命中率誠實顯示，
+// 低於 52% 代表沒有優勢，就不拿它決定方向。
+let _twiiLong = null;
+const MKT_MODEL_KEY = 'mkt-hist-model';
+function marketFeaturesAt(bars, i) {
+  if (i < 60) return null;
+  const c = bars.map(b => b.close), h = bars.map(b => b.high), l = bars.map(b => b.low);
+  const e20 = btEMA(c.slice(0, i + 1), 20), e60 = btEMA(c.slice(0, i + 1), 60);
+  const rsi = btRSI(c.slice(0, i + 1))[i];
+  const adx = btADX(h.slice(0, i + 1), l.slice(0, i + 1), c.slice(0, i + 1))[i];
+  const px = c[i];
+  const ma = px > e20[i] && e20[i] > e60[i] ? 'bull' : px < e20[i] && e20[i] < e60[i] ? 'bear' : 'mixed';
+  const r5 = (px - c[i - 5]) / c[i - 5] * 100, r20 = (px - c[i - 20]) / c[i - 20] * 100;
+  const ext = (px / e20[i] - 1) * 100;
+  const hi20 = Math.max(...h.slice(i - 19, i + 1)); const dHi = (px - hi20) / hi20 * 100;
+  const tr = []; for (let k = i - 59; k <= i; k++) tr.push((h[k] - l[k]) / c[k]);
+  const atr = tr.slice(-14).reduce((a, b) => a + b, 0) / 14, sorted = [...tr].sort((a, b) => a - b);
+  const volP = sorted.findIndex(v => v >= atr) / sorted.length;
+  return {
+    ma, mom5: r5 > 1.5 ? 'up' : r5 < -1.5 ? 'dn' : 'flat', mom20: r20 > 4 ? 'up' : r20 < -4 ? 'dn' : 'flat',
+    rsi: rsi == null ? 'mid' : rsi >= 65 ? 'hot' : rsi <= 35 ? 'cold' : 'mid',
+    ext: ext > 3 ? 'far' : ext < -3 ? 'below' : 'near',
+    adx: adx == null ? 'weak' : adx >= 25 ? 'trend' : 'weak',
+    vol: volP >= 0.8 ? 'high' : volP <= 0.3 ? 'low' : 'mid',
+    nearHi: dHi >= -1 ? 'athigh' : dHi <= -5 ? 'far' : 'mid',
+  };
+}
+function nbTrain(samples) {
+  const keys = Object.keys(samples[0].f);
+  const up = samples.filter(x => x.y), dn = samples.filter(x => !x.y);
+  const tab = {};
+  for (const k of keys) { tab[k] = {}; for (const x of samples) { const v = x.f[k]; tab[k][v] = tab[k][v] || { u: 0, d: 0 }; tab[k][v][x.y ? 'u' : 'd']++; } }
+  return { keys, nUp: up.length, nDn: dn.length, tab };
+}
+function nbProb(model, f) {
+  const prior = (model.nUp + 1) / (model.nUp + model.nDn + 2);
+  let logit = Math.log(prior / (1 - prior));
+  for (const k of model.keys) {
+    const cell = model.tab[k]?.[f[k]] || { u: 0, d: 0 };
+    const nv = Object.keys(model.tab[k] || {}).length || 3;
+    logit += Math.log(((cell.u + 1) / (model.nUp + nv)) / ((cell.d + 1) / (model.nDn + nv)));
+  }
+  return 1 / (1 + Math.exp(-logit * 0.5));
+}
+function marketHistModel(retrain = false) {
+  let cached = null; try { cached = JSON.parse(localStorage.getItem(MKT_MODEL_KEY) || 'null'); } catch {}
+  const bars = _twiiLong;
+  if (!bars || bars.length < 120) return cached;
+  const today = twClock().date;
+  if (!retrain && cached?.at && tradingDaysBetween(cached.at, today) < 5 && cached.model) return cached;
+  const H = 5;
+  const samples = [];
+  for (let i = 60; i < bars.length - H; i++) {
+    const f = marketFeaturesAt(bars, i); if (!f) continue;
+    samples.push({ f, y: bars[i + H].close > bars[i].close, t: bars[i].time });
+  }
+  if (samples.length < 80) return cached;
+  const cut = Math.floor(samples.length * 0.7);
+  const train = samples.slice(0, cut), val = samples.slice(cut);
+  const m = nbTrain(train);
+  let hit = 0, calls = 0, hitAll = 0;
+  for (const x of val) { const p = nbProb(m, x.f); if (p >= 0.55 || p <= 0.45) { calls++; if ((p >= 0.55) === x.y) hit++; } if ((p >= 0.5) === x.y) hitAll++; }
+  const valAcc = calls ? +(hit / calls * 100).toFixed(1) : null;
+  const valAccAll = +(hitAll / val.length * 100).toFixed(1);
+  const baseUp = +(val.filter(x => x.y).length / val.length * 100).toFixed(1);
+  // 特徵優勢：各特徵值的歷史上漲率（訓練段），供「為什麼這樣判」的說明
+  const edges = [];
+  for (const k of m.keys) for (const [v, c] of Object.entries(m.tab[k])) { const n = c.u + c.d; if (n >= 15) edges.push({ k, v, n, up: +(c.u / n * 100).toFixed(0) }); }
+  const full = nbTrain(samples);   // 上線用全段資料（驗證段成績已另外算過）
+  const fNow = marketFeaturesAt(bars, bars.length - 1);
+  const prob = fNow ? +nbProb(full, fNow).toFixed(3) : null;
+  const out = { at: today, n: samples.length, nVal: val.length, calls, valAcc, valAccAll, baseUp, edges, model: full, fNow, prob, pct: prob != null ? Math.round(prob * 100) : null, lastBar: bars[bars.length - 1].time };
+  try { localStorage.setItem(MKT_MODEL_KEY, JSON.stringify(out)); } catch {}
+  return out;
+}
+const FEAT_NAME = { ma: '均線結構', mom5: '5 日動能', mom20: '20 日動能', rsi: 'RSI 區', ext: '乖離 EMA20', adx: 'ADX', vol: '波動位階', nearHi: '距 20 日高' };
+const FEAT_VAL = { bull: '多頭排列', bear: '空頭排列', mixed: '糾結', up: '向上', dn: '向下', flat: '持平', hot: '過熱', cold: '超賣', mid: '中性', far: '偏離', below: '跌破', near: '貼近', trend: '有趨勢', weak: '無趨勢', high: '高', low: '低', athigh: '在高點' };
+function marketModelTxt() {
+  const mm = marketHistModel();
+  if (!mm?.model) return null;
+  const usable = mm.valAcc != null && mm.calls >= 20 && mm.valAcc >= 52;
+  const why = mm.fNow ? Object.entries(mm.fNow).map(([k, v]) => { const e = mm.edges.find(x => x.k === k && x.v === v); return `${FEAT_NAME[k]}${FEAT_VAL[v] || v}${e ? `（歷史上漲率 ${e.up}%）` : ''}`; }).slice(0, 4).join('、') : '';
+  return { ...mm, usable, txt: `歷史校準：未來 5 日上漲機率 ${mm.pct}%（14 個月 ${mm.n} 筆訓練，驗證段有把握時命中 ${mm.valAcc ?? '--'}%／${mm.calls} 次，全部 ${mm.valAccAll}%，期間底率 ${mm.baseUp}%）${usable ? '' : ' — 驗證段無優勢，不用來決定方向'}`, why };
+}
+// 大盤走勢位置：距 20／60 日高低、最近支撐壓力 —— 給「現在在哪裡」而不只是「偏多偏空」
+function marketPositionTxt() {
+  const b = _twiiSeries; if (!b || b.length < 60) return null;
+  const c = b.map(x => x.close), h = b.map(x => x.high), l = b.map(x => x.low);
+  const px = c[c.length - 1];
+  const hi20 = Math.max(...h.slice(-20)), lo20 = Math.min(...l.slice(-20)), hi60 = Math.max(...h.slice(-60)), lo60 = Math.min(...l.slice(-60));
+  let sup = null, res = null; try { const sr = calcSR(b); sup = sr.supports?.[0]; res = sr.resistances?.find(v => v > px * 1.003); } catch {}
+  return `指數位置：距 20 日高 ${((px - hi20) / hi20 * 100).toFixed(1)}%、距 20 日低 +${((px - lo20) / lo20 * 100).toFixed(1)}%；60 日區間 ${Math.round(lo60).toLocaleString()}～${Math.round(hi60).toLocaleString()}${sup ? `；支撐 ${Math.round(sup).toLocaleString()}` : ''}${res ? `／壓力 ${Math.round(res).toLocaleString()}` : ''}`;
+}
+
 // 每日記錄一次預測快照（掃描完成後呼叫）
 function recordPredictions() {
   const ready = allStocks.filter(s => s.analysis);
@@ -11334,6 +11437,8 @@ function recordPredictions() {
                        if (MR.neutralOnDiv) { const c = outlookData.regime?.comps || []; const t = c.find(x => x.k === '大盤技術結構'), b = c.find(x => x.k === '市場寬度'); if (t && b && Math.sign(t.score) * Math.sign(b.score) < 0) return 0; }
                        // 校準機率接近五五波 → 棄權（樣本 ≥15 才啟用）
                        try { const cm = {}; for (const c of (outlookData.regime?.comps || [])) cm[c.k] = c.score; const mp = marketDirProbability(cm, outlookData.regime?.kind); if (mp.prob != null && mp.n >= 15 && mp.abstain) return 0; } catch {}
+                       // 歷史校準模型有驗證優勢時，方向要兩邊同意：分數偏多且模型 ≥55% 才記多；偏空且 ≤45% 才記空
+                       try { const mm = marketModelTxt(); if (mm?.usable && mm.prob != null) { if (norm >= 15 && mm.prob >= 0.55) return 1; if (norm <= -15 && mm.prob <= 0.45) return -1; if (Math.abs(norm) >= 15) return 0; } } catch {}
                        return norm >= 15 ? 1 : norm <= -15 ? -1 : 0;
                      })(),
                      twii } : null,
@@ -11489,6 +11594,7 @@ function renderPredAccuracy() {
       <div style="font-size:0.68rem;color:var(--text3);margin-top:3px">${sub}</div>
     </div>`;
 
+  const mm = (() => { try { return marketModelTxt(); } catch { return null; } })();
   const enough = a.market.n >= 10 || a.focus.n >= 10;
   el.innerHTML = `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
@@ -11498,6 +11604,12 @@ function renderPredAccuracy() {
              a.focus.pct, a.focus.n,
              a.focus.n ? `　平均超額 ${a.focus.avgExcess >= 0 ? '+' : ''}${a.focus.avgExcess.toFixed(2)}%` : '')}
     </div>
+    ${mm ? `<div style="margin-top:8px;padding:8px 11px;border-radius:7px;background:rgba(255,255,255,0.02);font-size:0.75rem;color:var(--text2);line-height:1.7">
+      📐 <strong>大盤歷史校準模型</strong>（走動式：前 70% 訓練、後 30% 驗證，每 5 個交易日重訓）<br>
+      ${mm.txt}<br>
+      <span style="color:var(--text3);font-size:0.7rem">訓練段各型態的歷史上漲率：${mm.edges.sort((x, y) => Math.abs(y.up - 50) - Math.abs(x.up - 50)).slice(0, 6).map(e => `${FEAT_NAME[e.k]}${FEAT_VAL[e.v] || e.v} ${e.up}%（n=${e.n}）`).join('・')}</span><br>
+      <span style="color:var(--text3);font-size:0.7rem">方向預測改為「分數與模型兩邊同意」才記方向：分數偏多且模型 ≥55% 記多、偏空且 ≤45% 記空，其餘記中性不計分。命中率提升的來源是少猜，不是多猜。</span>
+    </div>` : ''}
     ${a.marketHiConf.n >= 3 ? `<div style="margin-top:8px;padding:7px 11px;border-radius:7px;background:rgba(255,255,255,0.02);font-size:0.75rem;color:var(--text2)">
       🎯 高信心預測（成分一致性 ≥60%）命中率 <strong style="color:${col(a.marketHiConf.pct)}">${a.marketHiConf.pct.toFixed(0)}%</strong>（${a.marketHiConf.n} 次）
       ${a.market.pct != null && a.marketHiConf.pct > a.market.pct ? `— 高於整體 ${a.market.pct.toFixed(0)}%，信心度閘門有效：低信心時觀望才是對的` : ''}
