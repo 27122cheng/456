@@ -5419,6 +5419,10 @@ const SYNC_KEYS = [
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
   'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
+  // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
+  'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
+  'swing-lab-result', 'swing-lab-adopt', 'swing-tuned-live', 'dd-breaker',
+  'regime-kind-hist', 'regime-kind-eff', 'tg-update-offset',
 ];
 
 function exportSettings() {
