@@ -12070,7 +12070,9 @@ const TG_HELP = `🤖 可用指令（代號或中文名皆可）
 2330 或 台積電　→ 回傳這檔的交易看法與建議`;
 function tgInboundOn() { return localStorage.getItem('tg-inbound') !== 'false'; }
 function parseTgCommand(text) {
-  const t = String(text || '').trim().replace(/[，,]/g, ' ').replace(/\s+/g, ' ');
+  let t = String(text || '').trim().replace(/[，,]/g, ' ').replace(/\s+/g, ' ');
+  // 群組「隱私模式」下機器人只收得到以 / 開頭的訊息 → 「/買 2330 890」「/持倉」「/cmd@botname」都接受
+  if (/^\/(?!start$)/.test(t)) t = t.replace(/^\/([^\s@]+)(@\S+)?/, '$1');
   if (!t) return null;
   if (/^(\/start|幫助|help|說明|\?)$/i.test(t)) return { cmd: 'help' };
   if (/^(持倉|列表|查|list|持股)$/i.test(t)) return { cmd: 'list' };
@@ -12174,11 +12176,12 @@ async function execTgCommand(c) {
   }
   return TG_HELP;
 }
-let _tgPollBusy = false, _tgPollFail = 0;
+let _tgPollBusy = false, _tgPollFail = 0, _tgWebhookFixed = false;
 // 指令讀取狀態：最後讀取時間、累計處理筆數、最近錯誤 —— 讓使用者看得出「有沒有在動」
 function tgInboundStatus() { try { return JSON.parse(localStorage.getItem('tg-inbound-status') || '{}'); } catch { return {}; } }
-function tgInboundStamp({ handled = 0, error = null } = {}) {
+function tgInboundStamp({ handled = 0, error = null, foreign = null } = {}) {
   const st = tgInboundStatus();
+  if (foreign) { st.foreign = foreign; st.foreignAt = new Date().toISOString(); try { localStorage.setItem('tg-inbound-status', JSON.stringify(st)); } catch {} return; }
   st.at = new Date().toISOString();
   st.total = (st.total || 0) + handled;
   if (handled) st.lastHandledAt = st.at;
@@ -12191,7 +12194,7 @@ function tgInboundStatusTxt() {
   if (!isSignalMaster()) return 'Telegram 指令：此裝置非訊號主機，不讀取';
   if (!st.at) return 'Telegram 指令：尚未讀取過（主機啟動 5 秒後開始，每 30 秒一次）';
   const ago = Math.round((Date.now() - new Date(st.at).getTime()) / 60000);
-  return `Telegram 指令：${ago} 分鐘前讀取${st.error ? `（錯誤：${st.error}）` : '正常'}｜累計處理 ${st.total || 0} 則${st.lastHandledAt ? `，最近 ${st.lastHandledAt.slice(5, 16).replace('T', ' ')}` : ''}`;
+  return `Telegram 指令：${ago} 分鐘前讀取${st.error ? `（錯誤：${st.error}）` : '正常'}｜累計處理 ${st.total || 0} 則${st.lastHandledAt ? `，最近 ${st.lastHandledAt.slice(5, 16).replace('T', ' ')}` : ''}${st.foreign ? `｜⚠ 曾收到來自其他聊天室 ${st.foreign} 的訊息被忽略 — 若那是你，請把設定頁 Chat ID 改成它` : ''}`;
 }
 async function tgPollUpdates() {
   if (_tgPollBusy || !tgInboundOn() || !isSignalMaster()) return 0;
@@ -12202,13 +12205,24 @@ async function tgPollUpdates() {
     const offset = +(localStorage.getItem('tg-update-offset') || 0);
     const res = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=0&allowed_updates=%5B%22message%22%5D`, { signal: AbortSignal.timeout(10000) });
     const data = await res.json();
-    if (!data?.ok) { _tgPollFail++; tgInboundStamp({ error: data?.description || `HTTP ${res.status}` }); if (_tgPollFail === 3) logSysError(`Telegram 指令拉取失敗：${data?.description || res.status}`); return 0; }
+    if (!data?.ok) {
+      _tgPollFail++;
+      const desc = data?.description || `HTTP ${res.status}`;
+      // 409／webhook：機器人先前被設定過 webhook，getUpdates 會被拒 → 自動刪 webhook 一次再試
+      if (/webhook|409|conflict/i.test(desc) && !_tgWebhookFixed) {
+        _tgWebhookFixed = true;
+        try { await fetch(`https://api.telegram.org/bot${token}/deleteWebhook?drop_pending_updates=false`, { signal: AbortSignal.timeout(8000) }); logSysError('Telegram：偵測到 webhook 衝突，已自動移除 webhook'); } catch {}
+      }
+      tgInboundStamp({ error: desc });
+      if (_tgPollFail === 3) logSysError(`Telegram 指令拉取失敗：${desc}`);
+      return 0;
+    }
     _tgPollFail = 0;
     let handled = 0, maxId = offset - 1;
     for (const u of data.result || []) {
       maxId = Math.max(maxId, u.update_id);
       const msg = u.message; if (!msg?.text) continue;
-      if (String(msg.chat?.id) !== String(chatId)) continue;          // 只接受設定頁那個聊天室
+      if (String(msg.chat?.id) !== String(chatId)) { tgInboundStamp({ foreign: `${msg.chat?.id}（${msg.chat?.title || msg.chat?.first_name || msg.chat?.type || '未知'}）` }); continue; }   // 只接受設定頁那個聊天室，其他的記下來供診斷
       if (msg.date && Date.now() / 1000 - msg.date > 24 * 3600) continue;   // 太舊的不處理（主機離線期間的積壓）
       let reply;
       try { reply = await execTgCommand(parseTgCommand(msg.text)); } catch (e) { reply = `處理失敗：${e?.message || e}`; }
