@@ -1886,7 +1886,11 @@ function renderRanking() {
     // 搜尋是明確意圖：不受多空/市場篩選限制，且包含尚未取得分析的標的
     filtered = allStocks.filter(s => s.id.toLowerCase().includes(q) || (s.name || '').toLowerCase().includes(q));
   } else {
-    filtered = rankingFilter === 'all' ? ready : ready.filter(s => verdictSignal(s) === rankingFilter);
+    filtered = rankingFilter === 'all' ? ready
+      : rankingFilter === '可進場' ? ready.filter(s => s._gate === 'A')
+      : rankingFilter === '觀察' ? ready.filter(s => s._gate === 'B')
+      : rankingFilter === '持倉' ? ready.filter(s => getHoldings().some(h => h.id === s.id))
+      : ready.filter(s => verdictSignal(s) === rankingFilter);
     if (rankingMarket !== 'all') filtered = filtered.filter(s => stockMarket(s) === rankingMarket);
   }
 
@@ -1946,6 +1950,13 @@ function renderRanking() {
   document.getElementById('ranking-tbody').innerHTML = body;
 }
 
+// 排名表的門檻標籤：一眼看出這檔「可進場／觀察／卡在哪一道」
+function gateTag(s) {
+  const g = s?._gate; if (!g) return '';
+  const style = g === 'A' ? 'background:rgba(34,197,94,0.16);color:var(--bull)' : g === 'B' ? 'background:rgba(245,158,11,0.14);color:var(--yellow)' : 'background:rgba(255,255,255,0.06);color:var(--text3)';
+  const txt = g === 'A' ? '✅ 可進場' : g === 'B' ? '⏳ 觀察' : `✗ ${FUNNEL_LABELS[g] || g}`;
+  return `<span style="font-size:0.62rem;padding:1px 6px;border-radius:7px;${style};margin-left:4px;white-space:nowrap" title="推薦門檻體檢結果">${txt}</span>`;
+}
 function rankingRow(s, rank) {
   const a = s.analysis;
   // 搜尋結果可能包含尚未取得分析的標的 —— 顯示載入中而不是整列崩掉
@@ -1974,7 +1985,7 @@ function rankingRow(s, rank) {
         <div class="stock-avatar">${s.id.slice(-2)}</div>
         <div class="stock-cell-info">
           <span class="stock-cell-id">${s.id}</span>
-          <span class="stock-cell-name">${s.name}</span>
+          <span class="stock-cell-name">${s.name}${gateTag(s)}</span>
         </div>
       </div>
     </td>
@@ -3861,6 +3872,45 @@ function quoteStampHTML(s) {
   return '';
 }
 
+// ── 個股頁研究摘要：一張卡回答「該不該買、買在哪、為什麼、現在有沒有持有」 ──
+function renderResearchSummary(s) {
+  const el = document.getElementById('research-body'); if (!el) return;
+  const a = s.analysis; if (!a) { el.innerHTML = ''; return; }
+  const m = buildManagerAnalysis(s), v = getVerdict(s);
+  let R = null; try { R = entryGateReport(s); } catch {}
+  const pk = R?.pick, p = pk?.p;
+  const col = v?.stanceColor || 'var(--text2)';
+  const verdictTxt = R?.die ? `⏳ 未列入推薦 — 卡在「${FUNNEL_LABELS[R.die] || R.die}」` : pk ? (pk.q.grade === 'A' ? `✅ 可進場 A 級 ${pk.q.score} 分` : `⏳ 先觀察 ${pk.q.grade} 級 ${pk.q.score} 分（距 A 差 ${pk.q.gapToA}）`) : '—';
+  const verdictC = R?.die ? 'var(--text3)' : pk?.q.grade === 'A' ? 'var(--bull)' : 'var(--yellow)';
+  const lastCheck = R?.die ? R.checks[R.checks.length - 1]?.txt : null;
+  let plan = p;
+  if (!plan && m) { try { const cs = currentSwingStrategy(); plan = buildEntryPlan(s, m, { mode: cs.k || 'breakout', tuned: cs.tuned || null }); } catch {} }
+  const h = getHoldings().find(x => x.id === s.id);
+  let hold = null; if (h) { try { hold = checkHoldingExit(h); } catch {} }
+  const reason = pk ? plainReason(pk) : (m?.bull?.slice(0, 2).map(x => x.split('（')[0]).join('・') || '—');
+  el.innerHTML = `
+    <div class="sig-card" style="margin-bottom:0">
+      <div class="sig-head">
+        <div class="sig-grade" style="color:${col};border-color:${col};background:${col}1f"><b>${v?.score ?? '--'}</b><small>研判</small></div>
+        <div>
+          <div style="font-size:0.95rem;font-weight:800;color:${col}">${v?.signal || '--'}　<span style="font-size:0.74rem;font-weight:600;color:var(--text2)">${m?.stance || ''}</span></div>
+          <div style="font-size:0.7rem;color:var(--text3);margin-top:2px">一致性 ${m ? (m.agr * 100).toFixed(0) : '--'}%・信心 ${m ? (m.conf * 100).toFixed(0) : '--'}%・${s.sector || '—'}</div>
+        </div>
+        <div class="sig-act" style="color:${verdictC}">${verdictTxt}</div>
+      </div>
+      <div class="sig-reason">${reason}</div>
+      ${lastCheck ? `<div style="font-size:0.72rem;color:var(--text3);margin-top:3px">${lastCheck}</div>` : ''}
+      ${plan?.ok ? `<div class="sig-levels">
+        <div class="sig-lv stop"><div class="l">停損</div><div class="v">${plan.stop}</div><div class="p">−${plan.riskPct.toFixed(1)}%</div></div>
+        <div class="sig-lv entry"><div class="l">掛買區</div><div class="v">${plan.lo}~${plan.hi}</div><div class="p" style="color:var(--text3)">${SWING_STRATEGIES.find(x => x.k === plan.mode)?.name || '突破追蹤'}</div></div>
+        <div class="sig-lv tgt"><div class="l">${plan.holdOn ? '目標（續抱）' : '目標'}</div><div class="v">${plan.holdOn ? '續抱' : plan.t1}</div><div class="p">${plan.holdOn ? `移動停利 ${plan.trail}` : `+${plan.rewardPct1.toFixed(1)}%${plan.rr ? `・賠率 1:${plan.rr.toFixed(1)}` : ''}`}</div></div>
+      </div>${ladderHTML(plan.stop, plan.lo, plan.hi, plan.holdOn ? null : plan.t1, plan.holdOn)}` : `<div style="font-size:0.74rem;color:var(--text3);margin-top:6px">目前不給進場計畫：${plan?.why || '結構偏空或資料不足'}</div>`}
+      <div style="font-size:0.7rem;color:var(--text2);margin-top:7px">📈 ${dataLine(s)}</div>
+      ${hold ? `<div class="hold-next ${hold.level}" style="margin-top:8px">📌 持有中：成本 ${h.entry}｜${hold.retPct >= 0 ? '+' : ''}${hold.retPct.toFixed(2)}%｜${{ exit: '🔴 建議出場', watch: '🟡 留意', hold: '🟢 續抱' }[hold.level]} — ${hold.reasons[0]}</div>` : ''}
+      <div style="font-size:0.66rem;color:var(--text3);margin-top:6px">下方各區塊是這張摘要的依據：研判證據、進場計畫與門檻體檢、型態、籌碼、基本面、風險</div>
+    </div>`;
+}
+
 function renderStockDetail(s) {
   const a = s.analysis;
   const price = a.price?.toFixed(2) ?? '--';
@@ -3878,6 +3928,7 @@ function renderStockDetail(s) {
   // 沒有標示就會被誤認成現價（實際發生過：顯示昨收 50.00，當下實際 49.00）
   const qEl = document.getElementById('stock-quote-src');
   if (qEl) qEl.innerHTML = quoteStampHTML(s);
+  try { renderResearchSummary(s); } catch (e) { console.warn('研究摘要', e); }
 
   // Trend chip
   const chip = document.getElementById('stock-trend-chip');
@@ -6525,7 +6576,9 @@ function renderAiSignals() {
   const wins = done.filter(t => t.status === 'win');
   const reasons = {};
   done.filter(t => t.status === 'loss').forEach(t => { reasons[t.exitReason] = (reasons[t.exitReason] || 0) + 1; });
-  el.innerHTML = simNote + `
+  const eq = (() => { const d = done.filter(t => t.entry > 0 && t.stop != null && t.entry > t.stop).sort((a, b) => String(a.exitDate).localeCompare(String(b.exitDate))); let c = 0; return d.map(t => +(c += (t.netPct ?? t.retPct ?? 0) / ((t.entry - t.stop) / t.entry * 100)).toFixed(2)); })();
+  const eqHTML = eq.length >= 2 ? `<div style="margin-bottom:8px;padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.02)"><div style="font-size:0.68rem;color:var(--text3)">📉 權益曲線（累計淨 R，${eq.length} 筆）：目前 <b style="color:${eq[eq.length - 1] >= 0 ? 'var(--bull)' : 'var(--bear)'}">${eq[eq.length - 1] >= 0 ? '+' : ''}${eq[eq.length - 1]}R</b></div>${sparklineSVG(eq)}</div>` : '';
+  el.innerHTML = simNote + eqHTML + `
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:10px">
       <div class="inst-card"><div class="inst-card-lbl">追蹤中</div><div class="inst-card-val" style="color:var(--blue)">${open.length}</div></div>
       <div class="inst-card"><div class="inst-card-lbl">已結算</div><div class="inst-card-val">${done.length}</div></div>
@@ -10128,7 +10181,7 @@ function sigCardHTML(pk, kind, inH) {
             <span class="sig-tag">現價 ${s.analysis.price.toFixed(2)}</span>
           </div>
         </div>
-        <div class="sig-act" style="color:${isA ? 'var(--bull)' : 'var(--yellow)'}">${isA ? '✅ 可進場' : '⏳ 先觀察'}</div>
+        <div class="sig-act" style="color:${isA ? 'var(--bull)' : 'var(--yellow)'}">${pk.isNew ? '<span style="font-size:0.64rem;padding:1px 6px;border-radius:8px;background:rgba(0,212,255,0.18);color:var(--blue);margin-right:6px">🆕 今日新增</span>' : ''}${isA ? '✅ 可進場' : '⏳ 先觀察'}</div>
       </div>
       <div class="sig-reason">${plainReason(pk)}</div>
       <div class="sig-levels">
@@ -10803,6 +10856,7 @@ function computeEntrySignals(opts = {}) {
   const picks = [];
   for (const s of ready) {
     const r = evalEntry(s, env);
+    s._gate = r.die || (r.pick.q.grade === 'A' ? 'A' : 'B');   // 排名表「門檻」標籤用
     if (r.die) { die(r.die); continue; }
     picks.push(r.pick);
   }
@@ -10822,6 +10876,16 @@ function computeEntrySignals(opts = {}) {
   });
   F.watchB = out.filter(pk => pk.q.grade !== 'A').length;
   F.finalA = out.filter(pk => pk.q.grade === 'A').length;
+  // 🆕 新訊號：今天的 A 級名單與上一個交易日比對，新出現的標記出來（交易員最想先看「今天多了誰」）
+  try {
+    const today = twClock().date;
+    const prev = JSON.parse(localStorage.getItem('picks-prev') || '{}');
+    const ids = out.filter(pk => pk.q.grade === 'A').map(pk => pk.s.id);
+    if (prev.date !== today) localStorage.setItem('picks-prev', JSON.stringify({ date: today, ids, before: prev.date ? prev.ids : [] , beforeDate: prev.date || null }));
+    else { prev.ids = ids; localStorage.setItem('picks-prev', JSON.stringify(prev)); }
+    const beforeSet = new Set((JSON.parse(localStorage.getItem('picks-prev') || '{}').before) || []);
+    for (const pk of out) pk.isNew = pk.q.grade === 'A' && !beforeSet.has(pk.s.id);
+  } catch {}
   // 硬濾網③：分級 — 只有品質 A（黃金匯流）才是「進場訊號」；
   // B 級降為觀察名單（等回檔到更好位置），不推播、不建檔追蹤。
   // 勝率不理想時的正解是提高出手標準，不是換指標。
@@ -11175,7 +11239,36 @@ function renderEffectiveness() {
     </div>`).join('') || '<div class="adv-loading">掃描完成後產生</div>';
 }
 
+// ── 準確度儀表板：一排數字看完系統現在準不準、樣本到哪裡 ─────────────────
+function kpiHTML() {
+  const tile = (lbl, val, sub, c) => `<div class="st" style="flex:1;min-width:110px"><div class="st-l">${lbl}</div><div class="st-v" style="color:${c || 'var(--text1)'};font-size:1rem">${val}</div><div class="st-s">${sub || ''}</div></div>`;
+  const out = [];
+  try { const st = expectancyStats(); const done = getAiSignals().filter(t => ['win', 'loss'].includes(t.status)).length;
+    out.push(tile('波段勝率／期望值', st ? `${st.W}%／${st.expectancy >= 0 ? '+' : ''}${st.expectancy}R` : '--', st ? `${st.n} 筆・獲利因子 ${st.pf ?? '∞'}` : `結算 ${done}／5 筆起算`, st ? (st.expectancy > 0 ? 'var(--bull)' : 'var(--bear)') : 'var(--text3)')); } catch {}
+  try { const dt = getDayTrades().filter(t => ['win', 'loss', 'flat'].includes(t.status)); const w = dt.filter(t => t.status === 'win').length; const avg = dt.length ? dt.reduce((a, t) => a + (t.netPct ?? 0), 0) / dt.length : null;
+    out.push(tile('當沖勝率', dt.length ? `${(w / dt.length * 100).toFixed(0)}%` : '--', dt.length ? `${dt.length} 筆・平均淨 ${avg >= 0 ? '+' : ''}${avg.toFixed(2)}%` : '尚無結算', dt.length ? (avg > 0 ? 'var(--bull)' : 'var(--bear)') : 'var(--text3)')); } catch {}
+  try { const lt = getLongTermList(); const tw = _twiiSeries?.length ? _twiiSeries[_twiiSeries.length - 1].close : null; const rows = lt.map(it => { const px = allStocks.find(x => x.id === it.id)?.analysis?.price; if (!px || !it.basePrice) return null; const ret = (px / it.basePrice - 1) * 100; return { ret, al: it.twiiBase && tw ? ret - (tw / it.twiiBase - 1) * 100 : null }; }).filter(Boolean);
+    const avg = rows.length ? rows.reduce((a, r) => a + r.ret, 0) / rows.length : null; const als = rows.filter(r => r.al != null); const al = als.length ? als.reduce((a, r) => a + r.al, 0) / als.length : null;
+    out.push(tile('長期名單', avg != null ? `${avg >= 0 ? '+' : ''}${avg.toFixed(1)}%` : '--', rows.length ? `${rows.length} 檔${al != null ? `・贏大盤 ${al >= 0 ? '+' : ''}${al.toFixed(1)}%` : ''}` : '尚無成員', avg != null ? (avg >= 0 ? 'var(--bull)' : 'var(--bear)') : 'var(--text3)')); } catch {}
+  try { const a = computePredAccuracy(); out.push(tile('大盤方向命中', a.market.pct != null ? `${a.market.pct.toFixed(0)}%` : '--', `${a.market.n} 次已驗證${a.marketHiConf.n ? `・高信心 ${a.marketHiConf.pct.toFixed(0)}%` : ''}`, a.market.pct == null ? 'var(--text3)' : a.market.pct >= 55 ? 'var(--bull)' : 'var(--yellow)')); } catch {}
+  try { const mm = marketModelTxt(); out.push(tile('歷史模型驗證', mm?.valAcc != null ? `${mm.valAcc}%` : '--', mm ? `${mm.calls} 次有把握・底率 ${mm.baseUp}%${mm.usable ? '' : '・未啟用'}` : '尚未訓練', mm?.valAcc == null ? 'var(--text3)' : mm.usable ? 'var(--bull)' : 'var(--yellow)')); } catch {}
+  try { let n = 0; for (const L of [aiLossLearnings(), dayLossLearnings()]) n += (L.rules || []).filter(r => r.active).length; const b = drawdownBreaker(); const cd = systemCooldown();
+    out.push(tile('學習與風控', `${n} 條已加嚴`, b.on ? '⛔ 斷路器啟動' : cd.on ? '🧊 冷卻中' : '風控正常', b.on ? 'var(--bear)' : cd.on ? 'var(--blue)' : 'var(--bull)')); } catch {}
+  return `<div class="sig-strip" style="margin-bottom:8px">${out.join('')}</div>`;
+}
+function renderKpi() { const el = document.getElementById('kpi-body'); if (el) { try { el.innerHTML = kpiHTML(); } catch (e) { el.innerHTML = ''; } } }
+// 權益曲線（累計淨 R）迷你圖：成績單上一眼看出是往上還是往下
+function sparklineSVG(vals, w = 320, h = 60) {
+  if (!vals || vals.length < 2) return '';
+  const min = Math.min(0, ...vals), max = Math.max(0, ...vals), span = (max - min) || 1;
+  const x = i => (i / (vals.length - 1) * (w - 4) + 2).toFixed(1), y = v => ((1 - (v - min) / span) * (h - 6) + 3).toFixed(1);
+  const pts = vals.map((v, i) => `${x(i)},${y(v)}`).join(' ');
+  const last = vals[vals.length - 1];
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none" style="display:block"><line x1="0" x2="${w}" y1="${y(0)}" y2="${y(0)}" stroke="rgba(255,255,255,0.15)" stroke-dasharray="3 3"/><polyline points="${pts}" fill="none" stroke="${last >= 0 ? '#22c55e' : '#ef4444'}" stroke-width="2"/></svg>`;
+}
+
 function renderJournal() {
+  renderKpi();
   renderEffectiveness();
   renderLearningOverview();
   renderExpectancy();
