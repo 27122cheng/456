@@ -13633,7 +13633,7 @@ function labCommitTune(st, next, changes, note) {
     const all = JSON.parse(localStorage.getItem('dt-strategy-tuned') || '{}');
     const hist = (all[st.k]?.hist || []).slice(-10);
     hist.push({ at: twClock().date, changes, note });
-    all[st.k] = { p: { stopPct: next.stopPct, tgtR: next.tgtR, closePos: next.closePos, volX: next.volX }, hist };
+    all[st.k] = { p: { stopPct: next.stopPct, tgtR: next.tgtR, closePos: next.closePos, volX: next.volX, ...(next.gapHi != null ? { gapHi: next.gapHi } : {}) }, hist };
     localStorage.setItem('dt-strategy-tuned', JSON.stringify(all));
   } catch {}
 }
@@ -13694,6 +13694,7 @@ function effectiveStrategyParams(st) {
   p.tgtR = Math.max(1.0, Math.min(3.0, p.tgtR));
   p.closePos = Math.max(0.5, Math.min(0.9, p.closePos));
   p.volX = Math.max(1.1, Math.min(2.5, p.volX));
+  if (p.gapHi != null) p.gapHi = Math.max(0.3, Math.min(3, p.gapHi));
   return p;
 }
 function currentStrategyNames() {
@@ -13701,6 +13702,29 @@ function currentStrategyNames() {
   return r?.top?.map(x => x.name) || ['放量動能'];
 }
 
+// ── 當沖「勝率最高參數」搜尋：每個策略在訓練段掃參數格，找出守住底線下勝率最高的組合，驗證段打分 ──
+// 底線：訓練段 n≥20、期望值 >0（已扣全成本）、回撤 ≥−8%。只追勝率不管期望值的參數會被排除。
+// 採用：驗證段 n≥10 且期望值 ≥ 現行參數的驗證段期望值、勝率高 ≥3pp → 寫入 dt-strategy-tuned（實盤 activeStrategyParams 直接讀）。
+const DT_GRID = { stopPct: [1.0, 1.5, 2.0], tgtR: [1.0, 1.5, 2.0], closePos: [0.6, 0.75], volX: [1.3, 1.8], gapHi: [1.0, 2.0] };
+const DT_GRID_TARGET = { minN: 20, minAvgNet: 0, maxDD: -8 };
+async function dtGridTune(st, eff, ready, regimeFn, TRAIN, TEST, onProgress = null) {
+  const combos = gridCombos(DT_GRID);
+  let best = null, feasible = 0;
+  for (let ci = 0; ci < combos.length; ci++) {
+    const p = { ...eff, ...combos[ci] };
+    const train = [];
+    for (const s of ready) { try { train.push(...backtestStrategy(s, p, regimeFn, TRAIN)); } catch {} }
+    const tr = summarizeStrategy(train);
+    const ok = tr.n >= DT_GRID_TARGET.minN && tr.avgNet > DT_GRID_TARGET.minAvgNet && tr.maxDD >= DT_GRID_TARGET.maxDD;
+    if (ok) { feasible++; const score = tr.winRate + tr.avgNet * 20; if (!best || score > best.score) best = { params: combos[ci], train: tr, score }; }
+    if (ci % 6 === 5) { if (onProgress) onProgress(ci + 1, combos.length); await new Promise(r => setTimeout(r, 0)); }
+  }
+  if (!best) return { tried: combos.length, feasible: 0, best: null };
+  const test = [];
+  for (const s of ready) { try { test.push(...backtestStrategy(s, { ...eff, ...best.params }, regimeFn, TEST)); } catch {} }
+  best.test = summarizeStrategy(test);
+  return { tried: combos.length, feasible, best };
+}
 async function runStrategyLab() {
   const el = document.getElementById('dt-lab-body');
   if (!el) return;
@@ -13754,6 +13778,21 @@ async function runStrategyLab() {
       .sort((a, b) => b.byKind[k].score - a.byKind[k].score).slice(0, 3)
       .map(r => ({ k: r.k, name: r.name, score: r.byKind[k].score, winRate: r.byKind[k].winRate, avgNet: r.byKind[k].avgNet, n: r.byKind[k].n }));
   }
+  // 勝率最高參數搜尋：只對前三名（含分盤性冠軍）做，避免把主機跑滿
+  const gridKs = [...new Set([...top.map(x => x.k), ...(topByKind.trend || []).slice(0, 1).map(x => x.k), ...(topByKind.range || []).slice(0, 1).map(x => x.k)])];
+  for (const k of gridKs) {
+    const r0 = results.find(x => x.k === k); if (!r0) continue;
+    const st = DT_STRATEGIES.find(x => x.k === k);
+    try {
+      const g = await dtGridTune(st, r0.p, ready, regimeFn, TRAIN, TEST, (i, n) => { el.innerHTML = `<div class="adv-loading">勝率最高參數搜尋... ${st.name} ${i}/${n}</div>`; });
+      r0.grid = g;
+      if (g.best?.test && g.best.test.n >= 10 && g.best.test.avgNet >= (r0.avgNet ?? 0) && g.best.test.winRate >= (r0.winRate ?? 0) + 3) {
+        labCommitTune(st, { ...r0.p, ...g.best.params }, [`勝率最高參數：${Object.entries(g.best.params).map(([a, b]) => `${a}=${b}`).join('、')}`], `驗證段勝率 ${r0.winRate}%→${g.best.test.winRate}%、期望值 ${r0.avgNet}%→${g.best.test.avgNet}%`);
+        g.adopted = true;
+        learnLog('tune', `當沖「${st.name}」採用勝率最高參數（驗證段勝率 ${r0.winRate}%→${g.best.test.winRate}%、期望值 ${r0.avgNet}%→${g.best.test.avgNet}%）`);
+      } else g.adopted = false;
+    } catch (e) { r0.grid = { error: e?.message || String(e) }; }
+  }
   const prev = getStrategyRank();
   const changed = !prev || JSON.stringify(prev.top?.map(x => x.k)) !== JSON.stringify(top.map(x => x.k));
   try {
@@ -13799,7 +13838,8 @@ function renderStrategyLab() {
           <td style="font-family:var(--mono);color:var(--bear)">${x.n ? x.maxDD + '%' : '--'}</td>
           <td style="font-family:var(--mono);font-weight:700">${x.n >= 15 ? x.score : '樣本不足'}</td>
         </tr>
-        ${x.tune?.changes?.length ? `<tr><td colspan="7" style="font-size:0.68rem;color:var(--yellow);padding:2px 8px 8px">🎓 自動調參（下輪生效）：${x.tune.txt}</td></tr>` : ''}`).join('')}</tbody>
+        ${x.tune?.changes?.length ? `<tr><td colspan="7" style="font-size:0.68rem;color:var(--yellow);padding:2px 8px 8px">🎓 自動調參（下輪生效）：${x.tune.txt}</td></tr>` : ''}
+        ${x.grid ? `<tr><td colspan="7" style="font-size:0.68rem;padding:2px 8px 8px;color:${x.grid.adopted ? 'var(--bull)' : 'var(--text3)'}">🎯 勝率最高參數（試 ${x.grid.tried} 組、${x.grid.feasible} 組守住底線）：${x.grid.best ? `停損 ${x.grid.best.params.stopPct}%・停利 ${x.grid.best.params.tgtR}R・收盤位 ≥${x.grid.best.params.closePos}・量 ≥${x.grid.best.params.volX}×・開高上限 ${x.grid.best.params.gapHi}% → 訓練段勝率 ${x.grid.best.train.winRate}%／${x.grid.best.train.avgNet > 0 ? '+' : ''}${x.grid.best.train.avgNet}%，驗證段 ${x.grid.best.test?.n ? `${x.grid.best.test.winRate}%／${x.grid.best.test.avgNet > 0 ? '+' : ''}${x.grid.best.test.avgNet}%（n=${x.grid.best.test.n}）` : '無交易'}${x.grid.adopted ? ' ✅ 已採用，實盤當沖下輪生效' : '（驗證段未優於現行，不採用）'}` : x.grid.error ? `失敗：${x.grid.error}` : '沒有參數同時守住 n≥20、期望值>0、回撤≥−8% — 此策略在這個池子沒有可用參數'}</td></tr>` : ''}`).join('')}</tbody>
     </table></div>
     <div style="font-size:0.7rem;color:var(--text3);margin-top:8px;line-height:1.7">
       ${r.at} 實驗｜掃描池 ${r.universe} 檔｜報酬皆已扣除全成本（手續費＋交易稅＋買賣價差）<br>
@@ -13834,7 +13874,9 @@ function renderDaySignals() {
   const picks = computeDayTradePicks();
   const inH = new Set(getHoldings().map(h => h.id));
   const LF = dayLearnedFilters();
-  const lfNote = `<div style="font-size:0.7rem;color:var(--text3);margin-bottom:8px">目前生效門檻：波動 ≥${LF.minAtr}%・成交金額 ≥${(LF.minTurnover / 1e8).toFixed(0)} 億・日內相對強度 ≥${Math.abs(LF.minIrs)}pp${LF.needChips ? '・必須有法人籌碼' : ''}${LF.needVwapSide ? '・必須站在 VWAP 正確側' : ''}　<span style="color:var(--text3)">（由止損學習自動調整）</span></div>`;
+  const SPn = (() => { try { return activeStrategyParams(); } catch { return null; } })();
+  const spNote = SPn ? `<div style="font-size:0.7rem;color:var(--text2);margin-bottom:4px">🧪 現行當沖策略：<b>${SPn.name}</b>｜停損 ${SPn.stopPct}%・停利 ${SPn.tgtR}R・收盤位 ≥${SPn.closePos}・量 ≥${SPn.volX}×・開高上限 ${SPn.gapHi}%${SPn.regime ? '・順大盤' : ''}<span style="color:var(--text3)">（由實驗室冠軍與勝率最高參數自動帶入）</span></div>` : '';
+  const lfNote = spNote + `<div style="font-size:0.7rem;color:var(--text3);margin-bottom:8px">目前生效門檻：波動 ≥${LF.minAtr}%・成交金額 ≥${(LF.minTurnover / 1e8).toFixed(0)} 億・日內相對強度 ≥${Math.abs(LF.minIrs)}pp${LF.needChips ? '・必須有法人籌碼' : ''}${LF.needVwapSide ? '・必須站在 VWAP 正確側' : ''}　<span style="color:var(--text3)">（由止損學習自動調整）</span></div>`;
   if (!picks.length) {
     el.innerHTML = lfNote + '<p style="font-size:0.8rem;color:var(--text3)">今日無符合條件的當沖標的 — 條件包含流動性、波動足以覆蓋全成本、日線與週線同邊、大盤方向、日內相對強度。寧可空手也不硬給訊號。</p>';
     return;
