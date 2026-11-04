@@ -5523,7 +5523,7 @@ const SYNC_KEYS = [
   // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
   'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
   'swing-lab-result', 'swing-lab-adopt', 'swing-tuned-live', 'dd-breaker',
-  'regime-kind-hist', 'regime-kind-eff', 'tg-update-offset',
+  'regime-kind-hist', 'regime-kind-eff', 'tg-update-offset', 'learn-log', 'cut-adj-last', 'picks-prev', 'mkt-hist-model',
 ];
 
 function exportSettings() {
@@ -6432,6 +6432,19 @@ function renderAiLossLearning() {
 // 棘輪只會越鎖越死。改為：
 //   啟用：最近 40 筆窗口內，該原因 ≥5 次且占虧損 ≥30%
 //   評估：啟用後再累積 20 筆結算，期望值沒改善 → 自動回退並冷卻 30 筆
+// ── 學習日誌：系統每一次「改變自己」都留一筆，學習成長看得見、可稽核 ──────
+// 記錄：規則加嚴／回退、策略冠軍切換、A 級門檻校準、調參採用、斷路器觸發與解除、實驗室結果更新
+function learnLog(kind, txt, extra = null) {
+  try {
+    const log = JSON.parse(localStorage.getItem('learn-log') || '[]');
+    const last = log[log.length - 1];
+    if (last && last.kind === kind && last.txt === txt && last.date === twClock().date) return;   // 同日同事件不重複
+    log.push({ t: new Date().toISOString(), date: twClock().date, kind, txt, ...(extra ? { extra } : {}) });
+    localStorage.setItem('learn-log', JSON.stringify(log.slice(-200)));
+  } catch {}
+}
+function getLearnLog() { try { return JSON.parse(localStorage.getItem('learn-log') || '[]'); } catch { return []; } }
+const LEARN_KIND = { rule: '📏 規則', strategy: '🧭 策略', cut: '🎚 門檻', tune: '🎯 調參', breaker: '⛔ 斷路器', lab: '🧪 實驗室', model: '📐 模型' };
 const LEARN_WINDOW = 40, LEARN_MIN_N = 5, LEARN_MIN_SHARE = 0.3, LEARN_EVAL_AFTER = 20, LEARN_COOLDOWN = 30;
 function learnStateAll() { try { return JSON.parse(localStorage.getItem('learn-state') || '{}'); } catch { return {}; } }
 function learnState(store, cause) { return learnStateAll()[`${store}:${cause}`] || { on: false }; }
@@ -6444,10 +6457,12 @@ function learnGate(store, cause, n, share, expNow, settledN) {
     if (rec.cooldownUntil != null && settledN < rec.cooldownUntil) { /* 冷卻中 */ }
     else if (qualifies) {
       rec.on = true; rec.at = twClock().date; rec.expAt = expNow; rec.settledAt = settledN; rec.reverted = false;
+      learnLog('rule', `加嚴啟用：${store}／${cause}（最近 ${LEARN_WINDOW} 筆內 ${n} 次、占 ${(share * 100).toFixed(0)}%）`, { store, cause, n, share });
     }
   } else if (settledN - (rec.settledAt ?? settledN) >= LEARN_EVAL_AFTER && expNow != null && rec.expAt != null) {
     if (expNow <= rec.expAt) {        // 加嚴後期望值沒改善 → 回退
       rec.on = false; rec.reverted = true; rec.revertedAt = twClock().date; rec.cooldownUntil = settledN + LEARN_COOLDOWN;
+      learnLog('rule', `加嚴回退：${store}／${cause}（啟用後 ${LEARN_EVAL_AFTER} 筆期望值 ${expNow?.toFixed?.(2)} 未優於 ${rec.expAt?.toFixed?.(2)}，冷卻 ${LEARN_COOLDOWN} 筆）`, { store, cause });
     } else { rec.expAt = expNow; rec.settledAt = settledN; }   // 有效 → 續用並重設基準
   }
   all[key] = rec;
@@ -7245,6 +7260,7 @@ function swingTuneAdopt() {
   const live = {};
   for (const t of r.tuned) if (t.best && t.best.val.trades >= 12 && t.best.val.avgR > 0) live[t.k] = t.best.params;
   localStorage.setItem('swing-tuned-live', JSON.stringify(live));
+  if (Object.keys(live).length) learnLog('tune', `採用調參參數：${Object.entries(live).map(([k, p]) => `${SWING_STRATEGIES.find(x => x.k === k)?.name}（${Object.entries(p).map(([a, b]) => `${a}=${b === null ? '壓力區' : b}`).join('、')}）`).join('；')}`);
   showToast(Object.keys(live).length ? `已採用 ${Object.keys(live).length} 套調參結果（驗證段 n≥12 且期望值為正者）` : '沒有通過驗證段的調參結果可採用', Object.keys(live).length ? 'success' : 'info');
   renderSwingLab(); try { renderEntrySignals(); } catch {}
 }
@@ -7376,6 +7392,14 @@ async function runSwingLab() {
     if (el) { el.innerHTML = `<div class="adv-loading">策略庫驗證中... ${st.name}</div>`; await new Promise(r0 => setTimeout(r0, 0)); }
   }
   const champion = pickChampions(strategies);
+  try {
+    const prev = swingLabResult();
+    for (const kind of ['trend', 'range', 'transition', 'overall']) {
+      const a = prev?.champion?.[kind] ?? null, b = champion[kind] ?? null;
+      if (prev && a !== b) learnLog('strategy', `${{ trend: '趨勢盤', range: '盤整盤', transition: '轉換中', overall: '整體' }[kind]}冠軍：${a ? SWING_STRATEGIES.find(x => x.k === a)?.name : '無'} → ${b ? SWING_STRATEGIES.find(x => x.k === b)?.name : '無優勢'}`);
+    }
+    learnLog('lab', `波段實驗室更新：驗證段 ${split} 之後，基準勝率 ${base.val.winRate}%／${base.val.avgR >= 0 ? '+' : ''}${base.val.avgR}R，有效改法 ${rows.filter(r => r.verdict.k === 'good').length} 項`);
+  } catch {}
   // 目標導向調參：每種策略在訓練段找「期望值為正、回撤受控」下勝率最高的參數，驗證段打分
   const tuned = [];
   for (const st of SWING_STRATEGIES) {
@@ -10555,11 +10579,12 @@ function drawdownBreaker() {
     const days = tradingDaysBetween(st.at, today);
     const last3 = rs.slice(-3).reduce((a, b) => a + b, 0);
     const recovered = days >= 10 && rs.length >= 3 && last3 >= 0 && done.length > (st.settledAt ?? 0);
-    if (recovered) { const n = { on: false, releasedAt: today, lastDD: dd }; try { localStorage.setItem('dd-breaker', JSON.stringify(n)); } catch {} return { on: false, dd, txt: `斷路器已於 ${today} 自動解除（觸發後 ${days} 個交易日、最近 3 筆淨 ${last3.toFixed(1)}R）`, state: n }; }
+    if (recovered) { const n = { on: false, releasedAt: today, lastDD: dd }; learnLog('breaker', `回撤斷路器解除：觸發後 ${days} 個交易日、最近 3 筆淨 ${last3.toFixed(1)}R`); try { localStorage.setItem('dd-breaker', JSON.stringify(n)); } catch {} return { on: false, dd, txt: `斷路器已於 ${today} 自動解除（觸發後 ${days} 個交易日、最近 3 筆淨 ${last3.toFixed(1)}R）`, state: n }; }
     return { on: true, dd, days, txt: `⛔ 回撤斷路器：${st.at} 觸發（權益曲線回撤 ${st.dd}R）— 停發新訊號；恢復需 ≥10 個交易日（已 ${days}）且最近 3 筆淨 R ≥0（現 ${last3.toFixed(1)}R）`, state: st };
   }
   if (rs.length >= 10 && dd <= -DD_BREAKER_R) {
     const n = { on: true, at: today, dd, settledAt: done.length };
+    learnLog('breaker', `回撤斷路器觸發：最近 ${rs.length} 筆權益回撤 ${dd}R`);
     try { localStorage.setItem('dd-breaker', JSON.stringify(n)); } catch {}
     return { on: true, dd, days: 0, txt: `⛔ 回撤斷路器：今日觸發（最近 ${rs.length} 筆權益曲線回撤 ${dd}R ≥ ${DD_BREAKER_R}R）— 停發新訊號，直到 ≥10 個交易日後且最近 3 筆淨 R ≥0`, state: n };
   }
@@ -10649,7 +10674,7 @@ function entryEnv() {
   const strict = mktNow < 0 || outlookData.regime?.kind === 'transition';
   let heat = null; try { heat = portfolioHeat(); } catch {}
   let cooldown = null; try { cooldown = systemCooldown(); } catch {}
-  let cutAdj = 0; try { cutAdj = qualityCutAdj().adj; } catch {}
+  let cutAdj = 0; try { cutAdj = qualityCutAdj().adj; const prevAdj = +(localStorage.getItem('cut-adj-last') || 0); if (prevAdj !== cutAdj) { localStorage.setItem('cut-adj-last', String(cutAdj)); if (prevAdj || cutAdj) learnLog('cut', cutAdj ? `A 級門檻上調 +${cutAdj}（75~80 分區間實績偏弱）` : 'A 級門檻校準解除（樣本變動）'); } } catch {}
   const vm = volumeModeParams();
   let adopt = {}; try { adopt = swingLabAdopted(); } catch {}
   let strategy = null; try { strategy = currentSwingStrategy(); } catch { strategy = { k: 'breakout', name: '突破追蹤', noEdge: false }; }
@@ -11269,6 +11294,7 @@ function sparklineSVG(vals, w = 320, h = 60) {
 
 function renderJournal() {
   renderKpi();
+  renderGrowth();
   renderEffectiveness();
   renderLearningOverview();
   renderExpectancy();
@@ -11613,6 +11639,42 @@ function marketPositionTxt() {
   return `指數位置：距 20 日高 ${((px - hi20) / hi20 * 100).toFixed(1)}%、距 20 日低 +${((px - lo20) / lo20 * 100).toFixed(1)}%；60 日區間 ${Math.round(lo60).toLocaleString()}～${Math.round(hi60).toLocaleString()}${sup ? `；支撐 ${Math.round(sup).toLocaleString()}` : ''}${res ? `／壓力 ${Math.round(res).toLocaleString()}` : ''}`;
 }
 
+// 機率校準表：模型說 60% 的那些天，實際有幾成真的漲？（校準好的模型，這兩個數字會接近）
+function modelCalibration() {
+  const rows = getPredLog().filter(p => p.resolved && p.market?.prob != null && p.market.actualChg != null);
+  if (rows.length < 10) return { n: rows.length, buckets: [] };
+  const def = [['≤40%', 0, 0.40], ['40~50%', 0.40, 0.50], ['50~60%', 0.50, 0.60], ['≥60%', 0.60, 1.01]];
+  const buckets = def.map(([label, lo, hi]) => { const b = rows.filter(p => p.market.prob >= lo && p.market.prob < hi); const up = b.filter(p => p.market.actualChg > 0).length; return { label, n: b.length, up: b.length ? Math.round(up / b.length * 100) : null, avgProb: b.length ? Math.round(b.reduce((a, p) => a + p.market.prob, 0) / b.length * 100) : null }; });
+  return { n: rows.length, buckets };
+}
+// 滾動成績：每 N 筆的勝率／命中率序列，看學習有沒有讓曲線往上
+function rollingSeries(arr, isWin, win = 10) {
+  const out = [];
+  for (let i = win; i <= arr.length; i++) { const w = arr.slice(i - win, i); out.push(+(w.filter(isWin).length / win * 100).toFixed(0)); }
+  return out;
+}
+function growthHTML() {
+  const sig = getAiSignals().filter(t => ['win', 'loss'].includes(t.status)).sort((a, b) => String(a.exitDate).localeCompare(String(b.exitDate)));
+  const sw = rollingSeries(sig, t => t.status === 'win', 10);
+  const preds = getPredLog().filter(p => p.resolved && p.market && p.market.hit != null);
+  const mk = rollingSeries(preds, p => p.market.hit === true, 10);
+  const cal = modelCalibration();
+  const log = getLearnLog().slice(-12).reverse();
+  const line = (lbl, series, sub) => series.length >= 2
+    ? `<div style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02)"><div style="font-size:0.68rem;color:var(--text3)">${lbl}（最近 10 筆滾動，${series.length} 點）：目前 <b style="color:${series[series.length - 1] >= 50 ? 'var(--bull)' : 'var(--bear)'}">${series[series.length - 1]}%</b>${series.length >= 4 ? `，較起點 ${series[series.length - 1] - series[0] >= 0 ? '+' : ''}${series[series.length - 1] - series[0]}pp` : ''}</div>${sparklineSVG(series.map(v => v - 50), 300, 46)}<div style="font-size:0.62rem;color:var(--text3)">${sub}</div></div>`
+    : `<div style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.68rem;color:var(--text3)">${lbl}：樣本累積中（需 ≥12 筆才有曲線）</div>`;
+  return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      ${line('📈 波段訊號滾動勝率', sw, '虛線＝50%；曲線往上代表學習與校準有效')}
+      ${line('🌐 大盤方向滾動命中', mk, '只計有給方向的預測；棄權不計')}
+    </div>
+    ${cal.buckets.length ? `<div style="padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);margin-bottom:8px;font-size:0.72rem;color:var(--text2)"><div style="font-size:0.68rem;color:var(--text3);margin-bottom:3px">📐 模型機率校準（${cal.n} 筆）：模型說幾成 → 實際漲幾成；兩者接近代表機率可信</div>${cal.buckets.filter(b => b.n).map(b => `<span style="display:inline-block;margin-right:12px">${b.label}：實際漲 <b style="color:${b.up != null && Math.abs(b.up - b.avgProb) <= 15 ? 'var(--bull)' : 'var(--yellow)'}">${b.up}%</b>（n=${b.n}，模型均值 ${b.avgProb}%）</span>`).join('')}</div>` : ''}
+    <div style="padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.72rem;color:var(--text2)">
+      <div style="font-size:0.72rem;font-weight:700;color:var(--text1);margin-bottom:4px">📓 學習日誌 <span style="font-size:0.64rem;color:var(--text3);font-weight:400">系統每一次改變自己都在這裡（最近 12 筆）</span></div>
+      ${log.length ? log.map(e => `<div style="padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.04)"><span style="color:var(--text3);font-family:var(--mono);font-size:0.66rem">${e.date}</span>　${LEARN_KIND[e.kind] || e.kind}　${e.txt}</div>`).join('') : '<div style="color:var(--text3)">尚無學習事件：規則加嚴、策略冠軍切換、門檻校準、調參採用、斷路器觸發時會自動記錄</div>'}
+    </div>`;
+}
+function renderGrowth() { const el = document.getElementById('growth-body'); if (el) { try { el.innerHTML = growthHTML(); } catch (e) { el.innerHTML = `<div style="font-size:0.72rem;color:var(--text3)">成長曲線產生失敗：${e?.message || e}</div>`; } } }
+
 // 每日記錄一次預測快照（掃描完成後呼叫）
 function recordPredictions() {
   const ready = allStocks.filter(s => s.analysis);
@@ -11636,6 +11698,7 @@ function recordPredictions() {
     // 記錄當時 5 日內的重大事件與各成分方向 → 誤判時能回答「為什麼看錯」
     evts: (() => { try { return imminentEvents(5).map(e => e.name).slice(0, 4); } catch { return []; } })(),
     market: twii ? { norm, conf, kind: outlookData.regime?.kind ?? null,
+                     prob: (() => { try { const mm = marketModelTxt(); return mm?.prob ?? null; } catch { return null; } })(),
                      dir: (() => {
                        const MR = (() => { try { return marketLearnedRules(); } catch { return { minConf: 0.35 }; } })();
                        if (conf != null && conf < MR.minConf) return 0;
