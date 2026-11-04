@@ -1216,11 +1216,48 @@ function getUpcomingEvents() {
   return events.sort((a, b) => a.date - b.date).slice(0, 5);
 }
 
+// 事件反應追蹤：事件當天記下大盤位置，之後看第一波反應（隔日）能否延續（3 日）——
+// 「突破後站穩」與「很快退回區間」代表的強弱不同；這是消息判讀原則的「反應」那一步
+function trackEventReactions() {
+  try {
+    const log = JSON.parse(localStorage.getItem('event-react') || '[]');
+    const today = twClock().date;
+    const tw = _twiiSeries; if (!tw?.length) return log;
+    const closes = tw.map(b => b.close), dates = tw.map(b => b.time);
+    const idx = d => dates.indexOf(d);
+    for (const e of imminentEvents(0)) {
+      if (e.days !== 0) continue;
+      if (log.some(x => x.name === e.name && x.date === today)) continue;
+      const i = idx(today);
+      const before = i > 0 ? closes[i - 1] : closes[closes.length - 1];
+      log.push({ name: e.name, date: today, before, impact: e.impact || null });
+    }
+    for (const x of log) {
+      if (x.d3 != null) continue;
+      const i = idx(x.date); if (i < 0) continue;
+      if (i + 1 < closes.length && x.d1 == null) x.d1 = +((closes[i + 1] - x.before) / x.before * 100).toFixed(2);
+      if (i + 3 < closes.length) { x.d3 = +((closes[i + 3] - x.before) / x.before * 100).toFixed(2); x.sustained = x.d1 != null && Math.sign(x.d1) === Math.sign(x.d3) && Math.abs(x.d3) >= Math.abs(x.d1) * 0.5; }
+    }
+    localStorage.setItem('event-react', JSON.stringify(log.slice(-40)));
+    return log;
+  } catch { return []; }
+}
+function eventReactionHTML() {
+  let log = []; try { log = JSON.parse(localStorage.getItem('event-react') || '[]'); } catch {}
+  const rows = log.slice(-6).reverse();
+  if (!rows.length) return '';
+  return `<div style="margin-top:10px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.72rem;color:var(--text2)">
+      <div style="font-size:0.7rem;font-weight:700;color:var(--text1);margin-bottom:3px">📎 事件反應追蹤 <span style="color:var(--text3);font-weight:400">事件前記位置 → 隔日第一波 → 3 日後是否延續</span></div>
+      ${rows.map(x => `<div style="padding:2px 0;border-bottom:1px solid rgba(255,255,255,0.04)"><span style="font-family:var(--mono);color:var(--text3)">${x.date.slice(5)}</span> ${x.name}：第一波 ${x.d1 != null ? `<b style="color:${x.d1 >= 0 ? 'var(--bull)' : 'var(--bear)'}">${x.d1 >= 0 ? '+' : ''}${x.d1}%</b>` : '等隔日'}，3 日 ${x.d3 != null ? `<b style="color:${x.d3 >= 0 ? 'var(--bull)' : 'var(--bear)'}">${x.d3 >= 0 ? '+' : ''}${x.d3}%</b> → ${x.sustained ? '✅ 延續' : '↩ 退回／反轉'}` : '等 3 日'}</div>`).join('')}
+    </div>`;
+}
+
 function renderEvents() {
   const el = document.getElementById('events-body');
   if (!el) return;
   const events = getUpcomingEvents();
   const now = new Date();
+  try { trackEventReactions(); } catch {}
 
   // AI 預測：以當前綜合多空評分作為事件前偏向
   const twii = outlookData.factors?.find(f => f.sym === '^TWII');
@@ -1244,7 +1281,9 @@ function renderEvents() {
           <span class="event-predict" style="background:${bias.bg};color:${bias.c}">${bias.txt}</span>
         </div>`;
       }).join('')}
-    </div>`;
+    </div>
+    <div style="font-size:0.66rem;color:var(--text3);margin-top:6px">數據公布後看第一波反應能否延續：突破後站穩與很快退回區間代表的強弱不同；公布前先記下價格區間</div>
+    ${eventReactionHTML()}`;
 }
 
 // ── 交易日誌 + 止損學習系統 ────────────────────────────────────────────────
@@ -2345,6 +2384,24 @@ function evidenceFamily(e) {
   return 'context';   // 位階、乖離、族群、事件、期貨、大盤環境…
 }
 
+// 布林帶寬（(上軌−下軌)/中線）在近 120 日的位階；收斂＝最低 20%；收斂後帶寬放大 ≥25% 且收盤站上／跌破中線＝擴張
+function bollSqueeze(ohlcv) {
+  const closes = (ohlcv || []).map(b => b.close);
+  if (closes.length < 60) return null;
+  const bw = [];
+  for (let i = 19; i < closes.length; i++) { const b = calcBollinger(closes.slice(0, i + 1)); if (b && b.middle > 0) bw.push((b.upper - b.lower) / b.middle); }
+  if (bw.length < 30) return null;
+  const win = bw.slice(-120);
+  const rank = v => Math.round(win.filter(x => x <= v).length / win.length * 100);
+  const cur = bw[bw.length - 1], prev = bw[bw.length - 2], prev5 = Math.min(...bw.slice(-7, -2));
+  const pct = rank(cur), prevPct = rank(prev5);
+  const last = calcBollinger(closes);
+  const c = closes[closes.length - 1];
+  if (prevPct <= 20 && cur >= prev5 * 1.25) return { state: c > last.middle ? 'expand-up' : 'expand-down', pct, prevPct };
+  if (pct <= 20) return { state: 'squeeze', pct, prevPct };
+  return { state: 'none', pct, prevPct };
+}
+
 function buildManagerAnalysis(s) {
   const a = s.analysis;
   if (!a || !s.ohlcv?.length) return null;
@@ -2513,6 +2570,15 @@ function buildManagerAnalysis(s) {
     add(0.6, td.dHolders < 0 ? 1 : -1,
       `股東人數週${td.dHolders < 0 ? '減' : '增'} ${Math.abs(td.dHolders)}% — 籌碼${td.dHolders < 0 ? '趨於集中' : '轉為分散'}`, 'chip');
   }
+
+  // 布林通道四情境之①「整理後起漲」：通道收斂（帶寬在近 120 日最低兩成）後轉為擴張且收盤站上中線／上軌。
+  // 單純變寬不算方向；收斂本身也只是「開始觀察」，不給分只記註
+  try {
+    const sq = bollSqueeze(ohlcv);
+    if (sq?.state === 'expand-up') add(0.9, 1, `布林通道收斂後向上擴張（帶寬由 ${sq.prevPct}% 位階轉為擴張、收在中線上）— 整理後起漲型態`, 'tech');
+    else if (sq?.state === 'expand-down') add(0.9, -1, `布林通道收斂後向下擴張（收在中線下）— 整理後下跌型態`, 'tech');
+    else if (sq?.state === 'squeeze') notes.push(`布林通道極度收斂（帶寬近 120 日 ${sq.pct}% 位階）— 蓄勢中，等方向表態，極窄不代表下一根就突破`);
+  } catch {}
 
   const streak = instStreak(s.id);
   if (streak && streak.days >= 3) {
@@ -3318,6 +3384,29 @@ function entryGateHtml(s) {
     </div>`;
 }
 
+// 進場七步檢查（背景→方向→位置→觸發→失效→出場→檢討）：把計畫用交易員的流程順序唸一遍，每步給證據
+function sevenStepHTML(s, m, p) {
+  const a = s.analysis;
+  const ext = a.ema20 ? (a.price / a.ema20 - 1) * 100 : null;
+  const ss = (() => { try { return structureSettled(s); } catch { return null; } })();
+  const brk = a.brk?.type;
+  const trig = brk === 'breakout-vol' ? '帶量突破 20 日高且收在高檔' : brk === 'accumulation' ? '爆量收高檔紅 K（承接）' : ss?.ok ? '站穩 EMA20（近 5 日 ≥3 日收在上方）' : brk === 'breakout-novol' || brk === 'breakout-weak' ? '突破但量能未確認 — 等收盤站穩或回測守住' : '尚無明確觸發，等預設條件出現';
+  const regime = outlookData.regime?.kind;
+  const rows = [
+    ['背景', `持倉週期 ${p.horizon || '數日～數週'}｜觀察週期：週線 ${p.wk?.txt?.split('（')[0] || '—'}；執行週期：日線｜盤性 ${{ trend: '趨勢盤', range: '盤整盤', transition: '轉換中' }[regime] || '不明'}${regime === 'range' ? '（邊界被穿越不代表區間結束）' : ''}`],
+    ['方向', `研判「${m.stance}」強度 ${m.dir >= 0 ? '+' : ''}${m.dir.toFixed(1)}、一致性 ${(m.agr * 100).toFixed(0)}%（均線與動能同源，已以家族上限去重）`],
+    ['位置', `乖離 EMA20 ${ext != null ? (ext >= 0 ? '+' : '') + ext.toFixed(1) + '%' : '--'}${ext != null && ext > 4 ? '（離均線太遠，容易回歸）' : ''}｜掛買區 ${p.lo}~${p.hi}${a.ob?.support ? `｜多方訂單塊 ${a.ob.support.bottom}~${a.ob.support.top}（只是觀察區，不證明機構持倉）` : ''}`],
+    ['觸發', trig],
+    ['失效', `停損 ${p.stop}（−${p.riskPct.toFixed(1)}%）＝${(p.stopBasis || [])[0] || '交易理由失效的位置'}；部位依停損距離決定${p.sizing ? `（${p.sizing.shares > 0 ? p.sizing.shares + ' 張' : '零股 ' + p.sizing.oddLot + ' 股'}）` : ''}`],
+    ['出場', p.holdOn ? `續抱型：移動停利 ${p.trail}（+1R 先減半保本）` : `目標一 ${p.t1} 減半、目標二 ${p.t2} 清倉；+1R ${(p.lo * 2 - p.stop).toFixed(2)} 停損上移成本`],
+    ['檢討', '此計畫發出即建紙上交易，結算後自動歸因；復盤時只看進場當時的情境快照，不用後續行情改條件'],
+  ];
+  return `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.73rem;color:var(--text2);line-height:1.7">
+      <div style="font-weight:700;color:var(--text1);margin-bottom:2px">🧾 進場七步檢查</div>
+      ${rows.map(([k, v], i) => `<div><span style="display:inline-block;min-width:3.2em;color:var(--blue);font-weight:700">${i + 1}. ${k}</span>${v}</div>`).join('')}
+    </div>`;
+}
+
 function entryPlanHtml(s, m) {
   let modeNow = 'breakout', tunedNow = null; try { const cs = currentSwingStrategy(); modeNow = cs.k || 'breakout'; tunedNow = cs.tuned || null; } catch {}
   const p = buildEntryPlan(s, m, { mode: modeNow, tuned: tunedNow });
@@ -3377,6 +3466,7 @@ function entryPlanHtml(s, m) {
         ・大級別同意嗎？<span style="color:${p.wk?.dir > 0 ? 'var(--bull)' : p.wk?.dir < 0 ? 'var(--bear)' : 'var(--yellow)'}">${p.wk?.txt || '—'}</span>${p.wk?.dir < 0 ? '<span style="color:var(--bear)"> → 週線逆勢，系統不列入推薦</span>' : ''}<br>
         ・有沒有地雷日？${p.evt?.length ? p.evt.map(e => `<span style="color:var(--yellow)">${e.txt}</span>`).join('；') : '<span style="color:var(--bull)">5 天內無除息／財報截止</span>'}
       </div>
+      ${sevenStepHTML(s, m, p)}
       ${p.trap && p.trap.verdict !== 'none' ? `<div style="margin-top:8px;padding:7px 11px;background:${p.trap.verdict === 'washout' ? 'rgba(34,197,94,0.07)' : 'rgba(239,68,68,0.07)'};border-left:3px solid ${p.trap.verdict === 'washout' ? 'var(--bull)' : 'var(--bear)'};border-radius:0 6px 6px 0;font-size:0.75rem;color:${p.trap.verdict === 'washout' ? 'var(--bull)' : 'var(--bear)'};line-height:1.7">${p.trap.txt}${(p.trap.verdict === 'washout' ? p.trap.wash : p.trap.trap).slice(0, 3).map(x => `<br>・${x.txt}`).join('')}${p.trap.verdict !== 'washout' ? '<br><span style="font-size:0.7rem">應對：先別急著追；看能否真正站穩關鍵位，而不是盤中一時衝高；提前設好止盈止損與倉位</span>' : ''}</div>` : ''}
       ${p.sizing ? `<div style="margin-top:9px;padding:8px 11px;background:rgba(255,255,255,0.02);border-radius:7px;font-size:0.76rem;color:var(--text2);line-height:1.7">
         📦 <strong>部位規模建議</strong>：以資金 ${(p.sizing.capital/10000).toFixed(0)} 萬、單筆風險 ${p.sizing.riskPctUsed}%${p.sizing.kellyBased ? '（依 ≥30 筆實績的半凱利，非固定值）' : '（固定上限，累積 30 筆實績後改依半凱利）'} 計算，
@@ -5523,7 +5613,7 @@ const SYNC_KEYS = [
   // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
   'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
   'swing-lab-result', 'swing-lab-adopt', 'swing-tuned-live', 'dd-breaker',
-  'regime-kind-hist', 'regime-kind-eff', 'tg-update-offset', 'learn-log', 'cut-adj-last', 'picks-prev', 'mkt-hist-model',
+  'regime-kind-hist', 'regime-kind-eff', 'tg-update-offset', 'learn-log', 'cut-adj-last', 'picks-prev', 'mkt-hist-model', 'event-react',
 ];
 
 function exportSettings() {
@@ -6819,7 +6909,8 @@ function backtestStock(s, opts = {}) {
     if (opts.regimeFn && !opts.regimeFn(b.time)) continue;      // 大盤濾網
     if (mode === 'meanrev') {
       // 均值回歸：中期趨勢仍在（價在 EMA50 上）、短線超賣（RSI<40）、貼近 20 日低點、當日收紅止穩
-      if (!(c > e50[i] && rsi[i] != null && rsi[i] < 42 && lo20Arr[i] != null && c <= lo20Arr[i] * 1.04 && c > b.open)) continue;
+      // 止穩要看「向上收復」：收盤高於前一根高點（買盤推升），不只是收紅（賣壓減弱）
+      if (!(c > e50[i] && rsi[i] != null && rsi[i] < 42 && lo20Arr[i] != null && c <= lo20Arr[i] * 1.04 && c > b.open && c > highs[i - 1])) continue;
       const entry = bars[i + 1].open;
       const a = atr[i] || entry * 0.02;
       let stop = Math.min(lows[i], lows[i - 1]) * 0.98;
@@ -7161,7 +7252,7 @@ const SWING_VARIANTS = [
 const SWING_STRATEGIES = [
   { k: 'breakout', name: '突破追蹤', desc: '多頭排列＋MACD＋RSI 50~65＋回踩確認，壓力區停利、1R 減半', opts: {} },
   { k: 'pullback', name: '拉回買', desc: '趨勢中回到 EMA20 附近、RSI 45~60 剛轉強時買，進場更低、停損更近', opts: { rsiLo: 45, rsiMax: 60, pullback: true } },
-  { k: 'meanrev',  name: '均值回歸', desc: '價在 EMA50 上但短線超賣（RSI<42、貼近 20 日低）收紅止穩就買，回到 EMA20 即走，10 日時間停損', opts: { mode: 'meanrev' } },
+  { k: 'meanrev',  name: '均值回歸', desc: '價在 EMA50 上但短線超賣（RSI<42、貼近 20 日低）、收紅且收復前一根高點才買，回到 EMA20 即走，10 日時間停損', opts: { mode: 'meanrev' } },
   { k: 'trail',    name: '動能續抱', desc: '突破進場但不設目標，吊燈停損（最高收盤 −3ATR）跟到底，讓大行情跑完', opts: { mode: 'trail' } },
 ];
 const KIND_NAME = { trend: '趨勢盤', range: '盤整盤', transition: '轉換中' };
@@ -10722,8 +10813,9 @@ function evalEntry(s, env) {
     const lo20 = s.ohlcv?.length >= 21 ? Math.min(...s.ohlcv.slice(-21, -1).map(b => b.low)) : null;
     const last = s.ohlcv?.[s.ohlcv.length - 1];
     if (mode === 'pullback' && !(a.rsi != null && a.rsi >= 45 && a.rsi <= 60 && ext0 <= 3)) return fail('strategy', `拉回買：需 RSI 45~60 且乖離 EMA20 ≤3%（現 RSI ${a.rsi?.toFixed(0) ?? '--'}、乖離 ${ext0.toFixed(1)}%）`);
-    if (mode === 'meanrev' && !(a.rsi != null && a.rsi < 42 && a.ema50 && a.price > a.ema50 && lo20 != null && a.price <= lo20 * 1.04 && last && last.close > last.open))
-      return fail('strategy', `均值回歸：需 RSI<42、價在 EMA50 上、貼近 20 日低點（≤4%）且當日收紅（現 RSI ${a.rsi?.toFixed(0) ?? '--'}）`);
+    const prevBar = s.ohlcv?.[s.ohlcv.length - 2];
+    if (mode === 'meanrev' && !(a.rsi != null && a.rsi < 42 && a.ema50 && a.price > a.ema50 && lo20 != null && a.price <= lo20 * 1.04 && last && last.close > last.open && prevBar && last.close > prevBar.high))
+      return fail('strategy', `均值回歸：需 RSI<42、價在 EMA50 上、貼近 20 日低點（≤4%）、當日收紅且收復前一根高點（賣壓減弱≠買盤推升）（現 RSI ${a.rsi?.toFixed(0) ?? '--'}）`);
     if (mode === 'trail' && !(setupProfile(s).fresh != null && setupProfile(s).fresh <= 5)) return fail('strategy', '動能續抱：需在突破 20 日高點後 5 天內');
     // 調參採用：RSI 上限／ADX 下限成為硬門檻（參數來自訓練段找到、驗證段通過的組合）
     const TP = env.strategy?.tuned || null;
