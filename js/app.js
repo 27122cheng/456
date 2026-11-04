@@ -2377,6 +2377,7 @@ function evidenceFamily(e) {
   if (e.kind === 'fund') return 'fund';
   if (e.kind === 'risk') return 'risk';
   if (e.kind === 'news') return 'news';
+  if (e.kind === 'ctx') return 'context';
   const t = e.txt || '';
   if (/趨勢|均線|排列|EMA|年線|季線|MACD|結構|道氏|斜率|跑贏大盤|落後大盤|領先大盤|與大盤同步|同步偏多|同步偏空|週線/.test(t)) return 'trend';
   if (/量|突破|出貨|吸籌|訂單塊|價值區|缺口|VAH|VAL|POC|委買|委賣|爆量|籌碼/.test(t)) return 'volume';
@@ -2609,6 +2610,24 @@ function buildManagerAnalysis(s) {
     else if (bk.ratio != null && bk.ratio <= 0.5) add(0.5, -1, `盤中五檔委賣 ${bk.ask.toLocaleString()} 張為委買 ${(1 / bk.ratio).toFixed(1)} 倍（上方賣壓掛單沉重）`, 'chip');
     else notes.push(`盤中五檔 委買 ${bk.bid.toLocaleString()}／委賣 ${bk.ask.toLocaleString()} 張，掛單均衡`);
   }
+  // 盤中 order flow（主動買賣量＋CVD＋大單，由即時報價逐筆推算）：估算值，低權重
+  try {
+    const of = inNotifyWindow() ? orderFlowSummary(s) : null;
+    if (of) {
+      if (of.dir > 0) add(of.strong ? 0.8 : 0.5, 1, `盤中 order flow 偏買：${of.txt}`, 'chip');
+      else if (of.dir < 0) add(of.strong ? 0.8 : 0.5, -1, `盤中 order flow 偏賣：${of.txt}`, 'chip');
+      else notes.push(`盤中 order flow 均衡：${of.txt}`);
+    }
+  } catch {}
+  // 量化多因子橫斷面排名（與同一批掃描股比）：只在明顯領先／落後時給分
+  try {
+    const qf = quantFactors(s);
+    if (qf) {
+      if (qf.composite >= 80) add(0.6, 1, qf.txt, 'ctx');
+      else if (qf.composite <= 20) add(0.6, -1, qf.txt.replace('贏過', '僅贏過'), 'ctx');
+      else notes.push(qf.txt);
+    }
+  } catch {}
 
   // 重大事件環境註記（2 天內）：
   // - 數據型（FOMC/結算/央行/CPI）：波動放大提醒，不計方向分
@@ -3996,6 +4015,7 @@ function renderResearchSummary(s) {
         <div class="sig-lv tgt"><div class="l">${plan.holdOn ? '目標（續抱）' : '目標'}</div><div class="v">${plan.holdOn ? '續抱' : plan.t1}</div><div class="p">${plan.holdOn ? `移動停利 ${plan.trail}` : `+${plan.rewardPct1.toFixed(1)}%${plan.rr ? `・賠率 1:${plan.rr.toFixed(1)}` : ''}`}</div></div>
       </div>${ladderHTML(plan.stop, plan.lo, plan.hi, plan.holdOn ? null : plan.t1, plan.holdOn)}` : `<div style="font-size:0.74rem;color:var(--text3);margin-top:6px">目前不給進場計畫：${plan?.why || '結構偏空或資料不足'}</div>`}
       <div style="font-size:0.7rem;color:var(--text2);margin-top:7px">📈 ${dataLine(s)}</div>
+      ${(() => { try { const qf = quantFactors(s); return qf ? `<div style="font-size:0.7rem;color:var(--text2);margin-top:4px">🧮 量化因子（與本次掃描 ${qf.n} 檔相比）：${qf.factors.map(f => `${f.name} <b style="color:${f.pct >= 70 ? 'var(--bull)' : f.pct <= 30 ? 'var(--bear)' : 'var(--text2)'}">${f.pct}%</b>`).join('・')}　→ 綜合 <b>${qf.composite}%</b></div>` : ''; } catch { return ''; } })()}
       ${hold ? `<div class="hold-next ${hold.level}" style="margin-top:8px">📌 持有中：成本 ${h.entry}｜${hold.retPct >= 0 ? '+' : ''}${hold.retPct.toFixed(2)}%｜${{ exit: '🔴 建議出場', watch: '🟡 留意', hold: '🟢 續抱' }[hold.level]} — ${hold.reasons[0]}</div>` : ''}
       <div style="font-size:0.66rem;color:var(--text3);margin-top:6px">下方各區塊是這張摘要的依據：研判證據、進場計畫與門檻體檢、型態、籌碼、基本面、風險</div>
     </div>`;
@@ -5106,6 +5126,7 @@ function applyLiveQuote(s, q, today) {
   // MIS 額外欄位：漲跌停價、當盤量、市場別、全名 —— 一併留下供分析與顯示使用
   if (q.limitUp != null || q.limitDown != null) s._limit = { up: q.limitUp, down: q.limitDown };
   if (q.tickVol != null) s._tickVol = q.tickVol;
+  try { ofRecord(s, q, today); } catch {}
   if (q.fullName && !s.fullName) s.fullName = q.fullName;
   if (q.ex === 'tse' || q.ex === 'otc') {
     // 官方回報的市場別最準，用來校正先前靠試探記住的判斷
@@ -5126,9 +5147,174 @@ function limitDistance(s) {
   };
 }
 
+// ── 量化 order flow（由每 15 秒即時報價逐筆推算）──────────────────────────
+// 台股免費來源沒有逐筆主動買賣明細；但 MIS 每次報價都帶「累積成交量＋成交價＋五檔」，
+// 兩次報價之間的成交量增量配合 tick rule（成交價高於前價＝主動買、低於＝主動賣、
+// 平價則看成交在委賣或委買那一側）就能推算主動買賣量、CVD（累積買賣差）、
+// 真實 VWAP 與大單。這是估算不是逐筆，所以只做「低權重證據」與「當沖方向確認」。
+const _ofState = {};
+const OF_MAX_IDS = 150;
+const OF_HIST_MAX = 240;      // 15 秒 × 240 ≈ 一小時走勢
+function ofRecord(s, q, today) {
+  if (!s?.id || !(q?.price > 0) || !q.time) return;
+  const id = s.id;
+  let st = _ofState[id];
+  if (!st || st.date !== today) {
+    st = null;
+    try { const o = JSON.parse(localStorage.getItem(`of:${id}`) || 'null'); if (o && o.date === today) st = o; } catch {}
+    if (!st) st = { date: today, lastPx: null, lastCum: null, lastTime: '', lastSide: 0, buy: 0, sell: 0, pv: 0, vv: 0, ticks: 0, prints: [], bookHist: [], big: { buy: 0, sell: 0 }, hist: [] };
+    const keys = Object.keys(_ofState);
+    if (keys.length >= OF_MAX_IDS) delete _ofState[keys[0]];
+    _ofState[id] = st;
+  }
+  if (q.time === st.lastTime) return;                       // 同一筆報價（無新成交）
+  const cum = q.cumVol ?? null;
+  if (st.lastPx != null && cum != null && st.lastCum != null) {
+    const dv = cum - st.lastCum;                             // 張
+    if (dv > 0) {
+      let side = q.price > st.lastPx ? 1 : q.price < st.lastPx ? -1 : 0;
+      if (side === 0) {
+        const a1 = q.askP?.[0], b1 = q.bidP?.[0];
+        side = (a1 && q.price >= a1) ? 1 : (b1 && q.price <= b1) ? -1 : st.lastSide;
+      }
+      if (side > 0) st.buy += dv; else if (side < 0) st.sell += dv;
+      st.pv += q.price * dv; st.vv += dv;
+      st.lastSide = side;
+      const avgTick = st.ticks >= 5 ? st.vv / st.ticks : null;
+      const thr = Math.max(50, avgTick ? avgTick * 5 : 0);  // 大單：≥50 張且 ≥ 平均增量 5 倍
+      if (side !== 0 && dv >= thr) {
+        st.big[side > 0 ? 'buy' : 'sell'] += 1;
+        st.prints.push({ t: q.time.slice(0, 5), px: q.price, v: dv, side });
+        if (st.prints.length > 30) st.prints.shift();
+      }
+      st.ticks++;
+      st.hist.push({ t: q.time.slice(0, 5), cvd: st.buy - st.sell, px: q.price });
+      if (st.hist.length > OF_HIST_MAX) st.hist.shift();
+    }
+  }
+  if (cum != null) st.lastCum = cum;
+  st.lastPx = q.price; st.lastTime = q.time;
+  const bidT = (q.bidV || []).reduce((x, y) => x + (y || 0), 0), askT = (q.askV || []).reduce((x, y) => x + (y || 0), 0);
+  if (bidT + askT > 0) {
+    st.bookHist.push({ t: q.time.slice(0, 5), r: +((bidT - askT) / (bidT + askT)).toFixed(3) });
+    if (st.bookHist.length > OF_HIST_MAX) st.bookHist.shift();
+  }
+}
+// 只為「正在看／持倉／當沖候選」保存到 localStorage（重新整理後不歸零）；隔日自動失效
+function ofPersist(ids) {
+  for (const id of ids || []) {
+    const st = _ofState[id]; if (!st) continue;
+    try { localStorage.setItem(`of:${id}`, JSON.stringify(st)); } catch {}
+  }
+}
+function ofClearOld(today) {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('of:')) continue;
+      let d = null; try { d = JSON.parse(localStorage.getItem(k) || 'null')?.date; } catch {}
+      if (d !== today) localStorage.removeItem(k);
+    }
+  } catch {}
+}
+function orderFlowSummary(s) {
+  const st = _ofState[s?.id];
+  if (!st || st.ticks < 8 || st.vv < 100) return null;      // 樣本不足不判
+  const total = st.buy + st.sell;
+  if (total <= 0) return null;
+  const buyPct = Math.round(st.buy / total * 100);
+  const cvd = st.buy - st.sell;
+  const vwap = st.vv > 0 ? +(st.pv / st.vv).toFixed(2) : null;
+  const px = s.analysis?.price ?? st.lastPx;
+  const aboveVwap = vwap != null && px != null ? px >= vwap : null;
+  const bigNet = st.big.buy - st.big.sell;
+  // 委託簿失衡趨勢：最近 10 筆 vs 之前 10 筆
+  let bookNow = null, bookTrend = 0;
+  if (st.bookHist.length >= 4) {
+    const h = st.bookHist, k = Math.min(10, Math.floor(h.length / 2));
+    const avg = a => a.reduce((x, y) => x + y.r, 0) / a.length;
+    bookNow = avg(h.slice(-k)); const prev = avg(h.slice(-2 * k, -k));
+    bookTrend = bookNow - prev;
+  }
+  // 價格與 CVD 的背離／吸收：前三分之一 vs 後三分之一
+  let pattern = null;
+  if (st.hist.length >= 24) {
+    const h = st.hist, k = Math.floor(h.length / 3);
+    const px0 = h[k - 1].px, px1 = h[h.length - 1].px, cvd0 = h[k - 1].cvd, cvd1 = h[h.length - 1].cvd;
+    const pxChg = (px1 - px0) / px0 * 100, cvdChg = cvd1 - cvd0, scale = Math.max(1, st.vv * 0.1);
+    if (pxChg >= 0.5 && cvdChg <= 0) pattern = 'bear-div';             // 價漲但主動買盤沒跟上（拉抬無量）
+    else if (pxChg <= -0.5 && cvdChg >= scale) pattern = 'bull-div';   // 價跌但主動買盤增加（低接吸籌）
+    else if (Math.abs(pxChg) < 0.3 && cvdChg <= -scale) pattern = 'bull-absorb';   // 賣壓被吸收、價不跌
+    else if (Math.abs(pxChg) < 0.3 && cvdChg >= scale) pattern = 'bear-absorb';    // 買盤被消化、價不漲
+  }
+  let score = Math.max(-1.5, Math.min(1.5, (buyPct - 50) / 10));
+  if (bigNet >= 2) score += 0.5; else if (bigNet <= -2) score -= 0.5;
+  if (aboveVwap === true) score += 0.4; else if (aboveVwap === false) score -= 0.4;
+  if (bookNow != null) score += bookNow >= 0.3 ? 0.3 : bookNow <= -0.3 ? -0.3 : 0;
+  if (pattern === 'bull-div' || pattern === 'bull-absorb') score += 0.6;
+  if (pattern === 'bear-div' || pattern === 'bear-absorb') score -= 0.6;
+  const dir = score >= 1 ? 1 : score <= -1 ? -1 : 0;
+  const strong = Math.abs(score) >= 1.8;
+  const PAT = { 'bear-div': '價漲量不跟（拉抬無主動買盤）', 'bull-div': '價跌主動買盤反增（低接吸籌）', 'bull-absorb': '賣壓被吸收、價不跌', 'bear-absorb': '買盤被消化、價不漲' };
+  const txt = `主動買 ${buyPct}%／主動賣 ${100 - buyPct}%` +
+    `${bigNet !== 0 ? `、大單買 ${st.big.buy} 筆／賣 ${st.big.sell} 筆` : ''}` +
+    `${vwap != null ? `、${aboveVwap ? '站在' : '跌破'} VWAP ${vwap}` : ''}` +
+    `${pattern ? `、${PAT[pattern]}` : ''}`;
+  return { buy: st.buy, sell: st.sell, cvd, buyPct, vwap, aboveVwap, bigBuy: st.big.buy, bigSell: st.big.sell, bigNet,
+           bookNow, bookTrend, pattern, patTxt: pattern ? PAT[pattern] : null, score: +score.toFixed(2), dir, strong,
+           ticks: st.ticks, vol: st.vv, txt, hist: st.hist, prints: st.prints, bookHist: st.bookHist };
+}
+
+// ── 量化多因子（橫斷面百分位排名）──────────────────────────────────────────
+// 把每檔的動能／波動／量能／籌碼／營收放在同一個母體（本次掃描的所有股票）比較，
+// 得到「贏過幾 % 的同儕」。這跟研判證據（看單檔絕對狀態）互補：
+// 同樣漲 5%，在全市場都漲 8% 的日子裡是落後，在普跌日裡是領先。
+let _quantCache = null;
+const QUANT_FACTORS = [
+  { k: 'mom20', name: '20 日動能', f: s => ret(s, 20), hi: true },
+  { k: 'mom60', name: '60 日動能', f: s => ret(s, 60), hi: true },
+  { k: 'lowVol', name: '低波動', f: s => { const a = s.analysis; return a?.atr && a.price ? -(a.atr / a.price) : null; }, hi: true },
+  { k: 'volR', name: '量能擴張', f: s => { const a = s.analysis; return a?.volMA && a.lastVol ? a.lastVol / a.volMA : null; }, hi: true },
+  { k: 'chips', name: '法人買超佔量', f: s => { const a = s.analysis; const net = (s.foreign ?? 0) + (s.investment ?? 0) + (s.dealer ?? 0); return a?.lastVol ? net * 1000 / a.lastVol : null; }, hi: true },
+  { k: 'rev', name: '營收成長', f: s => s.rev?.yoy ?? null, hi: true },
+];
+function ret(s, n) { const b = s.ohlcv; if (!b || b.length <= n) return null; const p0 = b[b.length - 1 - n].close; return p0 > 0 ? (b[b.length - 1].close / p0 - 1) * 100 : null; }
+function quantUniverse() {
+  const key = `${allStocks.length}:${allStocks.filter(x => x.analysis).length}:${allStocks[0]?.analysis?.price ?? ''}`;
+  if (_quantCache && _quantCache.key === key && Date.now() - _quantCache.at < 60000) return _quantCache;
+  const cols = {};
+  for (const f of QUANT_FACTORS) {
+    const vals = [];
+    for (const s of allStocks) { if (!s.analysis) continue; let v = null; try { v = f.f(s); } catch {} if (typeof v === 'number' && isFinite(v)) vals.push(v); }
+    cols[f.k] = vals.sort((a, b) => a - b);
+  }
+  _quantCache = { key, at: Date.now(), cols };
+  return _quantCache;
+}
+function quantFactors(s) {
+  if (!s?.analysis) return null;
+  const U = quantUniverse();
+  const out = [];
+  for (const f of QUANT_FACTORS) {
+    const col = U.cols[f.k]; if (!col || col.length < 8) continue;
+    let v = null; try { v = f.f(s); } catch {}
+    if (typeof v !== 'number' || !isFinite(v)) continue;
+    let lo = 0, hi = col.length;                              // 二分：有幾個 ≤ v
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (col[mid] <= v) lo = mid + 1; else hi = mid; }
+    const pct = Math.round(lo / col.length * 100);
+    out.push({ k: f.k, name: f.name, v, pct, n: col.length });
+  }
+  if (out.length < 3) return null;
+  const composite = Math.round(out.reduce((a, b) => a + b.pct, 0) / out.length);
+  const sorted = [...out].sort((a, b) => b.pct - a.pct);
+  const txt = `量化綜合排名贏過 ${composite}% 同儕（${sorted[0].name} ${sorted[0].pct}%、${sorted[sorted.length - 1].name} ${sorted[sorted.length - 1].pct}%）`;
+  return { factors: out, composite, n: out[0].n, best: sorted[0], worst: sorted[sorted.length - 1], txt };
+}
+
 // 掃描完成後復原即時價 —— runScan 會重建 allStocks，
 // 若不復原，價格會倒退回日 K 快取（最舊可達 10 分鐘前）直到下一次 tick
 function reapplyLiveQuotes() {
+  try { ofClearOld(twClock().date); } catch {}
   if (!liveWindowTW()) return;
   const today = twClock().date;
   for (const s of allStocks) applyLiveQuote(s, _liveQuotes[s.id], today);
@@ -5228,6 +5414,7 @@ async function refreshLivePrices() {
         const need = new Set([currentStockId, ...getHoldings().map(h => h.id)].filter(Boolean));
         for (const d of (_dayCandIds || [])) need.add(d);
         for (const id of need) { const q = map[id]; if (q) pushIntradayQuote(id, 5, q); }
+        ofPersist(need);
       } catch {}
       checkStopProximity();      // 持倉逼近/跌破停損 → 盤中即時警報（每檔每日一次）
       try { notifyDayTradeTriggers(); } catch {}   // 當沖 ORB 觸發 → 立即可掛單的價格
@@ -9245,6 +9432,9 @@ function notifyDayTradeTriggers() {
     const hit = long ? o.state === 'break-up' : o.state === 'break-down';
     if (!hit) continue;
     if (tgKeySent(`dt-trig:${d.s.id}`)) continue;
+    // 突破當下主動買賣盤必須不反向：買盤不接手的突破不推（下一輪 tick 再看）
+    const of = (() => { try { return orderFlowSummary(d.s); } catch { return null; } })();
+    if (of && ((long && of.dir < 0) || (!long && of.dir > 0))) continue;
     const plan = dayTradePlan(d.s, d.side, d.atrPct, d.stratP) || d.plan;
     const px = d.s.analysis.price;
     tgPush(
@@ -9253,6 +9443,7 @@ function notifyDayTradeTriggers() {
       `${long ? '掛買' : '掛賣'} ${plan.entryLo}~${plan.entryHi}（含通知緩衝 ±${plan.buf}，勿追市價）\n` +
       `停損 ${plan.stop}（-${plan.riskPct}%）\n停利 ${plan.target}（+${plan.rewardPct}%，稅費後 ${plan.netPct}%）\n` +
       `${plan.vwap != null ? `日內 VWAP ${plan.vwap}\n` : ''}` +
+      `${of ? `Order flow：${of.txt}\n` : ''}` +
       `${!long ? '\n⚠ 現股當沖「先賣後買」需平盤之上才可放空，下單前確認券源與規則\n' : ''}` +
       `\n⏰ 13:00 前未達停利即準備平倉，收盤前務必出清\n⚠ 僅供參考，非投資建議`);
     tgMarkKeys([`dt-trig:${d.s.id}`]);
@@ -9899,6 +10090,14 @@ function computeDayTradePicks() {
       if ((pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak)) pick.base += 6;
     }
     if (LF.needChips && !((pick.side === 'long' && net > 0) || (pick.side === 'short' && net < 0))) continue;
+    // 盤中 order flow：主動買賣方向與本單相反且強烈 → 不做（買盤不接手的突破最常失敗）
+    const of = (() => { try { return orderFlowSummary(s); } catch { return null; } })();
+    if (of) {
+      const against = (pick.side === 'long' && of.dir < 0) || (pick.side === 'short' && of.dir > 0);
+      const withFlow = (pick.side === 'long' && of.dir > 0) || (pick.side === 'short' && of.dir < 0);
+      if (against && (of.strong || LF.needFlowSide)) continue;
+      if (withFlow) pick.base += 5;
+    }
 
     const long = pick.side === 'long';
     const plan = dayTradePlan(s, pick.side, atrPct, SP);
@@ -9927,6 +10126,8 @@ function computeDayTradePicks() {
       `大盤：研判 ${mktNorm >= 0 ? '+' : ''}${mktNorm}（信心 ${(mktConf * 100).toFixed(0)}%）${mktSide === 0 ? ' — 方向不明，已提高選股標準' : `，本單為${long ? '順勢做多' : '順勢做空'}`}`,
     ];
     if (irs) why.push(`${irs.txt} — ${(pick.side === 'long' && irs.strong) || (pick.side === 'short' && irs.weak) ? '與大盤同向且明顯領先，選邊正確' : '方向一致但領先幅度普通'}`);
+    if (of) why.push(`盤中 order flow：${of.txt} — ${((long && of.dir > 0) || (!long && of.dir < 0)) ? '主動買賣方向與本單一致' : of.dir === 0 ? '尚未明顯站隊，進場後若主動買盤轉弱即縮手' : '⚠ 與本單方向相反，部位減半'}`);
+    else why.push('盤中 order flow：尚無足夠即時成交樣本（開盤後逐筆累積，屆時自動納入方向確認）');
     if (tpD && tpD.verdict !== 'none') why.push(`${tpD.txt.split(' —')[0]}${tpD.verdict === 'caution' && long ? ' — 做多部位減半、突破站穩再加' : ''}`);
     else why.push('日內相對強度：尚無今日 5 分 K（開盤後累積中，屆時會自動納入選邊判斷）');
     if (s._oapi) {
@@ -9950,7 +10151,7 @@ function computeDayTradePicks() {
     why.push('⏰ 當沖紀律：13:00 前未達停利即準備平倉，收盤前務必出清，絕不留倉');
 
     out.push({
-      s, m, side: pick.side, plan, wk, atrPct, turnoverVal, irs, stratP: SP,
+      s, m, side: pick.side, plan, wk, atrPct, turnoverVal, irs, of, stratP: SP,
       hasChips: (long ? net > 0 : net < 0) ? 1 : 0,
       why,
       // 排序：流動性為主（當沖第一原則），再看證據強度
@@ -10257,6 +10458,8 @@ function dataLine(s) {
   if (s._fd?.pe > 0) parts.push(`PE ${s._fd.pe.toFixed(1)}`);
   try { const b = stockBeta(s); if (b != null) parts.push(`β ${b}`); } catch {}
   try { const w = weeklyBias(s); if (w?.dir) parts.push(`週線${w.dir > 0 ? '多' : '空'}`); } catch {}
+  try { const of = orderFlowSummary(s); if (of) parts.push(`主動買 ${of.buyPct}%`); } catch {}
+  try { const qf = quantFactors(s); if (qf) parts.push(`量化排名 ${qf.composite}%`); } catch {}
   return parts.join('・') || '—';
 }
 function sigCardHTML(pk, kind, inH) {
@@ -10321,9 +10524,10 @@ function sigCardHTML(pk, kind, inH) {
     </div>`;
 }
 
-function dayCardHTML({ s, m, why, side, plan }, inH) {
+function dayCardHTML({ s, m, why, side, plan, of }, inH) {
   const long = side !== 'short';
   const c = long ? 'var(--bull)' : 'var(--bear)';
+  const ofLine = of ? `<div class="sig-meta"><span style="color:${((long && of.dir > 0) || (!long && of.dir < 0)) ? 'var(--bull)' : of.dir === 0 ? 'var(--text2)' : 'var(--bear)'}">🔁 Order flow　${of.txt}</span></div>` : '';
   const lv = plan ? `
       <div class="sig-levels">
         <div class="sig-lv stop"><div class="l">停損</div><div class="v">${plan.stop}</div><div class="p">−${plan.riskPct}%</div></div>
@@ -10331,8 +10535,8 @@ function dayCardHTML({ s, m, why, side, plan }, inH) {
         <div class="sig-lv tgt"><div class="l">停利</div><div class="v">${plan.target}</div><div class="p">+${plan.rewardPct}%（稅後 ${plan.netPct}%）</div></div>
       </div>
       ${long ? ladderHTML(plan.stop, plan.entryLo, plan.entryHi, plan.target, false) : ''}
-      <div class="sig-meta"><span>${plan.vwap != null ? `VWAP <b>${plan.vwap}</b>${plan.orb ? `　開盤區間 <b>${plan.orb.lo}~${plan.orb.hi}</b>` : ''}` : '<b>開盤後 5 分 K 累積中</b>，進場價屆時依 ORB／VWAP 修正'}</span></div>`
-    : '<div class="sig-meta"><span>尚無可掛單價（等日內資料）</span></div>';
+      <div class="sig-meta"><span>${plan.vwap != null ? `VWAP <b>${plan.vwap}</b>${plan.orb ? `　開盤區間 <b>${plan.orb.lo}~${plan.orb.hi}</b>` : ''}` : '<b>開盤後 5 分 K 累積中</b>，進場價屆時依 ORB／VWAP 修正'}</span></div>${ofLine}`
+    : `<div class="sig-meta"><span>尚無可掛單價（等日內資料）</span></div>${ofLine}`;
   return `
     <div class="sig-card ${long ? 'k-day' : 'k-short'}">
       <div class="sig-head">
@@ -12836,7 +13040,31 @@ function renderOrderFlow(s) {
     </div>`;
   })() : '';
 
+  // 盤中真實 order flow（由即時報價逐筆推算：主動買賣量、CVD、VWAP、大單、委託簿失衡趨勢）
+  const of = (() => { try { return orderFlowSummary(s); } catch { return null; } })();
+  const ofHtml = of ? (() => {
+    const col = of.dir > 0 ? 'var(--bull)' : of.dir < 0 ? 'var(--bear)' : 'var(--yellow)';
+    const verdictOf = of.dir > 0 ? '🟢 主動買盤主導' : of.dir < 0 ? '🔴 主動賣盤主導' : '🟡 主動買賣拉鋸';
+    const prints = of.prints.slice(-6).reverse().map(p => `<span style="font-family:var(--mono);font-size:0.68rem;color:${p.side > 0 ? 'var(--bull)' : 'var(--bear)'}">${p.t} ${p.side > 0 ? '買' : '賣'} ${p.v.toLocaleString()} 張 @${p.px}</span>`).join('<span style="color:var(--text3)">　</span>');
+    const bookT = of.bookNow != null ? `委託簿失衡 ${(of.bookNow * 100).toFixed(0)}%${Math.abs(of.bookTrend) >= 0.1 ? `（${of.bookTrend > 0 ? '買方掛單增加中' : '賣方掛單增加中'}）` : ''}` : '';
+    return `
+    <div style="margin-bottom:12px;padding:10px 12px;border-radius:8px;background:rgba(255,255,255,0.02);border-left:3px solid ${col}">
+      <div class="fund-block-ttl">盤中 Order Flow（即時成交逐筆推算・${of.ticks} 筆／${of.vol.toLocaleString()} 張）</div>
+      <div style="font-size:0.82rem;font-weight:700;color:${col};margin-top:4px">${verdictOf}${of.patTxt ? `　— ${of.patTxt}` : ''}</div>
+      <div style="display:flex;justify-content:space-between;font-size:0.72rem;margin-top:6px">
+        <span style="color:var(--bull)">主動買 ${of.buyPct}%（${of.buy.toLocaleString()} 張）</span>
+        <span style="color:var(--bear)">主動賣 ${100 - of.buyPct}%（${of.sell.toLocaleString()} 張）</span>
+      </div>
+      <div style="height:8px;border-radius:4px;overflow:hidden;display:flex;margin-top:3px"><div style="width:${of.buyPct}%;background:var(--bull);opacity:0.85"></div><div style="flex:1;background:var(--bear);opacity:0.85"></div></div>
+      <div style="font-size:0.7rem;color:var(--text3);margin-top:6px">CVD（累積主動買賣差）走勢</div>
+      ${sparklineSVG(of.hist.map(h => h.cvd), 320, 44)}
+      <div style="font-size:0.7rem;color:var(--text2);margin-top:4px">${of.vwap != null ? `VWAP ${of.vwap}（現價${of.aboveVwap ? '之上' : '之下'}）` : ''}${bookT ? `・${bookT}` : ''}・大單買 ${of.bigBuy} 筆／賣 ${of.bigSell} 筆</div>
+      ${prints ? `<div style="display:flex;flex-wrap:wrap;gap:4px 0;margin-top:4px">${prints}</div>` : ''}
+      <div style="font-size:0.66rem;color:var(--text3);margin-top:5px">依每 15 秒報價的成交量增量與價格方向推算（tick rule），是估算非逐筆明細；當沖訊號會用它確認突破有沒有買盤接手</div>
+    </div>`;
+  })() : (isMarketOpenTW() ? `<div style="font-size:0.72rem;color:var(--text3);margin-bottom:10px">盤中 order flow：即時成交樣本累積中（需約 2 分鐘、100 張以上成交）</div>` : '');
   el.innerHTML = `
+    ${ofHtml}
     ${bookHtml}
     <div style="margin-bottom:12px">
       <div style="display:flex;justify-content:space-between;font-size:0.75rem;margin-bottom:5px">
@@ -13358,6 +13586,8 @@ function recordDayTradeSignals() {
         vwapSide: d.plan.vwap != null ? (d.s.analysis.price >= d.plan.vwap ? 1 : -1) : null,
         turnoverY: +(d.turnoverVal / 1e8).toFixed(1),
         chips: d.hasChips,
+        flow: d.of?.buyPct ?? null,
+        flowDir: d.of?.dir ?? null,
       },
       why: d.why.slice(0, 4),
       fams: famSnapshot(d.m),
@@ -13455,6 +13685,9 @@ const DT_LOSS_RULES = [
     hit: (tr) => tr.ctx?.chips === 0 },
   { k: 'thin', txt: '流動性偏薄 — 成交量不足，滑價與掛單失衡放大虧損',
     hit: (tr) => tr.ctx?.turnoverY != null && tr.ctx.turnoverY < 3 },
+  { k: 'flow-flip', txt: '主動買賣盤反轉 — 進場時 order flow 偏向本單，之後主動買盤（或賣盤）明顯退場',
+    hit: (tr, s) => { const of = orderFlowSummary(s); if (!of || tr.ctx?.flow == null) return false;
+      return tr.side !== 'short' ? of.buyPct <= tr.ctx.flow - 12 : of.buyPct >= tr.ctx.flow + 12; } },
 ];
 
 function classifyDayLoss(tr, s) {
@@ -13483,7 +13716,8 @@ function dayLossLearnings() {
                     'vwap-lost': '→ 已提高：進場價須在 VWAP 正確側',
                     'low-vol': '→ 已提高：ATR 門檻由 1.8% 拉高至 2.2%',
                     'no-chips': '→ 已提高：無法人籌碼者不列入訊號',
-                    'thin': '→ 已提高：成交金額門檻由 2 億拉高至 3 億' }[k] || '',
+                    'thin': '→ 已提高：成交金額門檻由 2 億拉高至 3 億',
+                    'flow-flip': '→ 已提高：盤中 order flow 與本單方向相反即不進場' }[k] || '',
              active: learnState('day', k).on, status: learnStatusTxt('day', k) };
   }).sort((a, b) => b.n - a.n);
   return { n: done.length, total: all.length, rules, insufficient: false };
@@ -13492,7 +13726,7 @@ function dayLossLearnings() {
 // 學習結果轉成「當前生效的加嚴條件」，供 computeDayTradePicks 使用
 function dayLearnedFilters() {
   const L = dayLossLearnings();
-  const f = { minAtr: 1.8, minTurnover: 2e8, needChips: false, minIrs: -0.5, needVwapSide: false };
+  const f = { minAtr: 1.8, minTurnover: 2e8, needChips: false, minIrs: -0.5, needVwapSide: false, needFlowSide: false };
   if (L.insufficient) return f;
   const settled = getDayTrades().filter(t => ['win', 'loss', 'flat'].includes(t.status));
   const win = settled.slice(-LEARN_WINDOW);
@@ -13504,6 +13738,7 @@ function dayLearnedFilters() {
     if (r.k === 'no-chips') f.needChips = true;
     if (r.k === 'irs-flip') f.minIrs = 1;
     if (r.k === 'vwap-lost') f.needVwapSide = true;
+    if (r.k === 'flow-flip') f.needFlowSide = true;
   }
   return f;
 }
