@@ -43,6 +43,7 @@
 
 ### 2.3 其他資料
 - 全市場當日行情（支援 CORS，直抓失敗才走代理）：`https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL`、`https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes`。14:00 後才合併進日線最後一根（盤中是前一日資料）。
+- 日 K 來源順序 `ohlcvSourceOrder`（四條免費：官方證交所／櫃買、Yahoo、FinMind token、Stooq CSV；auto 依每日健檢結果切換，Yahoo 被限流就官方優先），`fetchStockOHLCV` 依順序逐條補到不過期為止。資料來源健檢 `SOURCE_CATALOG`／`runSourceAudit`：每類資料列出所有來源實測有沒有資料，存 `src-audit`，儀表板與設定頁顯示每類目前由哪個來源供應；每日掃描後自動跑一次。
 - 即時報價與五檔：`https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw|otc_XXXX.tw&json=1&delay=0`（批次）；備援 FinMind `TaiwanStockPriceTick`（需 token，5 分鐘冷卻、最多 6 檔）與 Yahoo（2 分鐘冷卻、最多 10 檔）。盤中以即時價更新最後一根 K、累積 5 分 K 給當沖用。
 - 三大法人買賣超：`https://openapi.twse.com.tw/v1/fund/T86`（備援 `https://www.twse.com.tw/rwd/zh/fund/T86?date=YYYYMMDD&selectType=ALLBUT0999&response=json`），每日累積歷史以計算「法人連續買賣超天數」。
 - 融資融券：`https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?date=YYYYMMDD&selectType=ALL&response=json`（券資比、融資融券日增減）。
@@ -100,6 +101,7 @@
 ## 6. 持倉、當沖、長期名單
 - 持倉：`checkHoldingExit`（跌破停損、研判轉空、均線雙破、頂背離、外資賣超、營收轉差、達目標、財報截止、除息預告、時間停損 40 日／長期 120 日、誘多→減碼／洗盤→續抱、買進理由檢查、健康度階段 試煉/保護/保本/追蹤）；`updateTrailingStops`（+1R 上移至成本、+2R 結構位＝max(現價−2ATR, EMA20)、動能續抱吊燈、持有 ≥10 日仍在 ±0.5R 內停損收至 −0.5R）；組合風險總量（全部停損額 ÷ 資金，上限 6%、盤整轉換 4%；族群集中；60 日相關 ≥0.7）；盤中停損逼近／觸發推播。
 - 盤中 order flow（量化）：每次即時報價用「累積成交量增量 × tick rule」推算主動買賣量、CVD、VWAP、大單（≥50 張且 ≥ 平均 5 倍）與委託簿失衡趨勢（`ofRecord`／`orderFlowSummary`）；研判給低權重證據、當沖候選要求方向不反向（強烈反向不做）、ORB 觸發推播前確認、止損原因「主動買賣盤反轉」進學習、個股頁 Order Flow 區塊顯示主動買賣條與 CVD 走勢。量化多因子 `quantFactors`：20／60 日動能、低波動、量能、法人佔量、營收在本次掃描母體做百分位排名，綜合 ≥80% 加分、≤20% 扣分。
+- 進場品質 `entryQuality` 含「基本面」15 分（營收年增、淨利率／ROE、本益比自身歷史位階、負債比）與「籌碼」（法人連買、大戶、外資持股比率、千張大戶）；`evalEntry` 硬門檻 `fundbad`（營收年減 ≥20% 且本業虧損或估值歷史高檔不推），法人連賣／融資大增／外資持股下降／大戶減持扣分。推薦卡 `planEvidenceHTML` 顯示進場／停損／目標各自依據與基本面、籌碼得分。持有中頁最上方「實倉跟單表」`orderSheetItems`：出場、留意、買進（張數依資金與單筆可接受虧損）、當沖，每列附價位、停損、目標與一句依據。
 - 當沖 `computeDayTradePicks` 多空雙向：成交 ≥3000 張且 ≥2 億、ATR% 覆蓋全成本（稅費 0.1425%×2＋0.15%＋tick 價差）、日線與週線同邊、法人籌碼、大盤方向、日內相對強度、盤中 order flow 方向確認、ORB／VWAP 進出場、掛單價含通知緩衝；紙上追蹤到止盈／止損／收盤；當沖頁含訊號、追蹤中、實驗室（10 策略走動式驗證、分盤性冠軍、有界自動調參）、交易紀錄（保留 30 筆，止損原因與學習不刪）。
 - 長期名單（持久化、放半年以上）：成長＋估值＋資金流三證據、60 日贏大盤、乖離年線 ≤25%；年線二次確認才剔除；剔除學習。
 

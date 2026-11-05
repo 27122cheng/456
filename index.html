@@ -234,6 +234,11 @@
         <div id="todo-body"><div class="adv-loading">掃描完成後產生今日待辦</div></div>
       </div>
 
+      <!-- 資料來源狀態 -->
+      <div class="market-outlook-card">
+        <div id="data-src-body"><div class="adv-loading">掃描後自動健檢資料來源</div></div>
+      </div>
+
       <!-- 市場多空總覽 -->
       <div class="market-outlook-card">
         <div id="market-outlook-body"><div class="adv-loading">載入市場多空分析...</div></div>
@@ -778,6 +783,7 @@
         </div>
       </div>
       <div class="market-outlook-card" style="margin-bottom:16px">
+        <div id="order-sheet-body" style="margin-bottom:14px"><div class="adv-loading">掃描完成後產生今日跟單表</div></div>
         <h3 style="font-size:0.9rem;font-weight:700">➕ 自行加入持倉</h3>
         <span style="font-size:0.7rem;color:var(--text3)">輸入實際買進的股票，AI 會給出這個價格的看法、止損價與上方壓力區，並每輪檢查出場訊號</span>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
@@ -981,6 +987,25 @@
               <input type="file" id="sync-import-file" accept="application/json,.json" style="display:none" onchange="importSettings(event)" />
             </div>
           </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">日 K 來源順序</div>
+              <div class="setting-desc">四條來源全部免費：證交所／櫃買官方、Yahoo、FinMind（需 token）、Stooq。「自動」依每日健檢結果切換：Yahoo 被限流就改官方優先</div>
+            </div>
+            <select class="setting-select" id="s-ohlcv-src">
+              <option value="auto">自動（依健檢結果）</option>
+              <option value="official">官方優先（證交所／櫃買）</option>
+              <option value="yahoo">Yahoo 優先</option>
+            </select>
+          </div>
+          <div class="setting-row">
+            <div class="setting-info">
+              <div class="setting-name">資料來源健檢</div>
+              <div class="setting-desc">每類資料列出所有來源並實測現在有沒有資料；每日掃描後自動跑一次，結果決定日 K 來源順序</div>
+            </div>
+            <button class="btn-primary" style="padding:8px 18px" onclick="runSourceAuditUI()">🩺 立即健檢</button>
+          </div>
+          <div id="src-audit-body" style="margin-bottom:10px"></div>
           <div class="setting-row">
             <div class="setting-info">
               <div class="setting-name">資料源診斷</div>

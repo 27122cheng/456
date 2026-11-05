@@ -715,6 +715,7 @@ let _dayAllResolved = null;
 
 const _ohlcvInflight = new Map(); // 同一檔同時被多處請求時只發一次
 const ohlcvFailReason = {};       // 掃描失敗原因（stockId → 說明文字），供 UI 呈現
+const ohlcvSrcUsed = {};   // 每檔實際供應日 K 的來源（健檢與個股頁顯示用）
 
 // 台北今天（YYYY-MM-DD）與「落後幾個交易日」— api.js 自帶，不依賴 app.js
 function twTodayISO() { const d = twNow(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
@@ -762,6 +763,46 @@ async function fetchFinMindHistory(stockId, sinceISO) {
   return bars;
 }
 
+// ── Stooq 個股日線（第四條免費備援；CSV，經代理）──────────────────────────
+// 格式：Date,Open,High,Low,Close,Volume。只在前面幾條來源都補不齊時才會走到。
+async function fetchStooqHistory(stockId) {
+  if (srcDead('stooq')) return [];
+  const key = `cache:stooqh:${stockId}`;
+  const cached = cacheGet(key, 30 * 60 * 1000);
+  if (cached) return unpackBars(cached);
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(String(stockId).toLowerCase() + '.tw')}&i=d`;
+  const csv = await proxyFetchText(url, 8000).catch(() => null);
+  if (!csv || !/^Date/i.test(csv.trim())) { srcMarkDead('stooq', 15); return []; }
+  srcMarkAlive('stooq');
+  const bars = [];
+  for (const line of csv.trim().split('\n').slice(1)) {
+    const [d, o, h, l, c, v] = line.split(',');
+    const close = parseFloat(c);
+    if (!(close > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(d || '')) continue;
+    bars.push({ time: d, open: parseFloat(o) || close, high: parseFloat(h) || close, low: parseFloat(l) || close, close, volume: Math.round(parseFloat(v) || 0) });
+  }
+  const out = bars.slice(-320);
+  if (out.length) cacheSet(key, packBars(out));
+  return out;
+}
+
+// ── 日 K 來源順序 ──────────────────────────────────────────────────────────
+// 四條全免費：官方（證交所／櫃買）、Yahoo、FinMind（免費 token）、Stooq。
+// auto：Yahoo 熔斷中或健檢顯示 Yahoo 失效 → 官方優先；否則 Yahoo 優先
+//（一檔一個請求、不耗官方節流額度）。使用者也可在設定頁強制官方優先。
+function ohlcvSourceOrder(interval = '1d') {
+  if (interval !== '1d') return ['yahoo'];
+  const pref = localStorage.getItem('ohlcv-src') || 'auto';
+  if (pref === 'official') return ['official', 'yahoo', 'finmind', 'stooq'];
+  if (pref === 'yahoo') return ['yahoo', 'official', 'finmind', 'stooq'];
+  let audit = null; try { audit = JSON.parse(localStorage.getItem('src-audit') || 'null'); } catch {}
+  const bad = Array.isArray(audit?.bad) ? audit.bad : [];
+  const yahooBad = srcDead('yahoo') || bad.includes('yahoo');
+  const officialBad = bad.includes('twse-hist') && bad.includes('tpex-hist');
+  if (yahooBad && !officialBad) return ['official', 'finmind', 'stooq', 'yahoo'];
+  return ['yahoo', 'official', 'finmind', 'stooq'];
+}
+
 async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {}) {
   const ikey = `${stockId}:${interval}:${range}${opts.force ? ':f' : ''}`;
   if (_ohlcvInflight.has(ikey)) return _ohlcvInflight.get(ikey);
@@ -770,23 +811,26 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {
     const suffixKey = `sym-suffix:${stockId}`;
     const knownSuffix = localStorage.getItem(suffixKey);
     let ohlcv = [];
-    if (knownSuffix === 'TWO') {
-      ohlcv = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
-    }
-    if (!ohlcv.length) {
-      ohlcv = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range, opts);
-      if (!ohlcv.length) {
-        const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
-        if (two.length) localStorage.setItem(suffixKey, 'TWO');
-        ohlcv = two;
+    const diag = {};
+    // 「還需要補」的判定：沒資料，或日線落後 ≥3 個交易日（只給得出舊資料的來源不算成功）
+    const need = () => !ohlcv.length || (interval === '1d' && barsStale(ohlcv));
+    const stepYahoo = async () => {
+      let y = [];
+      if (knownSuffix === 'TWO') y = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
+      if (!y.length) {
+        y = await fetchYahooOHLCV(yahooSymbol(stockId), interval, range, opts);
+        if (!y.length) {
+          const two = await fetchYahooOHLCV(`${stockId}.TWO`, interval, range, opts);
+          if (two.length) localStorage.setItem(suffixKey, 'TWO');
+          y = two;
+        }
       }
-    }
-    // Yahoo 全掛或「只給得出舊資料」時改用官方日線，確保技術分析不中斷：
-    // 上市走證交所 STOCK_DAY、上櫃走櫃買中心 tradingStock。市場別確認一次後記住。
-    // 先前只在 Yahoo「完全沒資料」時才走官方 → Yahoo 的 72 小時陳舊快取一直頂著，
-    // 官方來源永遠沒機會補上最新月份。現在：Yahoo 資料落後 ≥3 個交易日也走官方，並把兩邊合併。
-    const diag = { yahoo: ohlcv.length ? (barsStale(ohlcv) ? 'stale' : 'ok') : (srcDead('yahoo') ? 'dead' : 'empty') };
-    if (interval === '1d' && (!ohlcv.length || barsStale(ohlcv))) {
+      diag.yahoo = y.length ? (barsStale(y) ? 'stale' : 'ok') : (srcDead('yahoo') ? 'dead' : 'empty');
+      if (y.length) ohlcv = mergeBars(ohlcv, y);
+    };
+    // 官方日線：上市走證交所 STOCK_DAY、上櫃走櫃買中心 tradingStock。市場別確認一次後記住。
+    const stepOfficial = async () => {
+      if (interval !== '1d') return;
       const mkt = localStorage.getItem(`mkt:${stockId}`);
       const tpexFirst = mkt === 'tpex' || knownSuffix === 'TWO';
       const trySrc = tpexFirst
@@ -801,21 +845,31 @@ async function fetchStockOHLCV(stockId, interval = '1d', range = '6mo', opts = {
           ohlcv = mergeBars(ohlcv, off);
           break;
         }
-        // 已知市場別且官方回空 → 另一個市場不必再試（省下一半節流額度）
-        if (mkt && mkt === name) break;
+        if (mkt && mkt === name) break;   // 已知市場別且官方回空 → 另一個市場不必再試
       }
-    }
-    // 官方也補不齊（被限流／節流暫停中）→ FinMind（走使用者自己的 token 與瀏覽器 IP，不受代理限流影響）
-    if (interval === '1d' && (!ohlcv.length || barsStale(ohlcv)) && finmindToken()) {
+    };
+    // FinMind：走使用者自己的 token 與瀏覽器 IP，不受代理限流影響；只補「最後一根 K 之後」
+    const stepFinMind = async () => {
+      if (interval !== '1d' || !finmindToken()) return;
       const since = ohlcv.length ? ohlcv[ohlcv.length - 1].time : null;
       const fm = await fetchFinMindHistory(stockId, since).catch(() => []);
       diag.finmind = fm.length ? (barsStale(fm) ? 'stale' : 'ok') : 'empty';
       if (fm.length) ohlcv = mergeBars(ohlcv, fm);
-    }
+    };
+    const stepStooq = async () => {
+      if (interval !== '1d') return;
+      const sq = await fetchStooqHistory(stockId).catch(() => []);
+      diag.stooq = sq.length ? (barsStale(sq) ? 'stale' : 'ok') : 'empty';
+      if (sq.length) ohlcv = mergeBars(ohlcv, sq);
+    };
+    const STEPS = { yahoo: stepYahoo, official: stepOfficial, finmind: stepFinMind, stooq: stepStooq };
+    // 依來源順序逐條補到「不再過期」為止（順序由健檢結果或使用者設定決定）
+    for (const k of ohlcvSourceOrder(interval)) { if (!need()) break; try { await STEPS[k](); } catch {} }
+    if (interval === '1d' && ohlcv.length) ohlcvSrcUsed[stockId] = Object.entries(diag).filter(([, v]) => v === 'ok').map(([k]) => k);
     // 記錄失敗／過期原因，供掃描結果與個股頁說明「為什麼掃不出來、卡在哪個來源」
     if (interval === '1d') {
       const th = histThrottleStatus();
-      const srcTxt = Object.entries(diag).map(([k, v]) => `${{ yahoo: 'Yahoo', twse: '證交所', tpex: '櫃買', finmind: 'FinMind' }[k] || k} ${{ ok: '正常', stale: '僅舊資料', dead: '限流中', empty: '無資料' }[v] || v}`).join('、');
+      const srcTxt = Object.entries(diag).map(([k, v]) => `${{ yahoo: 'Yahoo', twse: '證交所', tpex: '櫃買', finmind: 'FinMind', stooq: 'Stooq' }[k] || k} ${{ ok: '正常', stale: '僅舊資料', dead: '限流中', empty: '無資料' }[v] || v}`).join('、');
       if (!ohlcv.length) {
         ohlcvFailReason[stockId] = `${srcTxt}${th.paused ? `；官方來源被限流，節流暫停中（${th.secondsLeft}s 後重試）` : ''} — 可能是興櫃、新上市未滿月、已下市或代號有誤`;
       } else if (barsStale(ohlcv)) {

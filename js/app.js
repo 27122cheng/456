@@ -432,6 +432,8 @@ async function runScan() {
   after('官方收盤合併', () => { mergeOfficialCloses().catch(e => console.warn('官方收盤合併失敗:', e)); });
   after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
+  after('實倉跟單表', renderOrderSheet);
+  after('資料來源健檢', () => { renderSourceAudit(); setTimeout(() => { sourceAuditMaybe().catch(() => {}); }, 8000); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); try { renderAiLossLearning(); } catch {} });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
   after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
@@ -5692,6 +5694,9 @@ function loadSettings() {
   if (sTI) sTI.checked = tgInboundOn();
   const sSV = document.getElementById('s-signal-volume');
   if (sSV) sSV.value = signalVolumeMode();
+  const sOS = document.getElementById('s-ohlcv-src');
+  if (sOS) sOS.value = localStorage.getItem('ohlcv-src') || 'auto';
+  try { renderSourceAudit(); } catch {}
   const sTF = document.getElementById('s-timeframe');
   if (sTF) sTF.value = tf;
   const sR  = document.getElementById('s-refresh');
@@ -5751,6 +5756,8 @@ function saveAllSettings() {
   if (tiEl) localStorage.setItem('tg-inbound', tiEl.checked ? 'true' : 'false');
   const svEl = document.getElementById('s-signal-volume');
   if (svEl) localStorage.setItem('signal-volume', svEl.value);
+  const osEl = document.getElementById('s-ohlcv-src');
+  if (osEl) localStorage.setItem('ohlcv-src', osEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
@@ -5795,7 +5802,7 @@ const SYNC_KEYS = [
   'trade-journal', 'exdiv-hist', 'auto-stocks', 'backtest-result',
   'capital', 'max-accept-loss', 'finmind-token',
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
-  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe',
+  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe', 'ohlcv-src',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
   // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
   'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
@@ -5845,6 +5852,113 @@ function importSettings(event) {
 }
 
 // ── 資料源診斷：逐一測試各來源，找出資料載入失敗的環節 ──────────────────────
+// ── 資料來源健檢（每日自動＋可手動）────────────────────────────────────────
+// 每一類資料列出全部來源（前三順位一律免費），逐一實測「現在有沒有資料」，
+// 結果存 src-audit：日 K 來源順序據此自動切換，儀表板顯示每類目前由哪個來源供應。
+// 不捏造：探測不到就寫「無資料」與原因，不用舊快取假裝正常。
+const SOURCE_CATALOG = [
+  { key: 'hist', cat: '日 K 歷史', srcs: [
+    { k: 'twse-hist', name: '證交所 STOCK_DAY（官方・免費）', probe: async () => { const b = await fetchTWSEHistory('2330', 2); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: '無資料（限流或端點異常）' }; } },
+    { k: 'tpex-hist', name: '櫃買中心 tradingStock（官方・免費）', probe: async () => { const b = await fetchTPExHistory('6488', 2); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: '無資料' }; } },
+    { k: 'yahoo', name: 'Yahoo Finance（免費）', probe: async () => { const b = await fetchYahooOHLCV('2330.TW', '1d', '1mo', { force: true }); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: srcDead('yahoo') ? '限流中（雲端代理 IP 被 Yahoo 擋）' : '無回應' }; } },
+    { k: 'finmind', name: 'FinMind TaiwanStockPrice（免費 token）', needsToken: true, probe: async () => { const d = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10); const b = await fetchFinMindHistory('2330', d); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: '無資料（token 無效或額度用盡）' }; } },
+    { k: 'stooq', name: 'Stooq CSV（免費）', probe: async () => { const b = await fetchStooqHistory('2330'); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: '無回應' }; } },
+  ] },
+  { key: 'dayall', cat: '當日收盤行情', srcs: [
+    { k: 'dayall', name: '證交所／櫃買 全市場當日行情（官方・免費）', probe: async () => { const m = await fetchTWDayAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔` } : { ok: false, msg: '無資料（非交易日或端點異常）' }; } },
+  ] },
+  { key: 'quote', cat: '即時報價', srcs: [
+    { k: 'mis', name: '證交所 MIS 即時（官方・免費）', probe: async () => { if (!isMarketOpenTW()) return { ok: null, msg: '非盤中，不測' }; const m = await fetchRealtimeBatch(['2330']); return m?.['2330']?.price ? { ok: true, msg: `2330 ${m['2330'].price} @${m['2330'].time}` } : { ok: false, msg: lastQuoteFail || '無報價' }; } },
+    { k: 'finmind-rt', name: 'FinMind 逐筆（免費 token）', needsToken: true, probe: async () => { if (!isMarketOpenTW()) return { ok: null, msg: '非盤中，不測' }; const m = await fetchFinMindQuotes(['2330'], 1); return m?.['2330']?.price ? { ok: true, msg: `2330 ${m['2330'].price}` } : { ok: false, msg: '無資料' }; } },
+    { k: 'yahoo-rt', name: 'Yahoo 分鐘線（免費）', probe: async () => { if (!isMarketOpenTW()) return { ok: null, msg: '非盤中，不測' }; const m = await fetchYahooQuotes(['2330'], 1); return m?.['2330']?.price ? { ok: true, msg: `2330 ${m['2330'].price}` } : { ok: false, msg: '無資料' }; } },
+  ] },
+  { key: 'inst', cat: '三大法人買賣超', srcs: [
+    { k: 't86', name: '證交所 T86／櫃買 法人（官方・免費）', probe: async () => { const r = await fetchT86All(); return r?.length ? { ok: true, msg: `${r.length} 檔` } : { ok: false, msg: '無資料（非交易日或端點異常）' }; } },
+  ] },
+  { key: 'pe', cat: '本益比／估值', srcs: [
+    { k: 'bwibbu', name: '證交所 BWIBBU_ALL／櫃買 估值（官方・免費）', probe: async () => { const m = await fetchTWFundAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔本益比／殖利率` } : { ok: false, msg: '無資料' }; } },
+  ] },
+  { key: 'rev', cat: '月營收', srcs: [
+    { k: 'rev', name: '公開資訊 t187ap05（上市＋上櫃・免費）', probe: async () => { const m = await fetchRevenueAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔` } : { ok: false, msg: '無資料' }; } },
+  ] },
+  { key: 'fin', cat: '季度財報', srcs: [
+    { k: 'fin', name: '綜合損益表 t187ap06（上市＋上櫃・免費）', probe: async () => { const m = await fetchFinancialsAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔` } : { ok: false, msg: '無資料（端點格式可能已變更）' }; } },
+    { k: 'bs', name: '資產負債表 t187ap07（免費）', probe: async () => { const m = await fetchBalanceSheetAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔` } : { ok: false, msg: '無資料' }; } },
+  ] },
+  { key: 'margin', cat: '融資融券', srcs: [
+    { k: 'margin', name: '證交所 MI_MARGN（官方・免費）', probe: async () => { const m = await fetchMarginAll(); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔` } : { ok: false, msg: '無資料' }; } },
+  ] },
+  { key: 'tdcc', cat: '集保大戶持股', srcs: [
+    { k: 'tdcc', name: '集保 TDCC 週報（官方・免費）', probe: async () => { const m = await fetchTDCCAll(new Set(['2330'])).catch(() => null); const n = m ? Object.keys(m).length : 0; return n ? { ok: true, msg: `${n} 檔，資料日 ${Object.values(m)[0]?.d || '--'}` } : { ok: false, msg: '無回應或格式變更' }; } },
+  ] },
+  { key: 'twii', cat: '加權指數', srcs: [
+    { k: 'twii-official', name: '證交所 MI_5MINS_HIST（官方・免費）', probe: async () => { const b = await fetchTWIIOHLC(2); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].close}` } : { ok: false, msg: '無資料' }; } },
+    { k: 'twii-yahoo', name: 'Yahoo ^TWII（免費）', probe: async () => { const b = await fetchYahooOHLCV('^TWII', '1d', '1mo', { force: true }); return b?.length ? { ok: true, msg: `${b.length} 根` } : { ok: false, msg: '無回應' }; } },
+  ] },
+];
+function getSourceAudit() { try { return JSON.parse(localStorage.getItem('src-audit') || 'null'); } catch { return null; } }
+async function runSourceAudit(onProgress = null) {
+  const cats = [];
+  const bad = [];
+  let okCount = 0, total = 0;
+  for (const c of SOURCE_CATALOG) {
+    const srcs = [];
+    for (const src of c.srcs) {
+      if (src.needsToken && !finmindToken()) { srcs.push({ k: src.k, name: src.name, ok: null, msg: '未設定 FinMind token（選填）', ms: 0 }); continue; }
+      const t0 = Date.now(); let r;
+      try { r = await Promise.race([src.probe(), new Promise(res => setTimeout(() => res({ ok: false, msg: '逾時 15 秒' }), 15000))]); } catch (e) { r = { ok: false, msg: `錯誤：${e?.message || e}` }; }
+      const row = { k: src.k, name: src.name, ok: r?.ok ?? false, msg: r?.msg || '', ms: Date.now() - t0 };
+      srcs.push(row);
+      if (row.ok === true) okCount++;
+      if (row.ok !== null) total++;
+      if (row.ok === false) bad.push(src.k);
+      if (onProgress) onProgress(c.cat, row);
+      await new Promise(res => setTimeout(res, 0));
+    }
+    const serving = srcs.find(x => x.ok === true) || null;
+    cats.push({ key: c.key, cat: c.cat, serving: serving?.name || null, servingK: serving?.k || null, srcs, state: serving ? 'ok' : srcs.every(x => x.ok === null) ? 'skip' : 'bad' });
+  }
+  const audit = { date: twClock().date, at: Date.now(), cats, bad, okCount, total };
+  try { localStorage.setItem('src-audit', JSON.stringify(audit)); } catch {}
+  try { if (bad.length) learnLog('rule', `資料來源健檢：${bad.length} 條來源無資料（${bad.join('、')}），已自動改用有資料的來源`); } catch {}
+  return audit;
+}
+let _auditBusy = false;
+// 每日一次自動健檢（掃描後背景執行，不擋畫面）；盤中不跑，避免占用報價頻寬
+async function sourceAuditMaybe() {
+  if (_auditBusy) return null;
+  const a = getSourceAudit();
+  if (a?.date === twClock().date && Date.now() - a.at < 12 * 60 * 60 * 1000) return a;
+  if (isMarketOpenTW() && a) return a;
+  _auditBusy = true;
+  try { const r = await runSourceAudit(); try { renderSourceAudit(); } catch {} return r; } finally { _auditBusy = false; }
+}
+function sourceAuditHTML(detail = false) {
+  const a = getSourceAudit();
+  if (!a) return `<div style="font-size:0.76rem;color:var(--text3)">尚未健檢資料來源（掃描後會自動執行；或到設定頁按「開始診斷」）</div>`;
+  const col = { ok: 'var(--bull)', bad: 'var(--bear)', skip: 'var(--text3)' };
+  const icon = { ok: '✓', bad: '✗', skip: '–' };
+  const badCats = a.cats.filter(c => c.state === 'bad');
+  const head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:0.84rem;font-weight:800">🩺 資料來源狀態</span><span style="font-size:0.7rem;color:${badCats.length ? 'var(--yellow)' : 'var(--bull)'}">${badCats.length ? `${badCats.length} 類無資料：${badCats.map(c => c.cat).join('、')}` : '全部類別皆有來源供應'}</span><span style="font-size:0.66rem;color:var(--text3);margin-left:auto">${a.date} 健檢・${a.okCount}/${a.total} 條來源正常・日 K 順序：${ohlcvSourceOrder().map(k => ({ yahoo: 'Yahoo', official: '官方', finmind: 'FinMind', stooq: 'Stooq' }[k])).join('→')}</span></div>`;
+  const chips = `<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:7px">${a.cats.map(c => `<span title="${c.srcs.map(x => `${x.ok === true ? '✓' : x.ok === false ? '✗' : '–'} ${x.name}：${x.msg}`).join('\n')}" style="font-size:0.68rem;padding:3px 8px;border-radius:10px;border:1px solid ${col[c.state]}55;color:${col[c.state]};background:${col[c.state]}12">${icon[c.state]} ${c.cat}${c.serving ? `<span style="color:var(--text3)">・${c.serving.split('（')[0]}</span>` : ''}</span>`).join('')}</div>`;
+  if (!detail) return head + chips;
+  const rows = a.cats.map(c => `<div style="margin-top:8px"><div style="font-size:0.76rem;font-weight:700;color:${col[c.state]}">${icon[c.state]} ${c.cat}${c.serving ? `　<span style="font-weight:400;color:var(--text2)">目前由「${c.serving}」供應</span>` : c.state === 'bad' ? '　<span style="font-weight:400;color:var(--bear)">所有來源皆無資料</span>' : ''}</div>${c.srcs.map((x, i) => `<div style="font-size:0.7rem;color:var(--text3);padding-left:14px;line-height:1.7">${i + 1}. ${x.ok === true ? '<span style="color:var(--bull)">✓</span>' : x.ok === false ? '<span style="color:var(--bear)">✗</span>' : '–'} ${x.name}　${x.msg}${x.ms ? `（${x.ms} ms）` : ''}</div>`).join('')}</div>`).join('');
+  return head + chips + rows;
+}
+function renderSourceAudit() {
+  const el = document.getElementById('data-src-body');
+  if (el) el.innerHTML = sourceAuditHTML(false);
+  const el2 = document.getElementById('src-audit-body');
+  if (el2) el2.innerHTML = sourceAuditHTML(true);
+}
+async function runSourceAuditUI() {
+  const el = document.getElementById('src-audit-body');
+  if (el) el.innerHTML = '<div class="adv-loading">逐一實測各資料來源（約 30~60 秒）...</div>';
+  const a = await runSourceAudit((cat, row) => { if (el) el.innerHTML = `<div class="adv-loading">測試中：${cat} → ${row.name}（${row.ok === true ? '✓' : row.ok === false ? '✗' : '–'}）</div>`; });
+  renderSourceAudit();
+  return a;
+}
+
 async function runDiagnostics() {
   const el = document.getElementById('diag-body');
   if (!el) return;
@@ -10302,6 +10416,7 @@ function renderEntrySignals() {
   const ready = allStocks.filter(s => s.analysis).length;
   if (ready < 5) { el.innerHTML = '<div class="adv-loading">等待掃描完成...</div>'; return; }
   const inH = new Set(getHoldings().map(h => h.id));
+  try { renderOrderSheet(); } catch {}
 
   // 長期：改用持久化名單（慢變數審核，短線波動不換臉）；波段：當日訊號扣除長期成員
   const ltList = updateLongTermList();
@@ -10462,6 +10577,91 @@ function dataLine(s) {
   try { const qf = quantFactors(s); if (qf) parts.push(`量化排名 ${qf.composite}%`); } catch {}
   return parts.join('・') || '—';
 }
+// 三個價位各自的依據（進場／停損／目標）＋基本面與籌碼一句 —— 每個數字都要說得出為什麼
+function planEvidenceHTML(p, q) {
+  if (!p?.ok) return '';
+  const first = (arr) => (arr || []).find(Boolean) || '';
+  const cut = (t, n = 46) => { t = String(t || '').replace(/^[📚🐋]\s*/, ''); return t.length > n ? t.slice(0, n) + '…' : t; };
+  const entry = first([...(p.support?.tech || []), ...(p.support?.chips || [])]) || '回踩支撐區分批掛買';
+  const stop = first(p.stopBasis) || '結構支撐之下';
+  const tgt = p.holdOn ? `上方無壓力，續抱；移動停利 ${p.trail}` : (p.targetNote || '').split('；')[0] || `目標 ${p.t1}`;
+  const fund = q?.factors?.find(f => f.k === '基本面'), chip = q?.factors?.find(f => f.k === '籌碼');
+  const pct = f => f && f.max ? Math.round(f.pts / f.max * 100) : null;
+  const colOf = v => v == null ? 'var(--text3)' : v >= 60 ? 'var(--bull)' : v >= 35 ? 'var(--yellow)' : 'var(--bear)';
+  return `<div class="sig-evid">
+      <div><b>進場</b><span>${cut(entry)}</span></div>
+      <div><b>停損</b><span>${cut(stop)}</span></div>
+      <div><b>目標</b><span>${cut(tgt)}</span></div>
+      <div><b style="color:${colOf(pct(fund))}">基本面 ${pct(fund) ?? '--'}%</b><span>${cut(fund?.txt, 60)}</span></div>
+      <div><b style="color:${colOf(pct(chip))}">籌碼 ${pct(chip) ?? '--'}%</b><span>${cut(chip?.txt, 60)}</span></div>
+    </div>`;
+}
+
+// ── 實倉跟單表：今天要下的單一行一筆 —— 動作、價位、張數、停損、目標、證據 ──────
+// 讓交易員打開就能照表下單，不必在各頁拼湊；張數依設定頁的資金與單筆可接受虧損計算。
+function orderSheetItems() {
+  const rows = [];
+  const fmt = v => v == null ? '--' : typeof v === 'number' ? v.toFixed(2) : String(v);
+  try {
+    for (const h of getHoldings()) {
+      const s = allStocks.find(x => x.id === h.id);
+      const px = s?.analysis?.price;
+      const r = checkHoldingExit(h); if (!r) continue;
+      const lots = h.qty > 0 ? `${h.qty} 張` : '全部';
+      if (r.level === 'exit') rows.push({ act: '出場', cls: 'sell', id: h.id, name: h.name, px: px != null ? `市價約 ${px.toFixed(2)}` : '--', lots, stop: '—', tgt: '—', why: r.reasons?.[0] || '結構轉弱', go: `showHoldingView('${h.id}')`, btn: { txt: '結案', fn: `closeHolding('${h.id}')` } });
+      else rows.push({ act: r.level === 'watch' ? '留意' : '續抱', cls: r.level === 'watch' ? 'watch' : 'hold', id: h.id, name: h.name, px: px != null ? px.toFixed(2) : '--', lots, stop: fmt(h.stop), tgt: h.t1 ? fmt(h.t1) : '續抱', why: h.trailNote ? `停損 ${fmt(h.stop)}（${h.trailNote.split('（')[0]}）` : (r.reasons?.[0] || '結構健康'), go: `showHoldingView('${h.id}')` });
+    }
+  } catch {}
+  try {
+    const inH = new Set(getHoldings().map(h => h.id));
+    for (const pk of computeEntrySignals().filter(pk => !inH.has(pk.s.id)).slice(0, 5)) {
+      const p = pk.p, sz = p.sizing;
+      rows.push({ act: '買進', cls: 'buy', id: pk.s.id, name: pk.s.name, px: `${p.lo}~${p.hi}`,
+        lots: sz ? (sz.shares > 0 ? `${sz.shares} 張${sz.cooldown ? '（冷卻減半）' : ''}` : `零股 ${sz.oddLot} 股`) : '設定頁填資金後計算',
+        stop: fmt(p.stop), tgt: p.holdOn ? `續抱（移停 ${p.trail}）` : fmt(p.t1),
+        why: `${((p.support?.tech || [])[0] || '技術結構').split('（')[0]}；停損依據：${((p.stopBasis || [])[0] || '').split('（')[0]}；品質 ${pk.q.grade} ${pk.q.score}`,
+        go: `openStock('${pk.s.id}')`, btn: { txt: '買進後記錄', fn: `addHolding('${pk.s.id}','swing')` } });
+    }
+  } catch {}
+  try {
+    for (const d of computeDayTradePicks().slice(0, 2)) {
+      if (!d.plan) continue;
+      rows.push({ act: d.side === 'short' ? '當沖空' : '當沖多', cls: 'day', id: d.s.id, name: d.s.name, px: `${d.plan.entryLo}~${d.plan.entryHi}`, lots: '依當沖額度', stop: fmt(d.plan.stop), tgt: fmt(d.plan.target), why: `${(d.why?.[0] || '').split('（')[0]}；13:00 前未達停利平倉`, go: "navigateTo('daytrade')" });
+    }
+  } catch {}
+  const order = { sell: 0, watch: 1, buy: 2, day: 3, hold: 4 };
+  return rows.sort((a, b) => order[a.cls] - order[b.cls]);
+}
+function orderSheetHTML() {
+  const rows = orderSheetItems();
+  let riskLine = '';
+  try {
+    const cap = +(localStorage.getItem('capital') || 0), mal = +(localStorage.getItem('max-accept-loss') || 0);
+    const env = entryEnv();
+    riskLine = `資金 ${cap ? `${(cap / 10000).toFixed(0)} 萬` : '未設定'}・單筆可接受虧損 ${mal ? `${mal}%` : '未設定'}・組合風險 ${env.heat?.heat ?? '--'}%／上限 ${env.heat?.cap ?? '--'}%${env.cooldown?.on ? '・系統冷卻中（新倉減半）' : ''}${env.breaker?.on ? '・⛔ 回撤斷路器：今日不開新倉' : ''}`;
+  } catch {}
+  const col = { sell: 'var(--bear)', watch: 'var(--yellow)', buy: 'var(--bull)', day: 'var(--blue)', hold: 'var(--text3)' };
+  const head = `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:0.9rem;font-weight:800">🧾 實倉跟單表</span><span style="font-size:0.68rem;color:var(--text3)">今天照這張表下單：出場優先、再開新倉；每一列的價位都有依據，點股名看完整證據</span></div>` +
+    (riskLine ? `<div style="font-size:0.7rem;color:var(--text3);margin-top:4px">${riskLine}</div>` : '');
+  if (!rows.length) return head + '<div style="font-size:0.78rem;color:var(--text3);margin-top:8px">今天沒有要下的單：無新 A 級訊號、持倉無出場條件。空手也是部位。</div>';
+  const body = rows.map(r => `<div class="osheet-row" style="border-left:3px solid ${col[r.cls]}">
+      <div class="osheet-act" style="color:${col[r.cls]}">${r.act}</div>
+      <div class="osheet-main"><span class="osheet-name" onclick="${r.go}">${r.name}<small>${r.id}</small></span><span class="osheet-why">${r.why}</span></div>
+      <div class="osheet-lv"><small>價位</small><b>${r.px}</b></div>
+      <div class="osheet-lv"><small>張數</small><b>${r.lots}</b></div>
+      <div class="osheet-lv"><small>停損</small><b>${r.stop}</b></div>
+      <div class="osheet-lv"><small>目標</small><b>${r.tgt}</b></div>
+      <div class="osheet-btn">${r.btn ? `<button class="btn-ghost" style="padding:5px 10px;font-size:0.7rem" onclick="${r.btn.fn}">${r.btn.txt}</button>` : ''}</div>
+    </div>`).join('');
+  return head + `<div style="margin-top:8px">${body}</div>`;
+}
+function renderOrderSheet() {
+  const el = document.getElementById('order-sheet-body');
+  if (!el) return;
+  if (allStocks.filter(s => s.analysis).length < 5) { el.innerHTML = '<div class="adv-loading">掃描完成後產生今日跟單表</div>'; return; }
+  try { el.innerHTML = orderSheetHTML(); } catch (e) { el.innerHTML = `<div style="font-size:0.76rem;color:var(--text3)">跟單表產生失敗：${e?.message || e}</div>`; }
+}
+
 function sigCardHTML(pk, kind, inH) {
   const { s, m, p, d, q, pillars, corr } = pk;
   const isA = q?.grade === 'A';
@@ -10483,6 +10683,9 @@ function sigCardHTML(pk, kind, inH) {
     p.cat ? `🔗 續漲動力：${p.cat.n ? p.cat.links.slice(0, 2).map(l => l.txt.split('：')[0]).join('＋') : '說不出來，僅氣氛'}` : null,
     p.scen ? `⚖️ 情境：樂觀 +${p.scen.optimistic}%／中性 +${p.scen.neutral}%／悲觀 ${p.scen.pessimistic}%` : null,
     `🛑 停損依據：${(p.stopBasis || []).slice(0, 2).join('；')}`,
+    `🎯 目標依據：${p.holdOn ? `${p.targetNote || '上方無壓力'}；移動停利 ${p.trail}` : (p.targetNote || '—')}`,
+    `📚 基本面：${q?.factors?.find(f => f.k === '基本面')?.txt || '無資料'}`,
+    `🧾 籌碼：${q?.factors?.find(f => f.k === '籌碼')?.txt || '無資料'}`,
     q?.penalties?.length ? `➖ 扣分：${q.penalties.map(x => `${x.k} −${x.v}`).join('・')}` : null,
     q?.weak?.length ? `⚠ 弱項：${q.weak.slice(0, 2).join('・')}` : null,
     `🔍 週線：${p.wk?.txt?.split('（')[0] || '—'}｜${p.liq?.txt?.split('（')[0] || ''}｜綜合 ${d.total}・一致性 ${(m.agr * 100).toFixed(0)}%`,
@@ -10508,6 +10711,7 @@ function sigCardHTML(pk, kind, inH) {
         <div class="sig-lv tgt"><div class="l">${p.holdOn ? '目標（上方無壓力）' : '目標一（先減半）'}</div><div class="v">${rewardTxt}</div><div class="p">${rewardP}</div></div>
       </div>
       ${ladderHTML(p.stop, p.lo, p.hi, p.holdOn ? null : p.t1, p.holdOn)}
+      ${planEvidenceHTML(p, q)}
       <div class="sig-meta">
         ${rr != null ? `<span>賠率 <b style="color:${rr >= 2 ? 'var(--bull)' : rr >= 1.5 ? 'var(--yellow)' : 'var(--bear)'}">1 : ${rr.toFixed(1)}</b></span>` : '<span>賠率 <b>續抱型</b></span>'}
         ${sizing ? `<span>部位 <b>${sizing}</b>${p.sizing.cooldown ? ' <span style="color:var(--blue)">冷卻減半</span>' : ''}</span>` : ''}
@@ -10747,7 +10951,49 @@ function entryQuality(s, m, p) {
   else if (st?.dir > 0 && st.days >= 2) { chip += 5; chipTxt.push(`法人連 ${st.days} 日買超`); }
   if (whaleFor(s.id)) { chip += 7; chipTxt.push('大戶訊號（已過陷阱檢查）'); }
   else if (s.investment > 500) { chip += 3; chipTxt.push('投信買超'); }
+  // 慢變數籌碼：外資持股比率上升、千張大戶增持 —— 比單日買賣超更難造假
+  if (s._fgnTrend?.delta > 0) { chip += 3; chipTxt.push(`外資持股比率 +${s._fgnTrend.delta}pp`); }
+  if (s._tdccTrend?.dir > 0) { chip += 3; chipTxt.push('千張大戶增持'); }
   push('籌碼', Math.min(chip, 15), 15, chipTxt.join('＋') || '無明顯籌碼加持');
+
+  // ⑨ 基本面（15）：營收趨勢／獲利品質／估值位階／財務體質 —— 推薦必須有基本面背書，不只看圖
+  {
+    let fp = 0; const ft = []; let any = false;
+    const rev = s.rev, fin = s._fin;
+    const pv = s._pePct || (s._fd?.pe > 0 ? peValuation(s.id, s._fd.pe) : null);
+    if (rev?.yoy != null) {
+      any = true;
+      if (rev.yoy >= 20) { fp += 5; ft.push(`營收年增 +${rev.yoy.toFixed(0)}%（高成長）`); }
+      else if (rev.yoy >= 0) { fp += 3; ft.push(`營收年增 +${rev.yoy.toFixed(0)}%`); }
+      else if (rev.yoy > -10) { fp += 1; ft.push(`營收年減 ${Math.abs(rev.yoy).toFixed(0)}%`); }
+      else ft.push(`營收年減 ${Math.abs(rev.yoy).toFixed(0)}%（衰退）`);
+    }
+    if (fin && (fin.netMargin != null || fin.roe != null)) {
+      any = true;
+      if (fin.netMargin != null && fin.netMargin < 0) ft.push(`本業虧損（淨利率 ${fin.netMargin.toFixed(1)}%）`);
+      else if (fin.netMargin >= 8 || fin.roe >= 12) { fp += 4; ft.push(`獲利品質佳（淨利率 ${fin.netMargin?.toFixed(0) ?? '--'}%／ROE ${fin.roe?.toFixed(0) ?? '--'}%）`); }
+      else { fp += 2; ft.push(`淨利率 ${fin.netMargin?.toFixed(0) ?? '--'}%`); }
+    }
+    if (pv && !pv.insufficient) {
+      any = true;
+      if (pv.zone === 'low') { fp += 4; ft.push(`本益比 ${pv.pe}x 在自身歷史低檔（第 ${pv.pct} 百分位，估值有保護）`); }
+      else if (pv.zone === 'mid') { fp += 2; ft.push(`本益比 ${pv.pe}x 中檔`); }
+      else ft.push(`本益比 ${pv.pe}x 在歷史高檔（第 ${pv.pct} 百分位，估值無保護）`);
+    } else if (s._fd?.pe > 0) {
+      any = true;
+      if (s._fd.pe < 15) { fp += 3; ft.push(`本益比 ${s._fd.pe.toFixed(1)}x 偏低`); }
+      else if (s._fd.pe < 25) { fp += 2; ft.push(`本益比 ${s._fd.pe.toFixed(1)}x`); }
+      else ft.push(`本益比 ${s._fd.pe.toFixed(1)}x 偏高`);
+    }
+    if (fin?.debtRatio != null) {
+      any = true;
+      if (fin.debtRatio < 50) { fp += 2; ft.push(`負債比 ${fin.debtRatio.toFixed(0)}%`); }
+      else if (fin.debtRatio >= 70) ft.push(`負債比 ${fin.debtRatio.toFixed(0)}% 偏高`);
+      else fp += 1;
+    }
+    if (!any) push('基本面', 6, 15, '無基本面資料（中性，不加不減）');
+    else push('基本面', Math.min(fp, 15), 15, ft.join('、'));
+  }
 
   // ⑦ 訊號一致性（10）
   push('一致性', m.agr >= 0.7 ? 10 : m.agr >= 0.55 ? 7 : m.agr >= 0.4 ? 4 : 0, 10,
@@ -10772,7 +11018,7 @@ function entryQuality(s, m, p) {
 let _entryFunnel = null;   // 最近一次進場篩選的漏斗統計
 const FUNNEL_LABELS = { stale: '資料過期', headwind: '大盤逆風', dir: '研判強度不足', plan: '無進場計畫', extended: '已追高',
   heat: '組合風險已滿', rr: '風報比不足', illiquid: '流動性不足', weekly: '週線逆勢', fresh: '結構未站穩', event: '事件視窗', excluded: '排除條件', range: '盤整盤位置', learned: '學習門檻', pricedIn: '利多已反映', trap: '主力誘多', quality: '品質 C 級',
-  pillars: '三支柱缺二', sectorCap: '族群上限', exposure: '族群曝險已滿', lab: '實驗室改法', noedge: '無經驗證優勢', strategy: '策略型態不符', breaker: '回撤斷路器' };
+  pillars: '三支柱缺二', fundbad: '基本面衰退', sectorCap: '族群上限', exposure: '族群曝險已滿', lab: '實驗室改法', noedge: '無經驗證優勢', strategy: '策略型態不符', breaker: '回撤斷路器' };
 function funnelHTML() {
   const F = _entryFunnel; if (!F) return '';
   const steps = Object.keys(FUNNEL_LABELS).filter(k => F[k]).map(k => `${FUNNEL_LABELS[k]} −${F[k]}`);
@@ -11106,9 +11352,26 @@ function evalEntry(s, env) {
   // 主力誘多：識別不了時，少追高、慢一步
   if (p.trap?.verdict === 'trap') return fail('trap', p.trap.txt.split(' —')[0]);
   ok('trap', p.trap?.verdict === 'caution' ? '誘多警訊（扣分處理）' : p.trap?.verdict === 'washout' ? '較像洗盤而非出貨' : '無誘多跡象');
+  // 基本面硬門檻：營收明顯衰退且（本業虧損或估值在自身歷史高檔）—— 技術面再漂亮也只是反彈，不列推薦
+  {
+    const yoy = s.rev?.yoy, nm = s._fin?.netMargin, pz = s._pePct?.zone;
+    if (yoy != null && yoy <= -20 && (nm < 0 || pz === 'high')) return fail('fundbad', `月營收年減 ${Math.abs(yoy).toFixed(0)}% 且${nm < 0 ? '本業虧損' : '本益比在自身歷史高檔'} — 基本面不支撐，不追反彈`);
+    if (nm != null && nm < 0 && yoy != null && yoy < 0) return fail('fundbad', `本業虧損（淨利率 ${nm.toFixed(1)}%）且營收年減 ${Math.abs(yoy).toFixed(0)}%`);
+    ok('fundbad', yoy != null || nm != null ? `基本面未衰退${yoy != null ? `（營收年增 ${yoy >= 0 ? '+' : ''}${yoy.toFixed(0)}%${nm != null ? `、淨利率 ${nm.toFixed(0)}%` : ''}）` : ''}` : '無基本面資料（未擋，品質分中性）');
+  }
   // 進場品質：研判強（該不該買）之外，還要進場點好（現在買好不好）
   const q = entryQuality(s, m, p);
   q.penalties = [];
+  // 籌碼反向扣分：法人連賣、融資大增（散戶追價）、外資持股下降、千張大戶減持 —— 推薦要有籌碼背書
+  {
+    const stN = instStreak(s.id);
+    if (stN?.dir < 0 && stN.days >= 3) q.penalties.push({ k: `法人連 ${stN.days} 日賣超`, v: 10 });
+    const lastV = (s.ohlcv?.[s.ohlcv.length - 1]?.volume || 0) / 1000;
+    const dFin = m.oi?.dFin;
+    if (dFin > 0 && lastV > 0 && dFin >= lastV * 0.08) q.penalties.push({ k: `融資大增 ${dFin.toLocaleString()} 張`, v: 6 });
+    if (s._fgnTrend?.delta != null && s._fgnTrend.delta <= -0.3) q.penalties.push({ k: `外資持股比率 ${s._fgnTrend.delta}pp`, v: 5 });
+    if (s._tdccTrend?.dir < 0 && Math.abs(s._tdccTrend.dBig ?? 0) >= 0.2) q.penalties.push({ k: '千張大戶減持', v: 5 });
+  }
   if (p.scen?.asym) q.penalties.push({ k: '賠率不對稱', v: 15 });
   if (p.cat?.weak) q.penalties.push({ k: '說不出續漲動力', v: 15 });
   if (p.trap?.verdict === 'caution') q.penalties.push({ k: '誘多警訊', v: 10 });
