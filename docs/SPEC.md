@@ -31,7 +31,14 @@
 - 預測記錄 `recordPredictions`／`resolvePredictions`（7 日後對答案）、看錯學習 `MARKET_MISS_RULES`、`marketDirProbability()`（單純貝氏校準的 7 日上漲機率，42%~58% 棄權）。
 - 資金潮汐／事件行事曆（`getCapitalFlowEvents`、`imminentEvents`）提前 5 天納入簡報與分析。
 
+## 5b. 資料來源健檢與日 K 來源順序
+- `SOURCE_CATALOG`（app.js）：每類資料（日 K 歷史、當日收盤、即時報價、法人、估值、月營收、季報、融資券、集保大戶、加權指數）列出全部來源，前三順位一律免費（官方證交所／櫃買、Yahoo、FinMind 免費 token；日 K 另有第四條 Stooq）。`runSourceAudit()` 逐一實測並存 `src-audit`（date／cats／serving／bad）；`sourceAuditMaybe()` 每日掃描後自動跑一次（盤中不跑）；`renderSourceAudit()` 填儀表板 `data-src-body` 與設定頁 `src-audit-body`。探測不到就寫「無資料」，不以舊快取假裝正常。
+- `ohlcvSourceOrder(interval)`（api.js）：`ohlcv-src` 設定 auto／official／yahoo。auto 下 Yahoo 熔斷或健檢列為壞 → 官方優先。`fetchStockOHLCV` 改為依順序逐條補到不過期為止（`stepYahoo／stepOfficial／stepFinMind／stepStooq`），`ohlcvSrcUsed[id]` 記錄實際供應來源。`fetchStooqHistory(stockId)` 解析 Stooq CSV（經代理，白名單已含 stooq）。
+
 ## 6. 進場推薦管線（`entryEnv` → `evalEntry` → `computeEntrySignals`）
+- **基本面與籌碌納入進場判斷**：`entryQuality` 新增「基本面」因子 15 分（營收年增／獲利品質／本益比自身歷史位階／負債比；無資料給 6 分中性），「籌碼」因子加入外資持股比率上升與千張大戶增持。`evalEntry` 新增硬門檻 `fundbad`（營收年減 ≥20% 且本業虧損或本益比在歷史高檔；或本業虧損且營收衰退 → 不列推薦），並對法人連賣 ≥3 日（−10）、融資大增（−6）、外資持股下降（−5）、千張大戶減持（−5）扣品質分。
+- **三個價位都有證據**：`planEvidenceHTML(p, q)` 在推薦卡顯示進場依據（`p.support`）、停損依據（`p.stopBasis`）、目標依據（`p.targetNote`／移動停利）與基本面、籌碼得分；詳細展開另列「🎯 目標依據／📚 基本面／🧾 籌碼」。
+- **實倉跟單表**：`orderSheetItems()` 彙整持倉出場／留意／續抱、A 級新倉（含依資金算出的張數、停損、目標、依據）、當沖候選；`orderSheetHTML()`／`renderOrderSheet()` 填持有中頁最上方 `order-sheet-body`，表頭顯示資金、單筆可接受虧損、組合風險、冷卻／斷路器狀態。出場列優先於新倉列。
 門檻順序：資料過期 → 組合風險已滿 → 回撤斷路器 → 無經驗證優勢 → 大盤逆風（跑贏大盤 ≥10pp 例外）→ 研判強度（均值回歸 0.5、其餘 3）→ 策略型態（含調參門檻）→ 進場計畫 → 已追高 → 風報比（嚴格模式 2.0）→ 流動性（日均成交 ≥3,000 萬）→ 週線逆勢 → 結構站穩（5 日 3 日在 EMA20 上且 EMA20≥EMA50）→ 事件視窗（學習後）→ 排除條件 → 盤整盤位置 → 學習門檻 → 實驗室採用改法 → 利多已反映 → 主力誘多 → 進場品質（含扣分／加分）→ 三支柱缺二 → 族群上限（含持倉與追蹤中訊號，最多 2 檔）。
 - 進場品質八因子（位置、趨勢階段、量能、相對大盤、族群內強弱、型態新鮮度、族群輪動、籌碼、一致性、風報比）正規化 100 分；因子權重依贏輸區分力校正（分盤性）；A 級門檻 75（嚴格模式 80）且可自我校準上調。
 - 扣分：賠率不對稱、續漲動力薄弱、誘多警訊、除息／財報／月營收視窗、週線無趨勢、與持倉高相關、跳空頻繁、目標偏遠、實績低勝率情境；加分：實績高勝率情境。
