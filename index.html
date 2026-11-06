@@ -1218,7 +1218,17 @@
   <script src="js/app.js"></script>
   <script>
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').catch(() => {});
+      // 主機瀏覽器常常一開好幾天：部署新版後舊程式會一直跑到手動重整為止
+      //（實際發生：09:30 推播沒有新段落、新指令沒回應）。
+      // 改為每 30 分鐘檢查一次新版，新版啟用後交給 app.js 在不打斷掃描的前提下自動重整。
+      navigator.serviceWorker.register('sw.js').then(reg => {
+        setInterval(() => { try { reg.update(); } catch {} }, 30 * 60 * 1000);
+      }).catch(() => {});
+      let hadController = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!hadController) { hadController = true; return; }   // 首次安裝不重整
+        try { window.onAppUpdated && window.onAppUpdated(); } catch {}
+      });
     }
   </script>
 </body>
