@@ -8456,6 +8456,47 @@ function notifyDailyBriefSend(b, manual) {
   ]);
 }
 
+// ── 今日可交易清單（Telegram 共用）：名稱、代碼、掛買區、停損、停利、張數 ───────
+// 09:30 推播與「今日」指令共用同一份，確保使用者看到的和跟單表一致。
+function tradableListLines() {
+  const L = [];
+  const inH = new Set(getHoldings().map(h => h.id));
+  let picks = [], days = [];
+  try { picks = computeEntrySignals().filter(pk => !inH.has(pk.s.id)).slice(0, 5); } catch {}
+  try { days = computeDayTradePicks().slice(0, 3); } catch {}
+  L.push('【今日可交易：波段】');
+  if (!picks.length) {
+    let why = '';
+    try { const env = entryEnv(); why = env.breaker?.on ? '回撤斷路器啟動中' : env.noEdge ? '目前盤性無經驗證優勢' : ''; } catch {}
+    const F = _entryFunnel || {};
+    const top = Object.entries(F).filter(([k]) => FUNNEL_LABELS[k] && F[k] > 0).sort((a, b) => b[1] - a[1])[0];
+    L.push(`今日無 A 級進場訊號${why ? `（${why}）` : top ? `（候選 ${F.total ?? '--'} 檔，主要卡在：${FUNNEL_LABELS[top[0]]}）` : ''} — 空手也是部位`);
+  }
+  picks.forEach((pk, i) => {
+    const { s, p, q } = pk;
+    const px = s.analysis?.price;
+    const sz = p.sizing ? (p.sizing.shares > 0 ? `${p.sizing.shares} 張` : p.sizing.oddLot ? `零股 ${p.sizing.oddLot} 股` : null) : null;
+    const tgt = p.holdOn ? `續抱（移動停利 ${p.trail}）` : `${p.t1}（+${p.rewardPct1.toFixed(1)}%）`;
+    const chase = px != null && px > p.hi * 1.02 ? '　⚠ 現價已高於區間上緣，不追' : '';
+    L.push(`${i + 1}. ${s.name}(${s.id})　${q.grade} 級 ${q.score} 分${px != null ? `　現價 ${px.toFixed(2)}` : ''}${chase}`);
+    L.push(`　掛買 ${p.lo}~${p.hi}｜停損 ${p.stop}（−${p.riskPct.toFixed(1)}%）｜停利 ${tgt}${sz ? `｜${sz}` : ''}`);
+    const why = [(p.support?.tech || [])[0], (p.support?.chips || [])[0], (p.support?.fund || [])[0]].filter(Boolean).map(x => String(x).replace(/^[📚🐋]\s*/, '').split('（')[0]).slice(0, 2).join('；');
+    if (why) L.push(`　依據：${why}`);
+  });
+  if (days.length) {
+    L.push(''); L.push('【今日可交易：當沖】');
+    days.forEach((d, i) => {
+      const long = d.side !== 'short';
+      if (!d.plan) { L.push(`${i + 1}. ${d.s.name}(${d.s.id})　${long ? '做多' : '做空'}候選 — 開盤後 5 分 K 累積中，掛單價稍後推送`); return; }
+      L.push(`${i + 1}. ${d.s.name}(${d.s.id})　${long ? '🟢 做多' : '🔴 做空'}`);
+      L.push(`　${long ? '掛買' : '掛賣'} ${d.plan.entryLo}~${d.plan.entryHi}｜停損 ${d.plan.stop}（−${d.plan.riskPct}%）｜停利 ${d.plan.target}（+${d.plan.rewardPct}%，稅後 ${d.plan.netPct}%）`);
+    });
+    L.push('　13:00 前未達停利準備平倉，收盤前一律出清');
+  }
+  L.push('紀律：限價掛單不追價、到 +1R 減半並把停損上移到成本、跌破停損當天出場');
+  return { lines: L, picks, days };
+}
+
 // ── 每日 09:30 開盤後追蹤 ──────────────────────────────────────────────────
 // 開盤半小時後才有意義：走勢已表態、五檔掛單可判真假、持倉是否該平倉已有依據。
 function buildPostOpen() {
@@ -8528,6 +8569,10 @@ function notifyPostOpen() {
   L.push(''); L.push('【大戶掛單判定】');
   L.push(b.whale.txt);
 
+  // 今日可交易：名稱、代碼、掛買區、停損、停利、張數（與網站跟單表同一份）
+  let tl = null;
+  try { tl = tradableListLines(); L.push(''); L.push(...tl.lines); } catch {}
+
   L.push(''); L.push('【今日重點關注】');
   b.focus.forEach(f => L.push(`・${f.s.name}(${f.s.id})　${f.v.signal}　評分 ${f.v.score}`));
   // 當沖觀察股的開盤區間（ORB）：09:30 正好是開盤區間定型的時刻
@@ -8540,6 +8585,7 @@ function notifyPostOpen() {
   tgPush(L.join('\n'));
   tgMarkKeys([
     ...b.focus.map(f => `sig:${f.s.id}`),
+    ...(tl?.picks || []).map(pk => `sig:${pk.s.id}`),
     ...b.holdings.map(r => `hold:${r.h.id}:${r.level}`),
   ]);
 }
@@ -12897,6 +12943,7 @@ const TG_HELP = `🤖 可用指令（代號或中文名皆可）
 持倉　→ 列出目前持倉
 刪 2330　→ 移除（不記錄）
 清零　→ 以當下價格結算全部持倉並回傳結果
+今日　→ 今日可交易清單（掛買區、停損、停利、張數）
 2330 或 台積電　→ 回傳這檔的交易看法與建議`;
 function tgInboundOn() { return localStorage.getItem('tg-inbound') !== 'false'; }
 function parseTgCommand(text) {
@@ -12905,6 +12952,7 @@ function parseTgCommand(text) {
   if (/^\/(?!start$)/.test(t)) t = t.replace(/^\/([^\s@]+)(@\S+)?/, '$1');
   if (!t) return null;
   if (/^(\/start|幫助|help|說明|\?)$/i.test(t)) return { cmd: 'help' };
+  if (/^(今日|今天|訊號|可交易|今日訊號|今日可交易)$/.test(t)) return { cmd: 'today' };
   if (/^(持倉|列表|查|list|持股)$/i.test(t)) return { cmd: 'list' };
   if (/^(清零|清空|全部出清|closeall)$/i.test(t)) return { cmd: 'closeall' };
   // 單獨一個代號或中文名（或「看 2330」）→ 回傳這檔的交易看法
@@ -12944,6 +12992,11 @@ function parseTgCommand(text) {
 async function execTgCommand(c) {
   if (!c) return '看不懂這則訊息。輸入「幫助」查看指令格式。';
   if (c.cmd === 'help') return TG_HELP;
+  if (c.cmd === 'today') {
+    if (allStocks.filter(s => s.analysis).length < 5) return '掃描尚未完成，稍後再查。';
+    const tl = tradableListLines();
+    return `📋 今日可交易　${twClock().date} ${String(twClock().hour).padStart(2, '0')}:${String(twClock().minute).padStart(2, '0')}\n\n${tl.lines.join('\n')}\n\n⚠ 規則化分析，僅供參考，非投資建議`;
+  }
   if (c.cmd === 'list') {
     const hs = getHoldings();
     if (!hs.length) return '目前沒有持倉。';
