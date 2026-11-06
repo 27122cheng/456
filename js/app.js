@@ -433,6 +433,7 @@ async function runScan() {
   after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('實倉跟單表', renderOrderSheet);
+  after('套用新版', reloadIfUpdated);
   after('資料來源健檢', () => { renderSourceAudit(); setTimeout(() => { sourceAuditMaybe().catch(() => {}); }, 8000); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); try { renderAiLossLearning(); } catch {} });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
@@ -8581,7 +8582,9 @@ function notifyPostOpen() {
     return o ? `・${dp.s.name}(${dp.s.id})　${o.txt}` : null;
   }).filter(Boolean);
   if (orbLines.length) { L.push(''); L.push('【當沖開盤區間 ORB】'); orbLines.forEach(x => L.push(x)); }
-  L.push(''); L.push('⚠ 規則化分析，僅供參考，非投資建議');
+  L.push(''); L.push('輸入「今日」可隨時重發可交易清單；輸入「幫助」看全部指令');
+  try { L.push(tgInboundStatusTxt()); } catch {}
+  L.push('⚠ 規則化分析，僅供參考，非投資建議');
   tgPush(L.join('\n'));
   tgMarkKeys([
     ...b.focus.map(f => `sig:${f.s.id}`),
@@ -13582,6 +13585,20 @@ function dueNotifySlot() {
 }
 
 let _slotScanBusy = false;
+// ── 部署新版自動套用 ──────────────────────────────────────────────────────
+// Service Worker 偵測到新版並接管後呼叫：不在掃描中就 3 秒後重整，掃描中則掃完再重整。
+// 狀態都在 localStorage，重整不會掉資料；不重整的話主機會一直跑舊程式。
+let _reloadAfterScan = false;
+function onAppUpdated() {
+  try { logSysError('偵測到網站新版本，自動重新載入以套用更新'); } catch {}
+  if (scanning) { _reloadAfterScan = true; return; }
+  setTimeout(() => { try { location.reload(); } catch {} }, 3000);
+}
+function reloadIfUpdated() {
+  if (!_reloadAfterScan) return;
+  _reloadAfterScan = false;
+  setTimeout(() => { try { location.reload(); } catch {} }, 3000);
+}
 async function scheduledTick() {
   // 先用現有資料檢查一次（事件型推播如停損、當沖觸發不必等掃描）
   runScheduledNotifications();
