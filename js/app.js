@@ -433,6 +433,7 @@ async function runScan() {
   after('即時報價復原', () => { reapplyLiveQuotes(); refreshLivePrices(); });   // 復原後立即再抓一次，不等下個 tick
   after('我的持倉', () => { updateTrailingStops(); renderHoldings(); });
   after('實倉跟單表', renderOrderSheet);
+  after('證據家族日評', famDailyTrack);
   after('套用新版', reloadIfUpdated);
   after('資料來源健檢', () => { renderSourceAudit(); setTimeout(() => { sourceAuditMaybe().catch(() => {}); }, 8000); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); try { renderAiLossLearning(); } catch {} });
@@ -2368,11 +2369,99 @@ function familyAccuracy() {
   for (const f of Object.keys(acc)) acc[f].pct = Math.round(acc[f].hit / acc[f].n * 100);
   return acc;
 }
-// 家族上限校正倍數（樣本 ≥15 才調；0.6~1.25）：長期看錯的家族說話小聲一點
+// ── 證據家族日評：每天對「全部掃描股」記錄各家族的方向，5 個交易日後對答案 ──────
+// 只靠成交的紙上交易學家族準不準太慢（一週才幾筆）；全池每天一百多檔，一週就有幾百個樣本。
+// 命中定義：家族貢獻方向 × 5 日報酬方向一致（|報酬| <0.5% 視為平盤不計）。
+// 同時記最近支撐／壓力，5 日後看「被測試時有沒有守住」，得到支撐壓力命中率。
+const FAM_DAILY_KEY = 'fam-daily', FAM_DAILY_RES = 'fam-daily-res';
+function famDailyLog() { try { return JSON.parse(localStorage.getItem(FAM_DAILY_KEY) || '[]'); } catch { return []; } }
+function famDailyRes() { try { return JSON.parse(localStorage.getItem(FAM_DAILY_RES) || '[]'); } catch { return []; } }
+function famDailyTrack() {
+  const today = twClock().date;
+  const log = famDailyLog();
+  // 1) 今日快照（每日一次）
+  if (!log.some(d => d.date === today)) {
+    const rows = {};
+    for (const s of allStocks) {
+      if (!s.analysis?.price || !s.ohlcv?.length || s.ohlcv[s.ohlcv.length - 1].time < today) continue;   // 只記有今日 K 的
+      let m = null; try { m = buildManagerAnalysis(s); } catch {}
+      const f = famSnapshot(m); if (!f) continue;
+      let sr = null; try { sr = calcSR(s.ohlcv); } catch {}
+      rows[s.id] = { f, px: +s.analysis.price.toFixed(2), sup: sr?.supports?.[0] != null ? +sr.supports[0].toFixed(2) : null, res: sr?.resistances?.[0] != null ? +sr.resistances[0].toFixed(2) : null };
+    }
+    if (Object.keys(rows).length >= 5) log.push({ date: today, rows });
+  }
+  // 2) 對答案：記錄日之後有 ≥5 根日 K 的條目
+  const res = famDailyRes();
+  let resolvedAny = false;
+  for (const d of log) {
+    if (d.resolved) continue;
+    let done = 0, total = 0;
+    for (const [id, r] of Object.entries(d.rows)) {
+      total++;
+      if (r.done) { done++; continue; }
+      const s = allStocks.find(x => x.id === id); const bars = s?.ohlcv; if (!bars) continue;
+      const i0 = bars.findIndex(b => b.time > d.date);
+      if (i0 < 0 || i0 + 4 >= bars.length) continue;
+      const win = bars.slice(i0, i0 + 5);
+      const ret = (win[4].close - r.px) / r.px * 100;
+      const sign = Math.abs(ret) < 0.5 ? 0 : Math.sign(ret);
+      const out = { f: {}, s: null, r: null };
+      for (const [fam, c] of Object.entries(r.f)) if (sign !== 0) out.f[fam] = Math.sign(c) === sign ? 1 : 0;
+      if (r.sup > 0) { const tested = win.some(b => b.low <= r.sup * 1.015); if (tested) out.s = win.some(b => b.close < r.sup * 0.99) ? 0 : 1; }
+      if (r.res > 0) { const tested = win.some(b => b.high >= r.res * 0.985); if (tested) out.r = win.some(b => b.close > r.res * 1.01) ? 0 : 1; }
+      res.push(out); r.done = true; done++; resolvedAny = true;
+    }
+    if (total && done === total) d.resolved = true;
+  }
+  const trimmed = log.filter(d => !d.resolved || tradingDaysBetween(d.date, today) <= 10).slice(-30);
+  try { localStorage.setItem(FAM_DAILY_KEY, JSON.stringify(trimmed)); } catch {}
+  if (resolvedAny) { try { localStorage.setItem(FAM_DAILY_RES, JSON.stringify(res.slice(-1500))); } catch {} }
+  return { days: trimmed.length, resolved: res.length };
+}
+// 日評家族命中率（最近 600 個股日）
+function familyAccuracyDaily() {
+  const rows = famDailyRes().slice(-600);
+  const acc = {};
+  for (const r of rows) for (const [f, ok] of Object.entries(r.f || {})) { const o = acc[f] = acc[f] || { n: 0, hit: 0 }; o.n++; if (ok) o.hit++; }
+  for (const f of Object.keys(acc)) acc[f].pct = Math.round(acc[f].hit / acc[f].n * 100);
+  return acc;
+}
+// 支撐／壓力命中率：被測試時守住的比例
+function srStats() {
+  const rows = famDailyRes().slice(-600);
+  const st = { supN: 0, supHeld: 0, resN: 0, resHeld: 0 };
+  for (const r of rows) { if (r.s != null) { st.supN++; if (r.s) st.supHeld++; } if (r.r != null) { st.resN++; if (r.r) st.resHeld++; } }
+  st.supPct = st.supN ? Math.round(st.supHeld / st.supN * 100) : null;
+  st.resPct = st.resN ? Math.round(st.resHeld / st.resN * 100) : null;
+  return st;
+}
+// 家族上限校正倍數（0.6~1.25，50% 命中＝×1.0）：實倉樣本 ≥15 或日評樣本 ≥60 才調；兩者都有時實倉權重 ×3 合併
 function familyCapAdj() {
   const acc = familyAccuracy();
+  const daily = (() => { try { return familyAccuracyDaily(); } catch { return {}; } })();
   const adj = {};
-  for (const [f, a] of Object.entries(acc)) if (a.n >= 15) adj[f] = +Math.max(0.6, Math.min(1.25, 0.6 + (a.pct / 100) * 1.3)).toFixed(2);
+  const fams = new Set([...Object.keys(acc), ...Object.keys(daily)]);
+  for (const f of fams) {
+    const a = acc[f], d = daily[f];
+    let pct = null;
+    if (a?.n >= 15 && d?.n >= 60) pct = (a.pct * a.n * 3 + d.pct * d.n) / (a.n * 3 + d.n);
+    else if (a?.n >= 15) pct = a.pct;
+    else if (d?.n >= 60) pct = d.pct;
+    if (pct == null) continue;
+    // 50% 命中＝沒有資訊 → ×1.0；60% → ×1.25；40% → ×0.75；≤34% → ×0.6
+    //（舊公式 0.6+pct×1.3 在 50% 就給 ×1.25，等於獎勵擲硬幣）
+    adj[f] = +Math.max(0.6, Math.min(1.25, 1 + (pct - 50) / 100 * 2.5)).toFixed(2);
+  }
+  // 倍數明顯變動時記入學習日誌（每家族每日最多一次）
+  try {
+    const last = JSON.parse(localStorage.getItem('fam-adj-last') || '{}');
+    let changed = false;
+    for (const [f, v] of Object.entries(adj)) {
+      if (last[f] == null || Math.abs(last[f] - v) >= 0.1) { changed = true; learnLog('rule', `家族校正：${FAMILY_NAME[f] || f} 貢獻上限 ×${v}（命中率 ${acc[f]?.n >= 15 ? `實倉 ${acc[f].pct}%／${acc[f].n} 筆` : ''}${acc[f]?.n >= 15 && daily[f]?.n >= 60 ? '、' : ''}${daily[f]?.n >= 60 ? `日評 ${daily[f].pct}%／${daily[f].n} 股日` : ''}）`); }
+    }
+    if (changed) localStorage.setItem('fam-adj-last', JSON.stringify(adj));
+  } catch {}
   return adj;
 }
 function evidenceFamily(e) {
@@ -3126,7 +3215,10 @@ function buildEntryPlan(s, m, opts = {}) {
   // ── 離場（停損）：取結構低點與 ATR 緩衝的較低者，並說明依據 ──
   const low5 = Math.min(...lows.slice(-5));
   const struct = Math.min(m.sup, low5);
-  let stop = +Math.min(struct * 0.99, lo - atr).toFixed(2);
+  // 支撐命中率（日評）：近期支撐常被跌破 → 停損多留 1% 緩衝，少被掃
+  const srS = (() => { try { return srStats(); } catch { return null; } })();
+  const supBuf = srS && srS.supN >= 30 && srS.supPct < 50 ? 0.98 : 0.99;
+  let stop = +Math.min(struct * supBuf, lo - atr).toFixed(2);
   if (stop >= lo) stop = +(lo - atr).toFixed(2);
   // 上限保護：突破創新高時結構支撐可能離得很遠，
   // 停損距離超過 8% 或 3×ATR 就改用較近者，避免單筆風險過大
@@ -3152,7 +3244,7 @@ function buildEntryPlan(s, m, opts = {}) {
   } else if (stopCapped) {
     stopBasis.push(`結構支撐距離過遠，改以風險上限 ${riskPct.toFixed(1)}%（${(maxRisk / atr).toFixed(1)}×ATR）設定`);
   } else {
-    if (m.sup && stop < m.sup) stopBasis.push(`低於支撐位 ${m.sup}（跌破代表支撐失守）`);
+    if (m.sup && stop < m.sup) stopBasis.push(`低於支撐位 ${m.sup}（跌破代表支撐失守${srS?.supN >= 30 ? `；近期支撐被測試時守住率 ${srS.supPct}%${supBuf === 0.98 ? '，偏低故多留 1% 緩衝' : ''}` : ''}）`);
     if (stop < low5) stopBasis.push(`低於近 5 日最低 ${low5.toFixed(2)}`);
     stopBasis.push(`保留 ${((lo - stop) / atr).toFixed(1)}×ATR 緩衝，避免日常波動誤觸`);
   }
@@ -5803,7 +5895,7 @@ const SYNC_KEYS = [
   'trade-journal', 'exdiv-hist', 'auto-stocks', 'backtest-result',
   'capital', 'max-accept-loss', 'finmind-token',
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
-  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe', 'ohlcv-src',
+  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe', 'ohlcv-src', 'fam-daily', 'fam-daily-res',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
   // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
   'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
@@ -12261,6 +12353,75 @@ function rollingSeries(arr, isWin, win = 10) {
   for (let i = win; i <= arr.length; i++) { const w = arr.slice(i - win, i); out.push(+(w.filter(isWin).length / win * 100).toFixed(0)); }
   return out;
 }
+// ── 學習迴路體檢：每條學習路徑現在有沒有接上、樣本多少、正在改什麼 ────────────
+// 讓使用者看得到「學習」不是口號：哪條迴路在動、哪條還在等樣本、哪條回退過。
+function learnLoopReport() {
+  const L = [];
+  const add = (k, name, state, n, effect, link) => L.push({ k, name, state, n, effect, link });
+  // ① 波段止損原因 → 進場門檻
+  try {
+    const AF = aiLearnedFilters();
+    const done = getAiSignals().filter(t => ['win', 'loss'].includes(t.status)).length;
+    const rev = Object.entries(learnStateAll()).filter(([k, v]) => k.startsWith('swing:') && v.reverted).length;
+    add('swing-learn', '波段止損原因 → 進場門檻', AF.learned.length ? 'on' : done >= 5 ? 'wait' : 'acc', `${done} 筆結算`,
+      AF.learned.length ? `已加嚴 ${AF.learned.length} 條：${AF.learned.join('、')}${rev ? `；曾回退 ${rev} 條` : ''}` : '尚無情境達啟用門檻（40 筆內 ≥5 次且占 ≥30%）', 'evalEntry learned 門檻');
+  } catch {}
+  // ② 品質因子權重
+  try {
+    const adj = factorWeightAdj(outlookData.regime?.kind);
+    const ch = Object.entries(adj).filter(([, v]) => v !== 1);
+    add('factor', '進場品質因子權重校正', ch.length ? 'on' : 'acc', `${getAiSignals().filter(t => ['win', 'loss'].includes(t.status) && t.ctx?.q).length} 筆有因子快照`,
+      ch.length ? ch.map(([k, v]) => `${k} ×${v}`).join('、') : '各因子區分力尚未達調整條件', 'entryQuality 因子加權');
+  } catch {}
+  // ③ A 級門檻校準
+  try { const c = qualityCutAdj(); add('cut', 'A 級門檻自我校準', c.adj ? 'on' : 'acc', `${c.loN + c.hiN} 筆`, c.txt, 'entryEnv aCut'); } catch {}
+  // ④ 證據家族校正（實倉＋日評）
+  try {
+    const acc = familyAccuracy(), daily = familyAccuracyDaily(), adj = familyCapAdj();
+    const tradeN = Object.values(acc).reduce((a, b) => Math.max(a, b.n), 0), dailyN = Object.values(daily).reduce((a, b) => Math.max(a, b.n), 0);
+    const parts = Object.entries(adj).map(([f, v]) => `${FAMILY_NAME[f] || f} ×${v}`);
+    const accTxt = Object.entries(daily).filter(([, v]) => v.n >= 60).sort((a, b) => b[1].pct - a[1].pct).map(([f, v]) => `${FAMILY_NAME[f] || f} ${v.pct}%`).join('、');
+    add('family', '證據家族命中率 → 研判權重（籌碼／技術／量能／動能／基本面／新聞）', parts.length ? 'on' : 'acc', `實倉 ${tradeN} 筆、日評 ${dailyN} 股日`,
+      (parts.length ? `上限校正：${parts.join('、')}` : '樣本累積中（實倉 ≥15 或日評 ≥60）') + (accTxt ? `｜日評命中率：${accTxt}` : ''), 'buildManagerAnalysis 家族上限');
+  } catch {}
+  // ⑤ 支撐壓力命中率 → 停損緩衝
+  try { const st = srStats(); add('sr', '支撐／壓力命中率 → 停損緩衝', st.supN >= 30 ? 'on' : 'acc', `支撐測試 ${st.supN} 次、壓力測試 ${st.resN} 次`, st.supN ? `支撐守住 ${st.supPct}%、壓力守住 ${st.resPct ?? '--'}%${st.supN >= 30 && st.supPct < 50 ? '（偏低 → 停損多留 1%）' : ''}` : '尚無被測試的支撐壓力樣本', 'buildEntryPlan 停損'); } catch {}
+  // ⑥ 波段實驗室
+  try {
+    const r = swingLabResult(); const cs = currentSwingStrategy();
+    add('swinglab', '波段實驗室 → 盤性冠軍策略與調參', r ? (cs?.noEdge ? 'warn' : 'on') : 'acc', r ? `${r.universe} 檔日 K，${r.at}` : '尚未執行',
+      r ? `現用「${cs?.name || '--'}」${cs?.tuned ? `（調參：停損 ${cs.tuned.stopATR ?? '--'}×ATR、目標 ${cs.tuned.targetR ?? '--'}R）` : ''}${cs?.noEdge ? '｜目前盤性無經驗證優勢，停發' : ''}` : '掃描後自動排程（桌機、非盤中）', 'entryEnv strategy');
+  } catch {}
+  // ⑦ 當沖實驗室與勝率參數
+  try {
+    const r = getStrategyRank(); const ap = activeStrategyParams();
+    const g = r?.all?.filter(x => x.grid?.adopted) || [];
+    add('daylab', '當沖實驗室 → 現行策略與勝率最高參數', r ? 'on' : 'acc', r ? `${r.universe} 檔，${r.at}` : '尚未執行',
+      r ? `現行「${ap.name}」停損 ${ap.stopPct}%、停利 ${ap.tgtR}R、量 ${ap.volX}×${g.length ? `｜勝率參數已採用 ${g.length} 組` : '｜勝率參數未達採用條件'}` : '掃描後自動排程', 'computeDayTradePicks SP');
+  } catch {}
+  // ⑧ 當沖止損學習
+  try { const L2 = dayLossLearnings(); const f = dayLearnedFilters(); const on = Object.entries(f).filter(([k, v]) => v === true || (k === 'minAtr' && v > 1.8) || (k === 'minTurnover' && v > 2e8) || (k === 'minIrs' && v > 0)).map(([k]) => k);
+    add('daylearn', '當沖止損原因 → 候選門檻', on.length ? 'on' : L2.insufficient ? 'acc' : 'wait', `${L2.total} 筆結算、${L2.n} 筆止損`, on.length ? `已加嚴：${on.join('、')}` : L2.insufficient ? '需 3 筆止損才開始歸納' : '有歸納但未達啟用門檻', 'computeDayTradePicks LF'); } catch {}
+  // ⑨ 大盤模型與校準
+  try { const mm = marketModelTxt(); const cal = modelCalibration(); add('mkt', '大盤歷史模型 → 方向預測', mm ? (mm.usable ? 'on' : 'warn') : 'acc', mm ? `${mm.n} 筆訓練、${cal.n} 筆校準` : '尚無 14 個月大盤資料', mm ? `${mm.usable ? '驗證段有優勢，參與方向判定' : '驗證段無優勢，不用來決定方向'}（命中 ${mm.valAcc ?? '--'}%）` : '等 TWII 長歷史載入', 'recordPredictions'); } catch {}
+  // ⑩ 回撤控制
+  try { const cd = systemCooldown(), br = drawdownBreaker(); add('dd', '回撤控制（冷卻→斷路器→移動停損）', br?.on ? 'warn' : cd?.on ? 'warn' : 'on', '—', br?.on ? br.txt : cd?.on ? `冷卻中：新倉減半（${cd.txt || ''}）` : '未觸發，正常出手', 'entryEnv／buildEntryPlan sizing'); } catch {}
+  // ⑪ 資料來源健檢
+  try { const a = getSourceAudit(); add('src', '資料來源健檢 → 來源順序', a ? (a.bad?.length ? 'warn' : 'on') : 'acc', a ? `${a.okCount}/${a.total} 條正常` : '尚未健檢', a ? (a.bad?.length ? `${a.bad.length} 條無資料，已改用其他來源：${a.bad.join('、')}` : '全部類別皆有來源供應') : '掃描後自動執行', 'ohlcvSourceOrder'); } catch {}
+  return L;
+}
+function learnLoopHTML() {
+  const L = learnLoopReport();
+  if (!L.length) return '';
+  const col = { on: 'var(--bull)', warn: 'var(--yellow)', wait: 'var(--yellow)', acc: 'var(--text3)' };
+  const lbl = { on: '✓ 運作中', warn: '⚠ 注意', wait: '⏳ 等門檻', acc: '… 累積中' };
+  const onN = L.filter(x => x.state === 'on').length;
+  return `<div style="padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);margin-bottom:8px">
+    <div style="font-size:0.72rem;font-weight:700;color:var(--text1);margin-bottom:4px">🔗 學習迴路體檢 <span style="font-size:0.64rem;color:var(--text3);font-weight:400">${onN}/${L.length} 條已接回決策；每條都寫明樣本、現在改了什麼、接在哪裡</span></div>
+    ${L.map(x => `<div style="display:flex;gap:8px;align-items:flex-start;padding:4px 0;border-top:1px solid rgba(255,255,255,0.04);font-size:0.7rem;line-height:1.5"><span style="flex:none;width:68px;color:${col[x.state]};font-weight:700">${lbl[x.state]}</span><div style="flex:1;color:var(--text2)"><b style="color:var(--text1)">${x.name}</b>　<span style="color:var(--text3)">${x.n}</span><br>${x.effect}<span style="color:var(--text3)">　→ ${x.link}</span></div></div>`).join('')}
+  </div>`;
+}
+
 function growthHTML() {
   const sig = getAiSignals().filter(t => ['win', 'loss'].includes(t.status)).sort((a, b) => String(a.exitDate).localeCompare(String(b.exitDate)));
   const sw = rollingSeries(sig, t => t.status === 'win', 10);
@@ -12271,7 +12432,7 @@ function growthHTML() {
   const line = (lbl, series, sub) => series.length >= 2
     ? `<div style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02)"><div style="font-size:0.68rem;color:var(--text3)">${lbl}（最近 10 筆滾動，${series.length} 點）：目前 <b style="color:${series[series.length - 1] >= 50 ? 'var(--bull)' : 'var(--bear)'}">${series[series.length - 1]}%</b>${series.length >= 4 ? `，較起點 ${series[series.length - 1] - series[0] >= 0 ? '+' : ''}${series[series.length - 1] - series[0]}pp` : ''}</div>${sparklineSVG(series.map(v => v - 50), 300, 46)}<div style="font-size:0.62rem;color:var(--text3)">${sub}</div></div>`
     : `<div style="flex:1;min-width:220px;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.02);font-size:0.68rem;color:var(--text3)">${lbl}：樣本累積中（需 ≥12 筆才有曲線）</div>`;
-  return `<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+  return `${(() => { try { return learnLoopHTML(); } catch { return ''; } })()}<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
       ${line('📈 波段訊號滾動勝率', sw, '虛線＝50%；曲線往上代表學習與校準有效')}
       ${line('🌐 大盤方向滾動命中', mk, '只計有給方向的預測；棄權不計')}
     </div>
