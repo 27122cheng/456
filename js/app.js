@@ -170,12 +170,48 @@ async function startScan() {
   }
 }
 
+// ── 掃描母體模式 ──────────────────────────────────────────────────────────
+// 推薦變多最誠實的方法不是放寬門檻，而是讓同一把尺量更多股票。
+// wide：內建清單 ＋ 法人粗篩自動追蹤 ＋ 全市場成交金額前 50（排除 ETF）；
+// base：只掃內建與自動追蹤。auto：桌機 wide、手機／低效能 base（掃描時間約加倍）。
+const UNIVERSE_LEADERS_N = 50;
+function universeMode() {
+  const v = localStorage.getItem('universe-mode') || 'auto';
+  if (v === 'wide' || v === 'base') return v;
+  return isLowPowerDevice() ? 'base' : 'wide';
+}
+// 全市場成交金額領先股（官方當日行情，不另外打請求）；排除 ETF／權證類代號與已在清單者
+function turnoverLeaders(dayMap, excludeIds, n = UNIVERSE_LEADERS_N) {
+  if (!dayMap) return [];
+  const rows = [];
+  for (const [id, q] of Object.entries(dayMap)) {
+    if (!/^\d{4}$/.test(id) || id.startsWith('00')) continue;      // 只取四碼普通股，排除 ETF（00xx）
+    if (excludeIds.has(id) || !(q?.close > 0) || !(q?.volume > 0)) continue;
+    rows.push({ id, name: q.name || id, turnover: q.close * q.volume });
+  }
+  rows.sort((a, b) => b.turnover - a.turnover);
+  return rows.slice(0, n).map(r => ({ id: r.id, name: r.name, sector: '成交熱門', auto: true, leader: true }));
+}
+let _universeInfo = { mode: 'base', base: 0, auto: 0, leaders: 0 };
 async function runScan() {
 
-  // 掃描範圍 = 正式清單 + 法人自動追蹤清單（全市場粗篩自動納入，不必手動加）
+  // 掃描範圍 = 正式清單 + 法人自動追蹤清單（全市場粗篩自動納入，不必手動加）＋（wide）成交熱門股
   const baseList = getStockList();
   const baseIds = new Set(baseList.map(x => x.id));
-  const stocks = [...baseList, ...getAutoStocks().filter(a => !baseIds.has(a.id))];
+  const autos = getAutoStocks().filter(a => !baseIds.has(a.id));
+  let leaders = [];
+  const uMode = universeMode();
+  if (uMode === 'wide') {
+    try {
+      const day = await fetchTWDayAll();
+      const ex = new Set([...baseIds, ...autos.map(a => a.id)]);
+      leaders = turnoverLeaders(day, ex);
+      // 產業別：有公司基本資料就補上，沒有就誠實標「成交熱門」
+      try { const info = await fetchCompanyInfo(); if (info) for (const l of leaders) { const c = info[l.id]; if (c?.sector) l.sector = c.sector; if (c?.name) l.name = c.name; } } catch {}
+    } catch {}
+  }
+  _universeInfo = { mode: uMode, base: baseList.length, auto: autos.length, leaders: leaders.length };
+  const stocks = [...baseList, ...autos, ...leaders];
   allStocks = stocks.map(s => ({ ...s, ohlcv: [], analysis: null, reversal: null }));
   // 上櫃股預先標記市場別，跳過「先試上市再試上櫃」的空探（100 檔時差很多）
   allStocks.forEach(s => {
@@ -436,6 +472,7 @@ async function runScan() {
   after('證據家族日評', famDailyTrack);
   after('套用新版', reloadIfUpdated);
   after('資料來源健檢', () => { renderSourceAudit(); setTimeout(() => { sourceAuditMaybe().catch(() => {}); }, 8000); });
+  after('候選股新聞', () => { setTimeout(() => { refreshCandidateNews().then(n => { if (n) { try { renderEntrySignals(); renderSourceAudit(); } catch {} } }).catch(() => {}); }, 2000); });
   after('AI 訊號追蹤', () => { updateAiSignals(); recordAiSignals(); renderAiSignals(); try { renderAiLossLearning(); } catch {} });
   after('大戶動向偵測', () => { detectWhales().catch(e => console.warn('大戶偵測失敗:', e)); });
   after('全市場大戶粗篩', () => { marketWideWhaleScreen().catch(e => console.warn('全市場粗篩失敗:', e)); });
@@ -5703,6 +5740,7 @@ function startNewsCycle() {
   _newsTimer = setInterval(() => {
     if (document.hidden || !isMarketOpenTW()) return;
     refreshNewsIntraday();
+    refreshCandidateNews().catch(() => {});
   }, 10 * 60 * 1000);
 }
 
@@ -5789,6 +5827,8 @@ function loadSettings() {
   if (sSV) sSV.value = signalVolumeMode();
   const sOS = document.getElementById('s-ohlcv-src');
   if (sOS) sOS.value = localStorage.getItem('ohlcv-src') || 'auto';
+  const sUM = document.getElementById('s-universe');
+  if (sUM) sUM.value = localStorage.getItem('universe-mode') || 'auto';
   try { renderSourceAudit(); } catch {}
   const sTF = document.getElementById('s-timeframe');
   if (sTF) sTF.value = tf;
@@ -5851,6 +5891,8 @@ function saveAllSettings() {
   if (svEl) localStorage.setItem('signal-volume', svEl.value);
   const osEl = document.getElementById('s-ohlcv-src');
   if (osEl) localStorage.setItem('ohlcv-src', osEl.value);
+  const umEl = document.getElementById('s-universe');
+  if (umEl) localStorage.setItem('universe-mode', umEl.value);
   if (tgT)  localStorage.setItem('tg-token', tgT);
   if (tgC)  localStorage.setItem('tg-chatid', tgC);
   if (tgE !== undefined) localStorage.setItem('tg-enabled', tgE);
@@ -5895,7 +5937,7 @@ const SYNC_KEYS = [
   'trade-journal', 'exdiv-hist', 'auto-stocks', 'backtest-result',
   'capital', 'max-accept-loss', 'finmind-token',
   'tg-token', 'tg-chatid', 'tg-enabled', 'tg-sig', 'tg-event', 'tg-focus',
-  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe', 'ohlcv-src', 'fam-daily', 'fam-daily-res',
+  'bull-threshold', 'bear-threshold', 'refresh-interval', 'timeframe', 'ohlcv-src', 'universe-mode', 'fam-daily', 'fam-daily-res',
   'notif-bull-thr', 'notif-bear-thr', 'signal-master',
   // 近期新增的設定與學習鍵 —— 匯出／匯入與換裝置都要帶到
   'edge-gate', 'signal-volume', 'host-mode', 'tg-inbound',
@@ -5949,6 +5991,81 @@ function importSettings(event) {
 // 每一類資料列出全部來源（前三順位一律免費），逐一實測「現在有沒有資料」，
 // 結果存 src-audit：日 K 來源順序據此自動切換，儀表板顯示每類目前由哪個來源供應。
 // 不捏造：探測不到就寫「無資料」與原因，不用舊快取假裝正常。
+// ── 資料新鮮度：每類資料「現在是幾號／幾點的資料」一眼可見 ─────────────────
+function modeOf(arr) { const c = {}; let best = null; for (const v of arr) { if (!v) continue; c[v] = (c[v] || 0) + 1; if (!best || c[v] > c[best]) best = v; } return best; }
+function dataFreshness() {
+  const ready = allStocks.filter(s => s.analysis);
+  const today = twClock().date;
+  const out = [];
+  const barDates = ready.map(s => s.ohlcv?.[s.ohlcv.length - 1]?.time).filter(Boolean);
+  const todayN = barDates.filter(d => d === today).length;
+  out.push({ k: 'kline', name: '日 K', val: barDates.length ? `${modeOf(barDates)}（${todayN}/${barDates.length} 檔有今日 K）` : '無資料', ok: barDates.length ? (todayN / barDates.length >= 0.8 || twClock().hour < 14) : false, note: '14:00 後官方收盤合併；盤中最後一根 K 由即時報價更新' });
+  out.push({ k: 'quote', name: '即時報價', val: _lastQuoteTime ? `${_lastQuoteTime}${_liveStatus ? `・${_liveStatus}` : ''}` : (liveWindowTW() ? (_liveStatus || '等待第一筆') : '非盤中'), ok: liveWindowTW() ? !!_lastQuoteTime : null, note: '盤中每 15 秒（MIS）；收盤後每 5 分鐘補今日收盤' });
+  const t86 = localStorage.getItem('t86-last-date');
+  out.push({ k: 'inst', name: '法人買賣超', val: t86 ? `資料日 ${t86}` : '無資料', ok: t86 ? tradingDaysBetween(t86, today) <= 1 : false, note: '盤後 16:00 後公布，盤中沒有即時法人資料；盤中籌碼看 Order Flow 主動買賣（估算）' });
+  const ym = modeOf(ready.map(s => s.rev?.ym)); out.push({ k: 'rev', name: '月營收', val: ym ? `資料年月 ${ym}` : '無資料', ok: !!ym, note: '每月 10 日前後公布' });
+  const fq = modeOf(ready.map(s => s._fin?.year && s._fin?.quarter ? `${s._fin.year} Q${s._fin.quarter}` : null)); out.push({ k: 'fin', name: '季報', val: fq || '無資料', ok: !!fq, note: '季度公布' });
+  const td = modeOf(ready.map(s => s._tdcc?.d)); out.push({ k: 'tdcc', name: '集保大戶', val: td ? `週報 ${td}` : '無資料', ok: !!td, note: '每週更新' });
+  const newsAt = _memoAt['news:台股 股市']; const candAt = _candNewsAt;
+  out.push({ k: 'news', name: '新聞', val: newsAt ? `大盤 ${new Date(newsAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false })}${candAt ? `・候選股 ${new Date(candAt).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false })}（${_candNewsN} 檔）` : ''}` : '尚未抓取', ok: !!newsAt, note: '盤中每 10 分鐘；候選股／持倉另抓個股新聞' });
+  const a = getSourceAudit(); out.push({ k: 'audit', name: '來源健檢', val: a ? `${a.date}・${a.okCount}/${a.total} 正常` : '尚未健檢', ok: a ? !(a.bad?.length) : null, note: '每日一次' });
+  return out;
+}
+function dataFreshnessHTML() {
+  const rows = dataFreshness();
+  const col = v => v === true ? 'var(--bull)' : v === false ? 'var(--yellow)' : 'var(--text3)';
+  const u = _universeInfo;
+  return `<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:0.84rem;font-weight:800">🕒 資料更新度</span><span style="font-size:0.68rem;color:var(--text3)">掃描母體 ${u.base + u.auto + u.leaders} 檔（內建 ${u.base}＋法人追蹤 ${u.auto}＋成交熱門 ${u.leaders}；${u.mode === 'wide' ? '擴大模式' : '基本模式'}）</span><button class="btn-ghost" style="margin-left:auto;padding:3px 10px;font-size:0.68rem" onclick="forceRefreshAll()">🔄 全部重抓</button></div>
+    <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">${rows.map(r => `<span title="${r.note}" style="font-size:0.68rem;padding:3px 8px;border-radius:10px;border:1px solid ${col(r.ok)}55;color:${col(r.ok)};background:${col(r.ok)}12">${r.name}：<span style="color:var(--text2)">${r.val}</span></span>`).join('')}</div>`;
+}
+async function forceRefreshAll() {
+  try { resetSourceState(); } catch {}
+  try { localStorage.removeItem('src-dead'); localStorage.removeItem('proxy-fail'); localStorage.removeItem('cache:dayall'); } catch {}
+  try { for (const s of allStocks) clearCurrentMonthCache(s.id); } catch {}
+  try { Object.keys(_memoAt).filter(k => k.startsWith('news:')).forEach(k => delete _memoAt[k]); } catch {}
+  showToast('已清除快取，重新抓取全部資料', 'info');
+  try { await startScan(); } catch {}
+}
+
+// ── 候選股新聞即時化：持倉／推薦／當沖候選另抓個股新聞，不只靠大盤一則查詢 ──────
+let _candNewsAt = 0, _candNewsN = 0, _candNewsBusy = false;
+function candidateNewsIds(limit = 15) {
+  const ids = [];
+  const push = id => { if (id && !ids.includes(id)) ids.push(id); };
+  push(currentStockId);
+  for (const h of getHoldings()) push(h.id);
+  try { for (const pk of computeEntrySignals({ includeWatch: true }).slice(0, 8)) push(pk.s.id); } catch {}
+  try { for (const d of computeDayTradePicks().slice(0, 3)) push(d.s.id); } catch {}
+  return ids.filter(id => allStocks.some(s => s.id === id)).slice(0, limit);
+}
+async function refreshCandidateNews(ids = null) {
+  if (_candNewsBusy) return 0;
+  _candNewsBusy = true;
+  try {
+    const list = ids || candidateNewsIds();
+    if (!list.length) return 0;
+    if (!_newsSignals) _newsSignals = { stocks: {}, sectors: {} };
+    let n = 0;
+    for (const id of list) {
+      const s = allStocks.find(x => x.id === id); if (!s) continue;
+      const items = await fetchNewsRSS(`${s.name} ${id}`, 4).catch(() => null);
+      if (!items?.length) continue;
+      const o = _newsSignals.stocks[id] = _newsSignals.stocks[id] || { name: s.name, score: 0, items: [] };
+      let added = 0;
+      for (const it of items) {
+        const h = it.headline.slice(0, 32);
+        if (o.items.includes(h)) continue;
+        const d = it.cls === 'bull' ? 1 : it.cls === 'bear' ? -1 : 0;
+        o.score = Math.max(-3, Math.min(3, o.score + d)); o.items.push(h); added++;
+      }
+      s._news = items; s._newsAt = Date.now();
+      if (added) { delete s._verdict; n++; }
+    }
+    _candNewsAt = Date.now(); _candNewsN = list.length;
+    return n;
+  } finally { _candNewsBusy = false; }
+}
+
 const SOURCE_CATALOG = [
   { key: 'hist', cat: '日 K 歷史', srcs: [
     { k: 'twse-hist', name: '證交所 STOCK_DAY（官方・免費）', probe: async () => { const b = await fetchTWSEHistory('2330', 2); return b?.length ? { ok: true, msg: `${b.length} 根，最新 ${b[b.length - 1].time}` } : { ok: false, msg: '無資料（限流或端點異常）' }; } },
@@ -6040,7 +6157,7 @@ function sourceAuditHTML(detail = false) {
 }
 function renderSourceAudit() {
   const el = document.getElementById('data-src-body');
-  if (el) el.innerHTML = sourceAuditHTML(false);
+  if (el) el.innerHTML = `${(() => { try { return dataFreshnessHTML(); } catch { return ''; } })()}<div style="height:8px"></div>${sourceAuditHTML(false)}`;
   const el2 = document.getElementById('src-audit-body');
   if (el2) el2.innerHTML = sourceAuditHTML(true);
 }
@@ -8956,7 +9073,7 @@ function updateAutoStocks(cands) {
     if (ex) { ex.lastHit = today; ex.name = c.name; }
     else autos.push({ id: c.id, name: c.name, sector: '法人動向', lastHit: today, auto: true });
   }
-  autos = autos.slice(-10);
+  autos = autos.slice(-30);   // 上限 10 → 30：母體擴大才有更多候選
   try { localStorage.setItem('auto-stocks', JSON.stringify(autos)); } catch {}
   return autos;
 }
@@ -8983,7 +9100,7 @@ async function marketWideWhaleScreen() {
                  close: q.close, chg: q.chg, inList: inList.has(r.id) });
   }
   cands.sort((a, b) => b.ratio - a.ratio);
-  _screenResults = cands.filter(c => !c.inList).slice(0, 10);
+  _screenResults = cands.filter(c => !c.inList).slice(0, 20);
   // 合格者自動納入下輪掃描 — 不必手動按加入
   updateAutoStocks(_screenResults);
   renderMarketScreen();
