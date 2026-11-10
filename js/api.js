@@ -403,6 +403,9 @@ async function fetchTWDayAll() {
       officialJSON('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes', 'tpex-day').catch(() => null),
     ]);
 
+    // 資料日：官方端點在 14:00 後才換成今日，之前拿到的是前一交易日。
+    // 先前只靠「收盤價＋量與前一根相同」判斷是否為舊資料；Yahoo 與官方的量常不一致，
+    // 導致前一日收盤被當成今日新 K 推入 → 盤後報告全部 +0.0%（實際發生）。
     for (const r of twse || []) {
       const close = num(r.ClosingPrice);
       if (!r.Code || close == null) continue;
@@ -411,6 +414,7 @@ async function fetchTWDayAll() {
         low: num(r.LowestPrice) ?? close, close,
         volume: num(r.TradeVolume) ?? 0, chg: num(r.Change),
         name: r.Name || null, // 供「輸入中文名稱找代號」使用
+        date: officialDateISO(r.Date),
       };
     }
     for (const r of tpex || []) {
@@ -421,6 +425,7 @@ async function fetchTWDayAll() {
         low: num(r.Low) ?? close, close,
         volume: num(r.TradingShares) ?? 0, chg: num(r.Change),
         name: r.CompanyName || null,
+        date: officialDateISO(r.Date),
       };
     }
 
@@ -452,6 +457,8 @@ function mergeOfficialBar(ohlcv, q) {
   // 盤中價格改由 MIS 批次即時報價提供（見 fetchRealtimeBatch）。
   if (dow === 0 || dow === 6 || tw.getHours() < 14) return ohlcv;
   const todayStr = `${tw.getFullYear()}-${String(tw.getMonth()+1).padStart(2,'0')}-${String(tw.getDate()).padStart(2,'0')}`;
+  // 有資料日就以資料日為準：不是今天的官方資料一律不合併（不把昨日收盤當今日）
+  if (q.date && q.date !== todayStr) return ohlcv;
   const last = ohlcv[ohlcv.length - 1];
   if (last.time === todayStr) {
     Object.assign(last, { open: q.open, high: q.high, low: q.low, close: q.close, volume: q.volume });
@@ -465,6 +472,13 @@ function mergeOfficialBar(ohlcv, q) {
 // ── 證交所官方日線歷史（Yahoo 全掛時的備援）─────────────────────────────────
 // STOCK_DAY 每次回傳一個月。過去月份的資料永不變動 → 快取 7 天，
 // 只有當月需要重抓，因此第二次之後的掃描成本極低。
+// 官方資料日：1151107 或 115/11/07 → 2026-11-07；解析不了回 null（不猜）
+function officialDateISO(d) {
+  const s = String(d ?? '').trim();
+  const m = s.match(/^(\d{3})(\d{2})(\d{2})$/);
+  if (m) return `${+m[1] + 1911}-${m[2]}-${m[3]}`;
+  return rocToISO(s);
+}
 function rocToISO(d) {
   const m = String(d).trim().match(/^(\d{2,3})\/(\d{2})\/(\d{2})$/);
   if (!m) return null;

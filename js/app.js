@@ -8695,11 +8695,15 @@ function buildAfterClose() {
   const norm = Math.round(outlookData.norm ?? 0);
 
   // 今日漲跌幅排行（以日 K 收盤 vs 前收）
-  const movers = ready.map(s => {
+  let movers = ready.map(s => {
     const a = s.analysis;
     const chg = a.prevClose ? (a.price - a.prevClose) / a.prevClose * 100 : null;
     return chg == null ? null : { s, chg };
   }).filter(Boolean).sort((a, b) => b.chg - a.chg);
+  // 八成以上個股漲跌幅恰為 0 ＝ 今日收盤還沒進來（最後兩根 K 相同），不列假排行
+  const zeroShare = movers.length ? movers.filter(m => Math.abs(m.chg) < 1e-9).length / movers.length : 0;
+  const moversStale = movers.length >= 5 && zeroShare >= 0.8;
+  if (moversStale) movers = [];
 
   const holdings = getHoldings().map(h => checkHoldingExit(h)).filter(Boolean);
   const picks = computeEntrySignals().slice(0, 5);
@@ -8710,7 +8714,7 @@ function buildAfterClose() {
     date: twClock().date, twii, norm,
     instVol: instAndVolumeSummary(),
     whale: whaleOrderSummary(),
-    up: movers.slice(0, 5), down: movers.slice(-5).reverse(),
+    up: movers.slice(0, 5), down: movers.slice(-5).reverse(), moversStale,
     holdings,
     exits: holdings.filter(r => r.level === 'exit'),
     watches: holdings.filter(r => r.level === 'watch'),
@@ -8744,6 +8748,7 @@ function notifyAfterClose() {
     L.push(`【收盤】加權 ${b.twii.price?.toLocaleString(undefined, { maximumFractionDigits: 0 })}（${b.twii.chg1 >= 0 ? '+' : ''}${b.twii.chg1.toFixed(2)}%）｜研判分數 ${b.norm > 0 ? '+' : ''}${b.norm}`);
   if (b.instVol.length) { L.push(''); L.push('【今日籌碼與量能】'); b.instVol.forEach(x => L.push(`・${x}`)); }
   (() => { const dv = derivsSummary(); if (dv) L.push(`・${dv.parts.join('；')}`); })();
+  if (b.moversStale) L.push('\n【今日強勢／弱勢】今日個股收盤尚未更新（來源仍為前一交易日），不列排行；系統會自動重抓');
   if (b.up.length) L.push(`\n【今日強勢】${b.up.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
   if (b.down.length) L.push(`【今日弱勢】${b.down.map(m => `${m.s.name} ${m.chg >= 0 ? '+' : ''}${m.chg.toFixed(1)}%`).join('・')}`);
   if (b.newsSec.length) L.push(`【新聞面】${b.newsSec.map(([s, v]) => `${s}${v.score > 0 ? '偏多' : '偏空'}`).join('、')}`);
