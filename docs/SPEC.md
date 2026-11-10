@@ -35,6 +35,11 @@
 - `SOURCE_CATALOG`（app.js）：每類資料（日 K 歷史、當日收盤、即時報價、法人、估值、月營收、季報、融資券、集保大戶、加權指數）列出全部來源，前三順位一律免費（官方證交所／櫃買、Yahoo、FinMind 免費 token；日 K 另有第四條 Stooq）。`runSourceAudit()` 逐一實測並存 `src-audit`（date／cats／serving／bad）；`sourceAuditMaybe()` 每日掃描後自動跑一次（盤中不跑）；`renderSourceAudit()` 填儀表板 `data-src-body` 與設定頁 `src-audit-body`。探測不到就寫「無資料」，不以舊快取假裝正常。
 - `ohlcvSourceOrder(interval)`（api.js）：`ohlcv-src` 設定 auto／official／yahoo。auto 下 Yahoo 熔斷或健檢列為壞 → 官方優先。`fetchStockOHLCV` 改為依順序逐條補到不過期為止（`stepYahoo／stepOfficial／stepFinMind／stepStooq`），`ohlcvSrcUsed[id]` 記錄實際供應來源。`fetchStooqHistory(stockId)` 解析 Stooq CSV（經代理，白名單已含 stooq）。
 
+## 5c. 掃描母體、資料更新度與候選股新聞
+- `universeMode()`：auto（桌機 wide、低效能 base）／wide／base。wide 時 `runScan` 以官方當日行情取全市場成交金額前 50 檔普通股（`turnoverLeaders`，排除 00 開頭 ETF 與非四碼代號、已在清單者；產業別取自公司基本資料，沒有就標「成交熱門」）加入掃描；法人自動追蹤上限 10 → 30。`_universeInfo` 記錄母體組成。
+- `dataFreshness()`／`dataFreshnessHTML()`：日 K（今日 K 覆蓋率）、即時報價時間、法人資料日、月營收年月、季報季別、集保週報日、新聞抓取時間（大盤與候選股）、來源健檢日；`forceRefreshAll()` 清快取與熔斷後重掃。顯示於儀表板資料來源卡最上方。法人買賣超明寫為盤後資料，盤中籌碼以 order flow 估算代理。
+- `refreshCandidateNews()`：掃描後與盤中每 10 分鐘，對持倉／推薦（含觀察）／當沖候選／正在看的股票（≤15 檔）另抓個股新聞，合併進 `_newsSignals.stocks`（分數夾 ±3、標題去重），並使研判快取失效。
+
 ## 6. 進場推薦管線（`entryEnv` → `evalEntry` → `computeEntrySignals`）
 - **基本面與籌碌納入進場判斷**：`entryQuality` 新增「基本面」因子 15 分（營收年增／獲利品質／本益比自身歷史位階／負債比；無資料給 6 分中性），「籌碼」因子加入外資持股比率上升與千張大戶增持。`evalEntry` 新增硬門檻 `fundbad`（營收年減 ≥20% 且本業虧損或本益比在歷史高檔；或本業虧損且營收衰退 → 不列推薦），並對法人連賣 ≥3 日（−10）、融資大增（−6）、外資持股下降（−5）、千張大戶減持（−5）扣品質分。
 - **三個價位都有證據**：`planEvidenceHTML(p, q)` 在推薦卡顯示進場依據（`p.support`）、停損依據（`p.stopBasis`）、目標依據（`p.targetNote`／移動停利）與基本面、籌碼得分；詳細展開另列「🎯 目標依據／📚 基本面／🧾 籌碼」。
